@@ -38,6 +38,27 @@ async fn get_live_list() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn get_record_list(next: String) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "debug": true,
+        "next": next,
+        "groupId": 0,
+        "record": true
+    });
+
+    let res = client.post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
+        .headers(get_headers())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: Value = res.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+#[tauri::command]
 async fn get_live_stream_url(live_id: String) -> Result<String, String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -107,7 +128,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_live_list, get_live_stream_url, open_in_player])
+        .invoke_handler(tauri::generate_handler![get_live_list, get_record_list, get_live_stream_url, open_in_player])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
