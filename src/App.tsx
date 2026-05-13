@@ -150,7 +150,7 @@ function App() {
           
           <Select 
             value={filterGroup} 
-            onChange={(e, data) => setFilterGroup(data.value)}
+            onChange={(_, data) => setFilterGroup(data.value)}
             style={{ minWidth: "120px" }}
           >
             <option value="全部">全部团体</option>
@@ -163,7 +163,7 @@ function App() {
 
           <Select 
             value={filterType} 
-            onChange={(e, data) => setFilterType(data.value)}
+            onChange={(_, data) => setFilterType(data.value)}
             style={{ minWidth: "120px" }}
           >
             <option value="全部">全部类型</option>
@@ -176,7 +176,7 @@ function App() {
             contentBefore={<SearchRegular />}
             placeholder="搜索成员或标题..." 
             value={searchQuery}
-            onChange={(e, data) => setSearchQuery(data.value)}
+            onChange={(_, data) => setSearchQuery(data.value)}
             style={{ maxWidth: "300px", width: "100%" }}
           />
           <Button icon={<ArrowClockwiseRegular />} onClick={fetchLiveList} disabled={loading}>
