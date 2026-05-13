@@ -1,13 +1,22 @@
-﻿use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT};
 use serde_json::Value;
 use std::process::Command;
+use std::io::Write;
+use tauri::Emitter;
+use url::Url;
 
 // 构造统一的请求头
 fn get_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(HOST, HeaderValue::from_static("pocketapi.48.cn"));
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json;charset=utf-8"));
-    headers.insert(USER_AGENT, HeaderValue::from_static("PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)"));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json;charset=utf-8"),
+    );
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)"),
+    );
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-Hans-AW;q=1"));
     headers.insert(
         "appInfo",
@@ -26,7 +35,8 @@ async fn get_live_list() -> Result<Value, String> {
         "record": false
     });
 
-    let res = client.post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
         .headers(get_headers())
         .json(&body)
         .send()
@@ -47,7 +57,8 @@ async fn get_record_list(next: String) -> Result<Value, String> {
         "record": true
     });
 
-    let res = client.post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
         .headers(get_headers())
         .json(&body)
         .send()
@@ -65,7 +76,8 @@ async fn get_live_stream_url(live_id: String) -> Result<String, String> {
         "liveId": live_id
     });
 
-    let res = client.post("https://pocketapi.48.cn/live/api/v1/live/getLiveOne")
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveOne")
         .headers(get_headers())
         .json(&body)
         .send()
@@ -73,7 +85,7 @@ async fn get_live_stream_url(live_id: String) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
 
     let json: Value = res.json().await.map_err(|e| e.to_string())?;
-    
+
     if let Some(path) = json["content"]["playStreamPath"].as_str() {
         Ok(path.to_string())
     } else {
@@ -109,15 +121,89 @@ fn open_in_player(url: String) -> Result<(), String> {
             // 如果没找到，不要用 cmd /c start 因为在遇到带 '&' 等符号的 url 时会被截断，导致参数丢失。
             // 使用 powershell 的 Start-Process 可以确保 url 被整体传递
             let _ = Command::new("powershell")
-                .args(&["-NoProfile", "-WindowStyle", "Hidden", "-Command", &format!("Start-Process '{}'", url.replace("'", "''"))])
+                .args(&[
+                    "-NoProfile",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    &format!("Start-Process '{}'", url.replace("'", "''")),
+                ])
                 .spawn()
                 .map_err(|e| e.to_string())?;
         }
     }
-    
+
     #[cfg(not(target_os = "windows"))]
     {
         let _ = Command::new("open").arg(&url).spawn();
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct DownloadEvent {
+    status: String,
+    message: String,
+}
+
+#[tauri::command]
+async fn download_video(app_handle: tauri::AppHandle, url: String, save_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn(async move {
+        // Emit start event
+        let _ = app_handle.emit("download-status", DownloadEvent {
+            status: "start".to_string(),
+            message: save_path.clone(),
+        });
+
+        match download_video_task(url.clone(), save_path.clone()).await {
+            Ok(_) => {
+                let _ = app_handle.emit("download-status", DownloadEvent {
+                    status: "success".to_string(),
+                    message: save_path.clone(),
+                });
+            }
+            Err(e) => {
+                let _ = app_handle.emit("download-status", DownloadEvent {
+                    status: "error".to_string(),
+                    message: format!("{}: {}", save_path, e),
+                });
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn download_video_task(url: String, save_path: String) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    
+    if url.contains(".m3u8") {
+        let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let text = res.text().await.map_err(|e| e.to_string())?;
+        let base_url = Url::parse(&url).map_err(|e| e.to_string())?;
+        
+        let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+        
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let ts_url = base_url.join(line).map_err(|e| e.to_string())?;
+            let mut chunk_res = client.get(ts_url).send().await.map_err(|e| e.to_string())?;
+            
+            while let Some(chunk) = chunk_res.chunk().await.map_err(|e| e.to_string())? {
+                file.write_all(&chunk).map_err(|e| e.to_string())?;
+            }
+        }
+    } else {
+        let mut res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+        
+        while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+        }
     }
     
     Ok(())
@@ -126,9 +212,16 @@ fn open_in_player(url: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_live_list, get_record_list, get_live_stream_url, open_in_player])
+        .invoke_handler(tauri::generate_handler![
+            get_live_list,
+            get_record_list,
+            get_live_stream_url,
+            open_in_player,
+            download_video
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

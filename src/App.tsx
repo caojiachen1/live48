@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { 
   Button, 
@@ -167,16 +169,41 @@ function App() {
     fetchLiveList();
   }, [activeTab]);
 
+  useEffect(() => {
+    const unlisten = listen("download-status", (event: any) => {
+      const payload = event.payload;
+      if (payload.status === "start") {
+        dispatchToast(<Toast><ToastTitle>正在下载：{payload.message}</ToastTitle></Toast>, { intent: "info" });
+      } else if (payload.status === "success") {
+        dispatchToast(<Toast><ToastTitle>下载完成：{payload.message}</ToastTitle></Toast>, { intent: "success" });
+      } else if (payload.status === "error") {
+        dispatchToast(<Toast><ToastTitle>下载失败：{payload.message}</ToastTitle></Toast>, { intent: "error" });
+      }
+    });
+
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, []);
+
   const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download") => {
     try {
       const url: string = await invoke("get_live_stream_url", { liveId });
       
-      if (action === "copy" || action === "download") {
+      if (action === "copy") {
         await writeText(url);
         dispatchToast(
           <Toast><ToastTitle>成功复制推流/录播地址</ToastTitle></Toast>,
           { intent: "success" }
         );
+      } else if (action === "download") {
+        const filePath = await save({
+          filters: [{ name: 'Video File', extensions: ['ts', 'mp4', 'flv'] }],
+          defaultPath: `Live_${liveId}.ts`
+        });
+        if (filePath) {
+          await invoke("download_video", { url, savePath: filePath });
+        }
       } else if (action === "play") {
         await invoke("open_in_player", { url });
         dispatchToast(
