@@ -231,29 +231,30 @@ function App() {
       
       <div style={{ 
         display: "flex", 
-        justifyContent: "space-between", 
-        alignItems: "center", 
+        flexDirection: "column",
+        gap: "16px",
         marginBottom: 20,
         position: "sticky",
         top: 0,
         zIndex: 10,
-        padding: "20px 0",
-        backgroundColor: "rgb(32, 32, 32)",
-        gap: "16px"
+        padding: "20px 0 10px 0",
+        backgroundColor: "rgb(32, 32, 32)"
       }}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
+        <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "16px" }}>
           <TabList 
             selectedValue={activeTab} 
             onTabSelect={(_, data) => setActiveTab(data.value as any)}
+            style={{ flexShrink: 0 }}
           >
             <Tab value="live">直播</Tab>
             <Tab value="record">录播</Tab>
           </TabList>
-        </div>
-        <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center" }}>
-          
-          <Select 
+
+          <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center" }}>
+            
+            <Select 
             value={filterGroup} 
             onChange={(_, data) => setFilterGroup(data.value)}
             style={{ minWidth: "120px" }}
@@ -287,6 +288,7 @@ function App() {
           <Button icon={<ArrowClockwiseRegular />} onClick={fetchLiveList} disabled={loading}>
             {loading ? "刷新中..." : "刷新列表"}
           </Button>
+        </div>
         </div>
       </div>
 
