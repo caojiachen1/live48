@@ -52,6 +52,7 @@ function App() {
   const [lives, setLives] = useState<LiveItem[]>([]);
   const [records, setRecords] = useState<LiveItem[]>([]);
   const [recordNext, setRecordNext] = useState<string>("0");
+  const [targetLoadTime, setTargetLoadTime] = useState<number>(0);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterGroup, setFilterGroup] = useState("全部");
@@ -69,11 +70,39 @@ function App() {
           setLives(res.content.liveList);
         }
       } else {
-        const res: any = await invoke("get_record_list", { next: "0" });
-        if (res.content && res.content.liveList) {
-          setRecords(res.content.liveList);
-          setRecordNext(res.content.next || "0");
+        const initialTargetTime = dayjs().subtract(1, 'day').startOf('day').valueOf();
+        setTargetLoadTime(initialTargetTime);
+
+        let currentNext = "0";
+        let accumRecords: LiveItem[] = [];
+        let done = false;
+
+        while (!done) {
+          const res: any = await invoke("get_record_list", { next: currentNext });
+          if (res.content && res.content.liveList) {
+            const newRecords: LiveItem[] = res.content.liveList;
+            accumRecords = [...accumRecords, ...newRecords];
+            currentNext = res.content.next || "0";
+
+            if (newRecords.length > 0) {
+              const lastRecord = newRecords[newRecords.length - 1];
+              if (lastRecord && lastRecord.ctime && Number(lastRecord.ctime) < initialTargetTime) {
+                done = true;
+              }
+            } else {
+              done = true;
+            }
+          } else {
+            done = true;
+          }
+
+          if (currentNext === "0") {
+            done = true;
+          }
         }
+
+        setRecords(accumRecords);
+        setRecordNext(currentNext);
       }
     } catch (e) {
       console.error(e);
@@ -90,11 +119,39 @@ function App() {
     if (activeTab !== "record" || recordNext === "0" || loading) return;
     setLoading(true);
     try {
-      const res: any = await invoke("get_record_list", { next: recordNext });
-      if (res.content && res.content.liveList) {
-        setRecords(prev => [...prev, ...res.content.liveList]);
-        setRecordNext(res.content.next || "0");
+      const nextTargetTime = dayjs(targetLoadTime).subtract(1, 'day').startOf('day').valueOf();
+      setTargetLoadTime(nextTargetTime);
+
+      let currentNext = recordNext;
+      let accumRecords = [...records];
+      let done = false;
+
+      while (!done) {
+        const res: any = await invoke("get_record_list", { next: currentNext });
+        if (res.content && res.content.liveList) {
+          const newRecords: LiveItem[] = res.content.liveList;
+          accumRecords = [...accumRecords, ...newRecords];
+          currentNext = res.content.next || "0";
+
+          if (newRecords.length > 0) {
+            const lastRecord = newRecords[newRecords.length - 1];
+            if (lastRecord && lastRecord.ctime && Number(lastRecord.ctime) < nextTargetTime) {
+              done = true;
+            }
+          } else {
+            done = true;
+          }
+        } else {
+          done = true;
+        }
+
+        if (currentNext === "0") {
+          done = true;
+        }
       }
+
+      setRecords(accumRecords);
+      setRecordNext(currentNext);
     } catch (e) {
       console.error(e);
       dispatchToast(
@@ -144,6 +201,12 @@ function App() {
   const currentList = activeTab === "live" ? lives : records;
 
   const filteredItems = currentList.filter(item => {
+    if (activeTab === "record" && targetLoadTime > 0 && item.ctime) {
+      if (Number(item.ctime) < targetLoadTime) {
+        return false;
+      }
+    }
+
     const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
       (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
 
