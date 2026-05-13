@@ -377,7 +377,14 @@ function App() {
                   image={<Avatar image={{ src: resolveImgInfo(item.userInfo.avatar) }} />}
                 />
 
-                <div style={{ display: "flex", gap: "8px", marginTop: "12px", justifyContent: "flex-end" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    marginTop: "12px",
+                    justifyContent: activeTab === "live" ? "flex-end" : "center",
+                    gap: "8px"
+                  }}
+                >
                   <Button 
                     icon={<CopyRegular />} 
                     onClick={() => handlePlayOrCopy(item.liveId, "copy")}

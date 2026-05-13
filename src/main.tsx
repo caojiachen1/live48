@@ -6,7 +6,7 @@ import "./App.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <FluentProvider theme={webDarkTheme}>
+    <FluentProvider theme={webDarkTheme} style={{ backgroundColor: "transparent" }}>
       <App />
     </FluentProvider>
   </React.StrictMode>
