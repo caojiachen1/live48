@@ -145,28 +145,36 @@ fn open_in_player(url: String) -> Result<(), String> {
 struct DownloadEvent {
     status: String,
     message: String,
+    progress: f64,
+    live_id: String,
 }
 
 #[tauri::command]
-async fn download_video(app_handle: tauri::AppHandle, url: String, save_path: String) -> Result<(), String> {
+async fn download_video(app_handle: tauri::AppHandle, url: String, save_path: String, live_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         // Emit start event
         let _ = app_handle.emit("download-status", DownloadEvent {
             status: "start".to_string(),
             message: save_path.clone(),
+            progress: 0.0,
+            live_id: live_id.clone(),
         });
 
-        match download_video_task(url.clone(), save_path.clone()).await {
+        match download_video_task(app_handle.clone(), url.clone(), save_path.clone(), live_id.clone()).await {
             Ok(_) => {
                 let _ = app_handle.emit("download-status", DownloadEvent {
                     status: "success".to_string(),
                     message: save_path.clone(),
+                    progress: 100.0,
+                    live_id: live_id.clone(),
                 });
             }
             Err(e) => {
                 let _ = app_handle.emit("download-status", DownloadEvent {
                     status: "error".to_string(),
                     message: format!("{}: {}", save_path, e),
+                    progress: 0.0,
+                    live_id: live_id.clone(),
                 });
             }
         }
@@ -175,7 +183,7 @@ async fn download_video(app_handle: tauri::AppHandle, url: String, save_path: St
     Ok(())
 }
 
-async fn download_video_task(url: String, save_path: String) -> Result<(), String> {
+async fn download_video_task(app_handle: tauri::AppHandle, url: String, save_path: String, live_id: String) -> Result<(), String> {
     let client = reqwest::Client::new();
     
     if url.contains(".m3u8") {
@@ -185,24 +193,47 @@ async fn download_video_task(url: String, save_path: String) -> Result<(), Strin
         
         let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
         
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
+        let lines: Vec<&str> = text.lines().filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        }).collect();
+        
+        let total_parts = lines.len();
+        
+        for (index, line) in lines.iter().enumerate() {
             let ts_url = base_url.join(line).map_err(|e| e.to_string())?;
             let mut chunk_res = client.get(ts_url).send().await.map_err(|e| e.to_string())?;
             
             while let Some(chunk) = chunk_res.chunk().await.map_err(|e| e.to_string())? {
                 file.write_all(&chunk).map_err(|e| e.to_string())?;
             }
+            
+            let progress = (index as f64 + 1.0) / (total_parts as f64) * 100.0;
+            let _ = app_handle.emit("download-status", DownloadEvent {
+                status: "progress".to_string(),
+                message: save_path.clone(),
+                progress,
+                live_id: live_id.clone(),
+            });
         }
     } else {
         let mut res = client.get(&url).send().await.map_err(|e| e.to_string())?;
         let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+        let total_size = res.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
         
         while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
             file.write_all(&chunk).map_err(|e| e.to_string())?;
+            downloaded += chunk.len() as u64;
+            if total_size > 0 {
+                let progress = (downloaded as f64 / total_size as f64) * 100.0;
+                let _ = app_handle.emit("download-status", DownloadEvent {
+                    status: "progress".to_string(),
+                    message: save_path.clone(),
+                    progress,
+                    live_id: live_id.clone(),
+                });
+            }
         }
     }
     

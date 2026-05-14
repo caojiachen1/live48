@@ -19,7 +19,8 @@ import {
   Input,
   Select,
   TabList,
-  Tab
+  Tab,
+  ProgressBar
 } from "@fluentui/react-components";
 import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular } from "@fluentui/react-icons";
 import dayjs from "dayjs";
@@ -57,6 +58,7 @@ function App() {
   const [targetLoadTime, setTargetLoadTime] = useState<number>(0);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [downloadProgresses, setDownloadProgresses] = useState<Record<string, number>>({});
   const [filterGroup, setFilterGroup] = useState("全部");
   const [filterType, setFilterType] = useState("全部");
   
@@ -173,10 +175,23 @@ function App() {
     const unlisten = listen("download-status", (event: any) => {
       const payload = event.payload;
       if (payload.status === "start") {
+        setDownloadProgresses(prev => ({ ...prev, [payload.live_id]: 0 }));
         dispatchToast(<Toast><ToastTitle>正在下载：{payload.message}</ToastTitle></Toast>, { intent: "info" });
+      } else if (payload.status === "progress") {
+        setDownloadProgresses(prev => ({ ...prev, [payload.live_id]: payload.progress }));
       } else if (payload.status === "success") {
+        setDownloadProgresses(prev => {
+          const next = { ...prev };
+          delete next[payload.live_id];
+          return next;
+        });
         dispatchToast(<Toast><ToastTitle>下载完成：{payload.message}</ToastTitle></Toast>, { intent: "success" });
       } else if (payload.status === "error") {
+        setDownloadProgresses(prev => {
+          const next = { ...prev };
+          delete next[payload.live_id];
+          return next;
+        });
         dispatchToast(<Toast><ToastTitle>下载失败：{payload.message}</ToastTitle></Toast>, { intent: "error" });
       }
     });
@@ -202,7 +217,7 @@ function App() {
           defaultPath: `Live_${liveId}.ts`
         });
         if (filePath) {
-          await invoke("download_video", { url, savePath: filePath });
+          await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
         await invoke("open_in_player", { url });
@@ -329,7 +344,8 @@ function App() {
             {filteredItems.map((item) => {
               const badge = getLiveTypeBadge(item.liveType);
               return (
-              <Card key={item.liveId} style={{ width: "100%" }}>
+              <div key={item.liveId} style={{ width: "100%", display: "flex", flexDirection: "column", gap: 0 }}>
+              <Card style={{ width: "100%" }}>
                 <CardPreview>
                   <div style={{ position: "relative", width: "100%", lineHeight: 0 }}>
                     <img src={resolveImgInfo(item.coverPath)} alt="cover" style={{ objectFit: 'cover', width: '100%', aspectRatio: '1 / 1', display: 'block' }} />
@@ -429,6 +445,18 @@ function App() {
                   >播放</Button>
                 </div>
               </Card>
+                {downloadProgresses[item.liveId] !== undefined && (
+                  <div style={{ width: "100%", marginTop: 0 }}>
+                    <ProgressBar
+                      value={downloadProgresses[item.liveId] <= 0 ? 0.02 : downloadProgresses[item.liveId] / 100}
+                      style={{ width: "100%" }}
+                    />
+                    <Text size={200} style={{ display: "block", textAlign: "center", marginTop: "4px", color: "var(--colorNeutralForeground3)" }}>
+                      {downloadProgresses[item.liveId] > 0 ? `下载处理中... ${downloadProgresses[item.liveId].toFixed(2)}%` : "准备下载..."}
+                    </Text>
+                  </div>
+                )}
+              </div>
               );
             })}
           </div>
