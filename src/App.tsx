@@ -22,7 +22,7 @@ import {
   Tab,
   ProgressBar
 } from "@fluentui/react-components";
-import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular } from "@fluentui/react-icons";
+import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular } from "@fluentui/react-icons";
 import dayjs from "dayjs";
 
 interface LiveItem {
@@ -193,6 +193,13 @@ function App() {
           return next;
         });
         dispatchToast(<Toast><ToastTitle>下载失败：{payload.message}</ToastTitle></Toast>, { intent: "error" });
+      } else if (payload.status === "cancelled") {
+        setDownloadProgresses(prev => {
+          const next = { ...prev };
+          delete next[payload.live_id];
+          return next;
+        });
+        dispatchToast(<Toast><ToastTitle>下载已取消：{payload.message}</ToastTitle></Toast>, { intent: "warning" });
       }
     });
 
@@ -230,6 +237,28 @@ function App() {
       console.error(e);
       dispatchToast(
         <Toast><ToastTitle>获取(流/录播)地址失败</ToastTitle></Toast>,
+        { intent: "error" }
+      );
+    }
+  };
+
+  const handleCancelDownload = async (liveId: string) => {
+    try {
+      await invoke("cancel_download", { liveId });
+      // 立即从 UI 中移除进度条
+      setDownloadProgresses(prev => {
+        const next = { ...prev };
+        delete next[liveId];
+        return next;
+      });
+      dispatchToast(
+        <Toast><ToastTitle>已发送取消下载请求</ToastTitle></Toast>,
+        { intent: "info" }
+      );
+    } catch (e) {
+      console.error(e);
+      dispatchToast(
+        <Toast><ToastTitle>取消失败</ToastTitle></Toast>,
         { intent: "error" }
       );
     }
@@ -446,11 +475,19 @@ function App() {
                 </div>
               </Card>
                 {downloadProgresses[item.liveId] !== undefined && (
-                  <div style={{ width: "100%", marginTop: 0 }}>
-                    <ProgressBar
-                      value={downloadProgresses[item.liveId] <= 0 ? 0.02 : downloadProgresses[item.liveId] / 100}
-                      style={{ width: "100%" }}
-                    />
+                  <div style={{ width: "100%", marginTop: "4px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <ProgressBar
+                        value={downloadProgresses[item.liveId] <= 0 ? 0.02 : downloadProgresses[item.liveId] / 100}
+                        style={{ flex: 1 }}
+                      />
+                      <Button
+                        size="small"
+                        icon={<DismissRegular />}
+                        onClick={() => handleCancelDownload(item.liveId)}
+                        title="取消下载"
+                      />
+                    </div>
                     <Text size={200} style={{ display: "block", textAlign: "center", marginTop: "4px", color: "var(--colorNeutralForeground3)" }}>
                       {downloadProgresses[item.liveId] > 0 ? `下载处理中... ${downloadProgresses[item.liveId].toFixed(2)}%` : "准备下载..."}
                     </Text>

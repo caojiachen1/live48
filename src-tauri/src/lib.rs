@@ -1,8 +1,12 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT};
 use serde_json::Value;
-use std::process::Command;
+use std::collections::HashMap;
 use std::io::Write;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
+use tauri::Manager;
 use url::Url;
 
 // 构造统一的请求头
@@ -149,94 +153,214 @@ struct DownloadEvent {
     live_id: String,
 }
 
+/// 存储每个下载任务的取消标志
+type CancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
 #[tauri::command]
-async fn download_video(app_handle: tauri::AppHandle, url: String, save_path: String, live_id: String) -> Result<(), String> {
+async fn download_video(
+    app_handle: tauri::AppHandle,
+    url: String,
+    save_path: String,
+    live_id: String,
+) -> Result<(), String> {
+    let cancel_map: CancelMap = app_handle.state::<CancelMap>().inner().clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut cancels = cancel_map.lock().map_err(|e| e.to_string())?;
+        cancels.insert(live_id.clone(), cancel_flag.clone());
+    }
+
     tauri::async_runtime::spawn(async move {
         // Emit start event
-        let _ = app_handle.emit("download-status", DownloadEvent {
-            status: "start".to_string(),
-            message: save_path.clone(),
-            progress: 0.0,
-            live_id: live_id.clone(),
-        });
+        let _ = app_handle.emit(
+            "download-status",
+            DownloadEvent {
+                status: "start".to_string(),
+                message: save_path.clone(),
+                progress: 0.0,
+                live_id: live_id.clone(),
+            },
+        );
 
-        match download_video_task(app_handle.clone(), url.clone(), save_path.clone(), live_id.clone()).await {
+        match download_video_task(
+            app_handle.clone(),
+            url.clone(),
+            save_path.clone(),
+            live_id.clone(),
+            cancel_flag.clone(),
+        )
+        .await
+        {
             Ok(_) => {
-                let _ = app_handle.emit("download-status", DownloadEvent {
-                    status: "success".to_string(),
-                    message: save_path.clone(),
-                    progress: 100.0,
-                    live_id: live_id.clone(),
-                });
+                // download_video_task emits success/cancelled itself
             }
             Err(e) => {
-                let _ = app_handle.emit("download-status", DownloadEvent {
-                    status: "error".to_string(),
-                    message: format!("{}: {}", save_path, e),
-                    progress: 0.0,
-                    live_id: live_id.clone(),
-                });
+                let _ = app_handle.emit(
+                    "download-status",
+                    DownloadEvent {
+                        status: "error".to_string(),
+                        message: format!("{}: {}", save_path, e),
+                        progress: 0.0,
+                        live_id: live_id.clone(),
+                    },
+                );
             }
+        }
+
+        // 清理注册表
+        if let Ok(mut cancels) = cancel_map.lock() {
+            cancels.remove(&live_id);
         }
     });
 
     Ok(())
 }
 
-async fn download_video_task(app_handle: tauri::AppHandle, url: String, save_path: String, live_id: String) -> Result<(), String> {
+#[tauri::command]
+async fn cancel_download(live_id: String, cancel_map: tauri::State<'_, CancelMap>) -> Result<(), String> {
+    let mut cancels = cancel_map.lock().map_err(|e| e.to_string())?;
+    if let Some(flag) = cancels.remove(&live_id) {
+        flag.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+async fn download_video_task(
+    app_handle: tauri::AppHandle,
+    url: String,
+    save_path: String,
+    live_id: String,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
+    // 检查是否已被取消
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
     let client = reqwest::Client::new();
-    
+
     if url.contains(".m3u8") {
         let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
         let text = res.text().await.map_err(|e| e.to_string())?;
         let base_url = Url::parse(&url).map_err(|e| e.to_string())?;
-        
+
         let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
-        
-        let lines: Vec<&str> = text.lines().filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with('#')
-        }).collect();
-        
+
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .collect();
+
         let total_parts = lines.len();
-        
+
         for (index, line) in lines.iter().enumerate() {
+            // 检查是否被取消
+            if cancelled.load(Ordering::SeqCst) {
+                drop(file);
+                let _ = std::fs::remove_file(&save_path);
+                let _ = app_handle.emit(
+                    "download-status",
+                    DownloadEvent {
+                        status: "cancelled".to_string(),
+                        message: save_path.clone(),
+                        progress: 0.0,
+                        live_id: live_id.clone(),
+                    },
+                );
+                return Ok(());
+            }
+
             let ts_url = base_url.join(line).map_err(|e| e.to_string())?;
-            let mut chunk_res = client.get(ts_url).send().await.map_err(|e| e.to_string())?;
-            
+            let mut chunk_res = client
+                .get(ts_url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
             while let Some(chunk) = chunk_res.chunk().await.map_err(|e| e.to_string())? {
+                // 检查是否被取消
+                if cancelled.load(Ordering::SeqCst) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&save_path);
+                    let _ = app_handle.emit(
+                        "download-status",
+                        DownloadEvent {
+                            status: "cancelled".to_string(),
+                            message: save_path.clone(),
+                            progress: 0.0,
+                            live_id: live_id.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
                 file.write_all(&chunk).map_err(|e| e.to_string())?;
             }
-            
+
             let progress = (index as f64 + 1.0) / (total_parts as f64) * 100.0;
-            let _ = app_handle.emit("download-status", DownloadEvent {
-                status: "progress".to_string(),
-                message: save_path.clone(),
-                progress,
-                live_id: live_id.clone(),
-            });
+            let _ = app_handle.emit(
+                "download-status",
+                DownloadEvent {
+                    status: "progress".to_string(),
+                    message: save_path.clone(),
+                    progress,
+                    live_id: live_id.clone(),
+                },
+            );
         }
     } else {
         let mut res = client.get(&url).send().await.map_err(|e| e.to_string())?;
         let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
         let total_size = res.content_length().unwrap_or(0);
         let mut downloaded: u64 = 0;
-        
+
         while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+            // 检查是否被取消
+            if cancelled.load(Ordering::SeqCst) {
+                drop(file);
+                let _ = std::fs::remove_file(&save_path);
+                let _ = app_handle.emit(
+                    "download-status",
+                    DownloadEvent {
+                        status: "cancelled".to_string(),
+                        message: save_path.clone(),
+                        progress: 0.0,
+                        live_id: live_id.clone(),
+                    },
+                );
+                return Ok(());
+            }
+
             file.write_all(&chunk).map_err(|e| e.to_string())?;
             downloaded += chunk.len() as u64;
             if total_size > 0 {
                 let progress = (downloaded as f64 / total_size as f64) * 100.0;
-                let _ = app_handle.emit("download-status", DownloadEvent {
-                    status: "progress".to_string(),
-                    message: save_path.clone(),
-                    progress,
-                    live_id: live_id.clone(),
-                });
+                let _ = app_handle.emit(
+                    "download-status",
+                    DownloadEvent {
+                        status: "progress".to_string(),
+                        message: save_path.clone(),
+                        progress,
+                        live_id: live_id.clone(),
+                    },
+                );
             }
         }
     }
-    
+
+    // 下载成功（未被取消）
+    let _ = app_handle.emit(
+        "download-status",
+        DownloadEvent {
+            status: "success".to_string(),
+            message: save_path.clone(),
+            progress: 100.0,
+            live_id: live_id.clone(),
+        },
+    );
+
     Ok(())
 }
 
@@ -246,12 +370,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
+        .manage::<CancelMap>(Arc::new(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
             get_live_list,
             get_record_list,
             get_live_stream_url,
             open_in_player,
-            download_video
+            download_video,
+            cancel_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
