@@ -25,6 +25,18 @@
     padding: 16px 12px 80px 12px !important; /* 顶部增加 padding 使标题下移 */
   }
 
+  /* ---------- 顶部固定区域：标题 + 筛选栏 ---------- */
+  #app-root > div:first-child {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    z-index: 100 !important;
+    background-color: rgb(32, 32, 32) !important;
+    padding: 16px 12px 12px 12px !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+  }
+
   /* ---------- 筛选按钮：显示在标题右侧 ---------- */
   #filter-toggle-btn {
     display: inline-flex;
@@ -36,7 +48,7 @@
     flex-direction: column !important;
     align-items: stretch !important;
     gap: 10px !important;
-    padding: 4px 0 !important;
+    padding: 8px 0 0 0 !important;
   }
 
   #filter-bar.open {
@@ -133,6 +145,7 @@
   #app-root > div:last-child > div:first-child {
     grid-template-columns: 1fr !important;
     gap: 14px !important;
+    margin-top: 8px !important; /* 与固定区域保持间距 */
   }
 
   /* ---------- 封面：改为 16:9 更适配横屏预览 ---------- */
