@@ -22,8 +22,9 @@ import {
   Tab,
   ProgressBar
 } from "@fluentui/react-components";
-import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular } from "@fluentui/react-icons";
+import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular } from "@fluentui/react-icons";
 import dayjs from "dayjs";
+import "./App.android.css";
 
 interface LiveItem {
   liveId: string;
@@ -61,6 +62,7 @@ function App() {
   const [downloadProgresses, setDownloadProgresses] = useState<Record<string, number>>({});
   const [filterGroup, setFilterGroup] = useState("全部");
   const [filterType, setFilterType] = useState("全部");
+  const [filterOpen, setFilterOpen] = useState(false);
   
   const toasterId = useId("toaster");
   const { dispatchToast } = useToastController(toasterId);
@@ -297,7 +299,7 @@ function App() {
   });
 
   return (
-    <div style={{ padding: "0 20px 20px 20px" }}>
+    <div id="app-root" style={{ padding: "0 20px 20px 20px" }}>
       <Toaster toasterId={toasterId} />
       
       <div style={{ 
@@ -311,9 +313,26 @@ function App() {
         padding: "20px 0 10px 0",
         backgroundColor: "rgb(32, 32, 32)"
       }}>
-        <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
 
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "16px" }}>
+          {/* Mobile filter toggle (hidden on desktop via CSS) */}
+          <Button 
+            id="filter-toggle-btn"
+            icon={<FilterRegular />}
+            appearance="outline"
+            onClick={() => setFilterOpen(prev => !prev)}
+          >
+            筛选
+          </Button>
+        </div>
+
+        <div id="filter-bar" className={filterOpen ? "open" : ""} style={{ 
+          display: "flex", 
+          gap: "12px", 
+          flexWrap: "wrap",
+          alignItems: "center"
+        }}>
           <TabList 
             selectedValue={activeTab} 
             onTabSelect={(_, data) => setActiveTab(data.value as any)}
@@ -323,7 +342,7 @@ function App() {
             <Tab value="record">录播</Tab>
           </TabList>
 
-          <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center" }}>
+          <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap" }}>
             
             <Select 
             value={filterGroup} 

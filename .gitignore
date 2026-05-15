@@ -26,3 +26,18 @@ dist-ssr
 
 # Development certificate
 devcert.pfx
+
+# Android build outputs
+*.apk
+*.aab
+*.idsig
+android.keystore
+
+# Generated Android files
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/build/
+src-tauri/gen/android/local.properties
+
+# Tauri build cache
+src-tauri/target/

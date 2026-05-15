@@ -25,7 +25,8 @@
     "dev": "vite",
     "msix": "scripts\\msix.bat",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "apk": "node scripts/apk.mjs"
   },
   "type": "module",
   "version": "0.1.0"
