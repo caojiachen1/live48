@@ -160,7 +160,8 @@ type CancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 async fn download_video(
     app_handle: tauri::AppHandle,
     url: String,
-    save_path: String,
+    save_path: Option<String>,
+    file_name: Option<String>,
     live_id: String,
 ) -> Result<(), String> {
     let cancel_map: CancelMap = app_handle.state::<CancelMap>().inner().clone();
@@ -170,13 +171,23 @@ async fn download_video(
         cancels.insert(live_id.clone(), cancel_flag.clone());
     }
 
+    // Resolve actual file path: mobile uses document_dir + file_name, desktop uses save_path
+    let resolved_path = if let Some(ref name) = file_name {
+        let doc_dir = app_handle.path().document_dir().map_err(|e| e.to_string())?;
+        doc_dir.join(name).to_string_lossy().to_string()
+    } else if let Some(ref path) = save_path {
+        path.clone()
+    } else {
+        return Err("No save path provided".to_string());
+    };
+
     tauri::async_runtime::spawn(async move {
         // Emit start event
         let _ = app_handle.emit(
             "download-status",
             DownloadEvent {
                 status: "start".to_string(),
-                message: save_path.clone(),
+                message: resolved_path.clone(),
                 progress: 0.0,
                 live_id: live_id.clone(),
             },
@@ -185,7 +196,7 @@ async fn download_video(
         match download_video_task(
             app_handle.clone(),
             url.clone(),
-            save_path.clone(),
+            resolved_path.clone(),
             live_id.clone(),
             cancel_flag.clone(),
         )
@@ -199,7 +210,7 @@ async fn download_video(
                     "download-status",
                     DownloadEvent {
                         status: "error".to_string(),
-                        message: format!("{}: {}", save_path, e),
+                        message: format!("{}: {}", resolved_path, e),
                         progress: 0.0,
                         live_id: live_id.clone(),
                     },
