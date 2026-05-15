@@ -299,88 +299,110 @@ function App() {
   });
 
   return (
-    <div id="app-root" style={{ padding: "0 20px 20px 20px" }}>
-      <Toaster toasterId={toasterId} />
-      
-      <div style={{ 
-        display: "flex", 
-        flexDirection: "column",
-        gap: "16px",
-        marginBottom: 20,
-        position: "sticky",
-        top: 0,
-        zIndex: 10,
-        padding: "20px 0 10px 0",
-        backgroundColor: "rgb(32, 32, 32)"
-      }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
-
-          {/* Mobile filter toggle (hidden on desktop via CSS) */}
-          <Button 
-            id="filter-toggle-btn"
-            icon={<FilterRegular />}
-            appearance="outline"
-            onClick={() => setFilterOpen(prev => !prev)}
-          >
-            筛选
-          </Button>
-        </div>
-
-        <div id="filter-bar" className={filterOpen ? "open" : ""} style={{ 
+      <div id="app-root" style={{ padding: "0 20px 20px 20px" }}>
+        <Toaster toasterId={toasterId} />
+        
+        <div style={{ 
           display: "flex", 
-          gap: "12px", 
-          flexWrap: "wrap",
-          alignItems: "center"
+          flexDirection: "column",
+          gap: "16px",
+          marginBottom: 20,
+          position: "sticky",
+          top: 0,
+          zIndex: 10,
+          padding: "20px 0 10px 0",
+          backgroundColor: "rgb(32, 32, 32)"
         }}>
-          <TabList 
-            selectedValue={activeTab} 
-            onTabSelect={(_, data) => setActiveTab(data.value as any)}
-            style={{ flexShrink: 0 }}
-          >
-            <Tab value="live">直播</Tab>
-            <Tab value="record">录播</Tab>
-          </TabList>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
 
-          <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap" }}>
-            
+            {/* Mobile filter toggle (hidden on desktop via CSS) */}
+            <Button 
+              id="filter-toggle-btn"
+              icon={<FilterRegular />}
+              appearance="outline"
+              onClick={() => setFilterOpen(prev => !prev)}
+            >
+              筛选
+            </Button>
+          </div>
+
+          <div id="filter-bar" className={filterOpen ? "open" : ""} style={{ 
+            display: "flex", 
+            gap: "12px", 
+            flexWrap: "wrap",
+            alignItems: "center"
+          }}>
+            <TabList 
+              selectedValue={activeTab} 
+              onTabSelect={(_, data) => setActiveTab(data.value as any)}
+              style={{ flexShrink: 0 }}
+            >
+              <Tab value="live">直播</Tab>
+              <Tab value="record">录播</Tab>
+            </TabList>
+
+            <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap" }}>
+              
+              <Select 
+              value={filterGroup} 
+              onChange={(_, data) => setFilterGroup(data.value)}
+              style={{ minWidth: "120px" }}
+            >
+              <option value="全部">全部团体</option>
+              <option value="SNH48">SNH48</option>
+              <option value="GNZ48">GNZ48</option>
+              <option value="BEJ48">BEJ48</option>
+              <option value="CKG48">CKG48</option>
+              <option value="CGT48">CGT48</option>
+            </Select>
+
             <Select 
-            value={filterGroup} 
-            onChange={(_, data) => setFilterGroup(data.value)}
-            style={{ minWidth: "120px" }}
-          >
-            <option value="全部">全部团体</option>
-            <option value="SNH48">SNH48</option>
-            <option value="GNZ48">GNZ48</option>
-            <option value="BEJ48">BEJ48</option>
-            <option value="CKG48">CKG48</option>
-            <option value="CGT48">CGT48</option>
-          </Select>
+              value={filterType} 
+              onChange={(_, data) => setFilterType(data.value)}
+              style={{ minWidth: "120px" }}
+            >
+              <option value="全部">全部类型</option>
+              <option value="视频">仅视频</option>
+              <option value="电台">仅电台</option>
+              <option value="连麦">仅连麦</option>
+            </Select>
 
-          <Select 
-            value={filterType} 
-            onChange={(_, data) => setFilterType(data.value)}
-            style={{ minWidth: "120px" }}
-          >
-            <option value="全部">全部类型</option>
-            <option value="视频">仅视频</option>
-            <option value="电台">仅电台</option>
-            <option value="连麦">仅连麦</option>
-          </Select>
+            <Input 
+              contentBefore={<SearchRegular />}
+              placeholder="搜索成员或标题..." 
+              value={searchQuery}
+              onChange={(_, data) => setSearchQuery(data.value)}
+              style={{ maxWidth: "300px", width: "100%" }}
+            />
+            <Button icon={<ArrowClockwiseRegular />} onClick={fetchLiveList} disabled={loading}>
+              {loading ? "刷新中..." : "刷新列表"}
+            </Button>
+          </div>
+          </div>
+        </div>
 
-          <Input 
-            contentBefore={<SearchRegular />}
-            placeholder="搜索成员或标题..." 
-            value={searchQuery}
-            onChange={(_, data) => setSearchQuery(data.value)}
-            style={{ maxWidth: "300px", width: "100%" }}
-          />
-          <Button icon={<ArrowClockwiseRegular />} onClick={fetchLiveList} disabled={loading}>
-            {loading ? "刷新中..." : "刷新列表"}
-          </Button>
-        </div>
-        </div>
-      </div>
+        {/* Bottom Navigation - Material Design Tab (Mobile only) */}
+        <nav id="bottom-nav" className="bottom-nav">
+          <button 
+            className={`bottom-nav-item ${activeTab === "live" ? "active" : ""}`}
+            onClick={() => setActiveTab("live")}
+          >
+            <svg className="bottom-nav-icon" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+            </svg>
+            <span className="bottom-nav-label">直播</span>
+          </button>
+          <button 
+            className={`bottom-nav-item ${activeTab === "record" ? "active" : ""}`}
+            onClick={() => setActiveTab("record")}
+          >
+            <svg className="bottom-nav-icon" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/>
+            </svg>
+            <span className="bottom-nav-label">录播</span>
+          </button>
+        </nav>
 
       {loading && currentList.length === 0 ? (
          <Spinner label="加载列表中..." />
