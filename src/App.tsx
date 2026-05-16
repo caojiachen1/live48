@@ -221,18 +221,12 @@ function App() {
           { intent: "success" }
         );
       } else if (action === "download") {
-        const isMobile = /Android/i.test(navigator.userAgent);
-        let filePath: string | undefined;
-        if (isMobile) {
-          filePath = `Live_${liveId}.ts`;
-        } else {
-          filePath = await save({
-            filters: [{ name: 'Video File', extensions: ['ts', 'mp4', 'flv'] }],
-            defaultPath: `Live_${liveId}.ts`
-          }) || undefined;
-        }
+        const filePath = await save({
+          filters: [{ name: 'Video File', extensions: ['ts', 'mp4', 'flv'] }],
+          defaultPath: `Live_${liveId}.ts`
+        });
         if (filePath) {
-          await invoke("download_video", { url, savePath: isMobile ? undefined : filePath, fileName: isMobile ? filePath : undefined, liveId });
+          await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
         await invoke("open_in_player", { url });

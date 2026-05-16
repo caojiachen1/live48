@@ -1,12 +1,13 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
+use tauri_plugin_fs::FsExt;
 use url::Url;
 
 // 构造统一的请求头
@@ -160,8 +161,7 @@ type CancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 async fn download_video(
     app_handle: tauri::AppHandle,
     url: String,
-    save_path: Option<String>,
-    file_name: Option<String>,
+    save_path: String,
     live_id: String,
 ) -> Result<(), String> {
     let cancel_map: CancelMap = app_handle.state::<CancelMap>().inner().clone();
@@ -171,23 +171,13 @@ async fn download_video(
         cancels.insert(live_id.clone(), cancel_flag.clone());
     }
 
-    // Resolve actual file path: mobile uses document_dir + file_name, desktop uses save_path
-    let resolved_path = if let Some(ref name) = file_name {
-        let doc_dir = app_handle.path().document_dir().map_err(|e| e.to_string())?;
-        doc_dir.join(name).to_string_lossy().to_string()
-    } else if let Some(ref path) = save_path {
-        path.clone()
-    } else {
-        return Err("No save path provided".to_string());
-    };
-
     tauri::async_runtime::spawn(async move {
         // Emit start event
         let _ = app_handle.emit(
             "download-status",
             DownloadEvent {
                 status: "start".to_string(),
-                message: resolved_path.clone(),
+                message: save_path.clone(),
                 progress: 0.0,
                 live_id: live_id.clone(),
             },
@@ -196,7 +186,7 @@ async fn download_video(
         match download_video_task(
             app_handle.clone(),
             url.clone(),
-            resolved_path.clone(),
+            save_path.clone(),
             live_id.clone(),
             cancel_flag.clone(),
         )
@@ -210,7 +200,7 @@ async fn download_video(
                     "download-status",
                     DownloadEvent {
                         status: "error".to_string(),
-                        message: format!("{}: {}", resolved_path, e),
+                        message: format!("{}: {}", save_path, e),
                         progress: 0.0,
                         live_id: live_id.clone(),
                     },
@@ -248,14 +238,212 @@ async fn download_video_task(
         return Ok(());
     }
 
+    let is_content_uri = save_path.starts_with("content://");
+
+    if is_content_uri {
+        // Android content:// URI: use tauri-plugin-fs with spawn_blocking
+        download_via_content_resolver(&app_handle, &url, &save_path, &live_id, &cancelled).await
+    } else {
+        // Desktop/regular path: use std::fs directly
+        download_via_std_fs(&app_handle, &url, &save_path, &live_id, &cancelled).await
+    }
+}
+
+async fn download_via_content_resolver(
+    app_handle: &tauri::AppHandle,
+    url: &str,
+    save_path: &str,
+    live_id: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
 
     if url.contains(".m3u8") {
-        let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let res = client.get(url).send().await.map_err(|e| e.to_string())?;
         let text = res.text().await.map_err(|e| e.to_string())?;
-        let base_url = Url::parse(&url).map_err(|e| e.to_string())?;
+        let base_url = Url::parse(url).map_err(|e| e.to_string())?;
 
-        let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .collect();
+
+        let total_parts = lines.len();
+        let app_handle = app_handle.clone();
+        let save_path = save_path.to_string();
+        let live_id = live_id.to_string();
+        let cancelled = cancelled.clone();
+        let lines_data: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+
+        // Use spawn_blocking for content:// URI operations
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let fs = app_handle.fs();
+            let mut options = tauri_plugin_fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Parse content:// URI as Url for tauri-plugin-fs
+            let file_path = url::Url::parse(&save_path).map_err(|e| e.to_string())?;
+            let mut file = fs.open(
+                file_path,
+                options,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let sync_client = reqwest::blocking::Client::new();
+
+            for (index, line) in lines_data.iter().enumerate() {
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = app_handle.emit(
+                        "download-status",
+                        DownloadEvent {
+                            status: "cancelled".to_string(),
+                            message: save_path.clone(),
+                            progress: 0.0,
+                            live_id: live_id.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+
+                let ts_url = base_url.join(line).map_err(|e| e.to_string())?;
+                let mut chunk_res = sync_client
+                    .get(ts_url)
+                    .send()
+                    .map_err(|e| e.to_string())?;
+
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = chunk_res.read(&mut buf).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    if cancelled.load(Ordering::SeqCst) {
+                        let _ = app_handle.emit(
+                            "download-status",
+                            DownloadEvent {
+                                status: "cancelled".to_string(),
+                                message: save_path.clone(),
+                                progress: 0.0,
+                                live_id: live_id.clone(),
+                            },
+                        );
+                        return Ok(());
+                    }
+                    file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                }
+
+                let progress = (index as f64 + 1.0) / (total_parts as f64) * 100.0;
+                let _ = app_handle.emit(
+                    "download-status",
+                    DownloadEvent {
+                        status: "progress".to_string(),
+                        message: save_path.clone(),
+                        progress,
+                        live_id: live_id.clone(),
+                    },
+                );
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    } else {
+        let app_handle = app_handle.clone();
+        let save_path = save_path.to_string();
+        let live_id = live_id.to_string();
+        let cancelled = cancelled.clone();
+        let url = url.to_string();
+
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let fs = app_handle.fs();
+            let mut options = tauri_plugin_fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // Parse content:// URI as Url for tauri-plugin-fs
+            let file_path = url::Url::parse(&save_path).map_err(|e| e.to_string())?;
+            let mut file = fs.open(
+                file_path,
+                options,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let sync_client = reqwest::blocking::Client::new();
+            let mut res = sync_client.get(&url).send().map_err(|e| e.to_string())?;
+            let total_size = res.content_length().unwrap_or(0);
+            let mut downloaded: u64 = 0;
+
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = res.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = app_handle.emit(
+                        "download-status",
+                        DownloadEvent {
+                            status: "cancelled".to_string(),
+                            message: save_path.clone(),
+                            progress: 0.0,
+                            live_id: live_id.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+
+                file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                downloaded += n as u64;
+                if total_size > 0 {
+                    let progress = (downloaded as f64 / total_size as f64) * 100.0;
+                    let _ = app_handle.emit(
+                        "download-status",
+                        DownloadEvent {
+                            status: "progress".to_string(),
+                            message: save_path.clone(),
+                            progress,
+                            live_id: live_id.clone(),
+                        },
+                    );
+                }
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    }
+
+    // 下载成功
+    let _ = app_handle.emit(
+        "download-status",
+        DownloadEvent {
+            status: "success".to_string(),
+            message: save_path.to_string(),
+            progress: 100.0,
+            live_id: live_id.to_string(),
+        },
+    );
+
+    Ok(())
+}
+
+async fn download_via_std_fs(
+    app_handle: &tauri::AppHandle,
+    url: &str,
+    save_path: &str,
+    live_id: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+
+    if url.contains(".m3u8") {
+        let res = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let text = res.text().await.map_err(|e| e.to_string())?;
+        let base_url = Url::parse(url).map_err(|e| e.to_string())?;
+
+        let mut file = std::fs::File::create(save_path).map_err(|e| e.to_string())?;
 
         let lines: Vec<&str> = text
             .lines()
@@ -268,17 +456,16 @@ async fn download_video_task(
         let total_parts = lines.len();
 
         for (index, line) in lines.iter().enumerate() {
-            // 检查是否被取消
             if cancelled.load(Ordering::SeqCst) {
                 drop(file);
-                let _ = std::fs::remove_file(&save_path);
+                let _ = std::fs::remove_file(save_path);
                 let _ = app_handle.emit(
                     "download-status",
                     DownloadEvent {
                         status: "cancelled".to_string(),
-                        message: save_path.clone(),
+                        message: save_path.to_string(),
                         progress: 0.0,
-                        live_id: live_id.clone(),
+                        live_id: live_id.to_string(),
                     },
                 );
                 return Ok(());
@@ -292,17 +479,16 @@ async fn download_video_task(
                 .map_err(|e| e.to_string())?;
 
             while let Some(chunk) = chunk_res.chunk().await.map_err(|e| e.to_string())? {
-                // 检查是否被取消
                 if cancelled.load(Ordering::SeqCst) {
                     drop(file);
-                    let _ = std::fs::remove_file(&save_path);
+                    let _ = std::fs::remove_file(save_path);
                     let _ = app_handle.emit(
                         "download-status",
                         DownloadEvent {
                             status: "cancelled".to_string(),
-                            message: save_path.clone(),
+                            message: save_path.to_string(),
                             progress: 0.0,
-                            live_id: live_id.clone(),
+                            live_id: live_id.to_string(),
                         },
                     );
                     return Ok(());
@@ -315,30 +501,29 @@ async fn download_video_task(
                 "download-status",
                 DownloadEvent {
                     status: "progress".to_string(),
-                    message: save_path.clone(),
+                    message: save_path.to_string(),
                     progress,
-                    live_id: live_id.clone(),
+                    live_id: live_id.to_string(),
                 },
             );
         }
     } else {
-        let mut res = client.get(&url).send().await.map_err(|e| e.to_string())?;
-        let mut file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+        let mut res = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let mut file = std::fs::File::create(save_path).map_err(|e| e.to_string())?;
         let total_size = res.content_length().unwrap_or(0);
         let mut downloaded: u64 = 0;
 
         while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
-            // 检查是否被取消
             if cancelled.load(Ordering::SeqCst) {
                 drop(file);
-                let _ = std::fs::remove_file(&save_path);
+                let _ = std::fs::remove_file(save_path);
                 let _ = app_handle.emit(
                     "download-status",
                     DownloadEvent {
                         status: "cancelled".to_string(),
-                        message: save_path.clone(),
+                        message: save_path.to_string(),
                         progress: 0.0,
-                        live_id: live_id.clone(),
+                        live_id: live_id.to_string(),
                     },
                 );
                 return Ok(());
@@ -352,23 +537,23 @@ async fn download_video_task(
                     "download-status",
                     DownloadEvent {
                         status: "progress".to_string(),
-                        message: save_path.clone(),
+                        message: save_path.to_string(),
                         progress,
-                        live_id: live_id.clone(),
+                        live_id: live_id.to_string(),
                     },
                 );
             }
         }
     }
 
-    // 下载成功（未被取消）
+    // 下载成功
     let _ = app_handle.emit(
         "download-status",
         DownloadEvent {
             status: "success".to_string(),
-            message: save_path.clone(),
+            message: save_path.to_string(),
             progress: 100.0,
-            live_id: live_id.clone(),
+            live_id: live_id.to_string(),
         },
     );
 
@@ -381,6 +566,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_fs::init())
         .manage::<CancelMap>(Arc::new(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
             get_live_list,
