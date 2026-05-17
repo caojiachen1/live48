@@ -138,9 +138,34 @@ fn open_in_player(url: String) -> Result<(), String> {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         let _ = Command::new("open").arg(&url).spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("xdg-open").arg(&url).spawn();
+    }
+
+    // Android: The front-end handles playback via in-app video player (VideoPlayer component)
+    // This command is provided as a fallback to open in system browser, which
+    // may trigger the system's built-in video player for stream URLs
+    #[cfg(target_os = "android")]
+    {
+        use std::process::Stdio;
+        // Use am start to launch an Android Intent to view the stream URL
+        // This will open the system's built-in video player
+        let _ = Command::new("am")
+            .args(&[
+                "start",
+                "-a", "android.intent.action.VIEW",
+                "-d", &url,
+                "-t", "video/*",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 
     Ok(())

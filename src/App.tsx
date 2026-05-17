@@ -23,6 +23,7 @@ import {
   ProgressBar
 } from "@fluentui/react-components";
 import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular } from "@fluentui/react-icons";
+import VideoPlayer from "./VideoPlayer";
 import dayjs from "dayjs";
 import "./App.android.css";
 
@@ -64,6 +65,10 @@ function App() {
   const [filterType, setFilterType] = useState("全部");
   const [filterOpen, setFilterOpen] = useState(false);
   
+  // Video player state (used on mobile/webview platforms)
+  const [playingItem, setPlayingItem] = useState<LiveItem | null>(null);
+  const [playingUrl, setPlayingUrl] = useState<string>("");
+
   const toasterId = useId("toaster");
   const { dispatchToast } = useToastController(toasterId);
 
@@ -210,7 +215,11 @@ function App() {
     };
   }, []);
 
-  const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download") => {
+  // Detect if running in a mobile WebView (Android)
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) 
+    || window.innerWidth <= 768;
+
+  const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download", item?: LiveItem) => {
     try {
       const url: string = await invoke("get_live_stream_url", { liveId });
       
@@ -229,11 +238,18 @@ function App() {
           await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
-        await invoke("open_in_player", { url });
-        dispatchToast(
-          <Toast><ToastTitle>正在启动播放器</ToastTitle></Toast>,
-          { intent: "info" }
-        );
+        // On mobile/Android WebView, use the in-app video player
+        if (isMobile && item) {
+          setPlayingUrl(url);
+          setPlayingItem(item);
+        } else {
+          // Desktop: use external player (PotPlayer, etc.)
+          await invoke("open_in_player", { url });
+          dispatchToast(
+            <Toast><ToastTitle>正在启动播放器</ToastTitle></Toast>,
+            { intent: "info" }
+          );
+        }
       }
     } catch (e) {
       console.error(e);
@@ -310,7 +326,7 @@ function App() {
           position: "sticky",
           top: 0,
           zIndex: 10,
-          padding: "20px 0 10px 0",
+          padding: "32px 0 10px 0",
           backgroundColor: "rgb(32, 32, 32)"
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -500,18 +516,18 @@ function App() {
                 >
                   <Button 
                     icon={<CopyRegular />} 
-                    onClick={() => handlePlayOrCopy(item.liveId, "copy")}
+                    onClick={() => handlePlayOrCopy(item.liveId, "copy", item)}
                   >地址</Button>
                   {activeTab === "record" && (
                     <Button 
                       icon={<ArrowDownloadRegular />} 
-                      onClick={() => handlePlayOrCopy(item.liveId, "download")}
+                      onClick={() => handlePlayOrCopy(item.liveId, "download", item)}
                     >下载</Button>
                   )}
                   <Button 
                     appearance="primary" 
                     icon={<PlayRegular />} 
-                    onClick={() => handlePlayOrCopy(item.liveId, "play")}
+                    onClick={() => handlePlayOrCopy(item.liveId, "play", item)}
                   >播放</Button>
                 </div>
               </Card>
@@ -546,6 +562,18 @@ function App() {
             </div>
           )}
         </div>
+      )}
+
+      {/* In-app video player (used on mobile/Android WebView) */}
+      {playingItem && (
+        <VideoPlayer
+          liveId={playingItem.liveId}
+          title={playingItem.title || "无标题"}
+          nickname={playingItem.userInfo.nickname}
+          streamUrl={playingUrl}
+          isLive={activeTab === "live"}
+          onClose={() => { setPlayingItem(null); setPlayingUrl(""); }}
+        />
       )}
     </div>
   );
