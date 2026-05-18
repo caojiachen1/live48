@@ -27,6 +27,11 @@ import VideoPlayer from "./VideoPlayer";
 import dayjs from "dayjs";
 import "./App.android.css";
 
+interface NativeAndroidPlayerBridge {
+  isAvailable?: () => boolean;
+  playStream: (url: string, title: string, nickname: string, isLive: boolean) => void;
+}
+
 interface LiveItem {
   liveId: string;
   title: string;
@@ -216,6 +221,7 @@ function App() {
   }, []);
 
   // Detect if running in a mobile WebView (Android)
+  const isAndroid = /Android/i.test(navigator.userAgent);
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) 
     || window.innerWidth <= 768;
 
@@ -238,7 +244,18 @@ function App() {
           await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
-        // On mobile/Android WebView, use the in-app video player
+        // Android: all streams (live + record) use native player first
+        if (isAndroid && item) {
+          const bridge = (window as Window & { Live48NativePlayer?: NativeAndroidPlayerBridge }).Live48NativePlayer;
+          if (bridge && typeof bridge.playStream === "function") {
+            if (!bridge.isAvailable || bridge.isAvailable()) {
+              bridge.playStream(url, item.title || "无标题", item.userInfo.nickname, activeTab === "live");
+              return;
+            }
+          }
+        }
+
+        // Non-Android mobile fallback: in-app web player
         if (isMobile && item) {
           setPlayingUrl(url);
           setPlayingItem(item);

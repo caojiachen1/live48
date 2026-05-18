@@ -13,6 +13,17 @@ interface VideoPlayerProps {
 
 const isAndroid = /Android/i.test(navigator.userAgent);
 
+interface NativeAndroidPlayerBridge {
+  isAvailable?: () => boolean;
+  playStream: (url: string, title: string, nickname: string, isLive: boolean) => void;
+}
+
+declare global {
+  interface Window {
+    Live48NativePlayer?: NativeAndroidPlayerBridge;
+  }
+}
+
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -27,6 +38,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
   const containerRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const animFrameRef = useRef<number>(0);
+  const retryCountRef = useRef<number>(0);
   const [streamUrl, setStreamUrl] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
@@ -39,8 +51,17 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
   const [duration, setDuration] = useState(0);
   const [buffered, setBuffered] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
-  const [showControls, setShowControls] = useState(true);
+  const [showControls, setShowControls] = useState(false);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const tryOpenNativeAndroidPlayer = useCallback((url: string) => {
+    if (!isAndroid) return false;
+    const bridge = window.Live48NativePlayer;
+    if (!bridge || typeof bridge.playStream !== "function") return false;
+    if (typeof bridge.isAvailable === "function" && !bridge.isAvailable()) return false;
+    bridge.playStream(url, title || "", nickname || "", Boolean(isLive));
+    return true;
+  }, [title, nickname, isLive]);
 
   const flashControls = useCallback(() => {
     setShowControls(true);
@@ -117,38 +138,67 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
     };
   }, [isSeeking]);
 
-  // Load stream URL (skip fetch if already provided via props)
+  // Load stream URL
   useEffect(() => {
+    let cancelled = false;
+
     const loadStream = async () => {
       try {
-        setLoading(true);
-        setError("");
+        if (!cancelled) {
+          setLoading(true);
+          setError("");
+        }
 
         let url: string;
         if (preUrl) {
-          url = preUrl;
+          if (preUrl.startsWith("rtmp://") || preUrl.startsWith("rtmps://")) {
+            try {
+              url = await invoke("get_playable_stream_url", { liveId }) as string;
+            } catch {
+              url = await invoke("get_live_stream_url_v2", { liveId }) as string;
+            }
+          } else {
+            url = preUrl;
+          }
         } else {
-          url = await invoke("get_live_stream_url", { liveId });
+          try {
+            url = await invoke("get_playable_stream_url", { liveId }) as string;
+          } catch {
+            url = await invoke("get_live_stream_url_v2", { liveId }) as string;
+          }
         }
+
+        if (cancelled) return;
         setStreamUrl(url);
 
         if (url.startsWith("rtmp://") || url.startsWith("rtmps://")) {
-          setError("RTMP 流无法在浏览器中直接播放，请使用外部播放器打开");
+          if (tryOpenNativeAndroidPlayer(url)) {
+            onClose();
+            return;
+          }
+          setError("获取到的流地址为 RTMP 协议，当前环境无法直接播放");
           return;
         }
 
-        if (isAndroid && (url.includes(".m3u8") || isLive)) {
+        if (isAndroid && isLive) {
           setUseCanvas(true);
         }
       } catch (e) {
         console.error(e);
-        setError("获取播放地址失败");
+        if (!cancelled) {
+          setError("获取播放地址失败");
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
     loadStream();
-  }, [liveId, preUrl]);
+    return () => {
+      cancelled = true;
+    };
+  }, [liveId, preUrl, isLive, onClose, tryOpenNativeAndroidPlayer]);
 
   // Initialize player
   useEffect(() => {
@@ -156,6 +206,26 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
 
     const video = videoRef.current;
     let cancelled = false;
+    retryCountRef.current = 0;
+
+    // 尝试在错误后恢复，最多重试3次
+    const retryPlay = () => {
+      if (cancelled || retryCountRef.current >= 3) return;
+      retryCountRef.current++;
+      console.log(`重试播放 (${retryCountRef.current}/3)...`);
+      setTimeout(() => {
+        if (!cancelled && video) {
+          if (hlsRef.current) {
+            hlsRef.current.destroy();
+            hlsRef.current = null;
+          }
+          video.pause();
+          video.removeAttribute("src");
+          video.load();
+          initPlayer();
+        }
+      }, 2000 * retryCountRef.current);
+    };
 
     const initPlayer = async () => {
       try {
@@ -172,6 +242,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
                 maxMaxBufferLength: 60,
                 startLevel: -1,
                 capLevelToPlayerSize: true,
+                debug: false,
               });
               hls.loadSource(streamUrl);
               hls.attachMedia(video);
@@ -179,32 +250,50 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
                 if (!cancelled) {
                   video.play().then(() => {
                     if (useCanvas) startCanvasLoop();
+                    retryCountRef.current = 0;
                   }).catch((e) => {
-                    console.error(e);
-                    setError("播放失败，请尝试使用外部播放器");
+                    console.error("play failed:", e);
+                    // 尝试恢复
+                    setTimeout(() => {
+                      if (!cancelled) video.play().catch(console.error);
+                    }, 1000);
                   });
                 }
               });
               hls.on(Hls.Events.ERROR, (_, data) => {
                 if (data.fatal) {
                   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    console.log("HLS network error, reloading...");
                     hls.startLoad();
+                  } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    console.log("HLS media error, recovering...");
+                    hls.recoverMediaError();
                   } else {
-                    setError("播放失败：视频流错误");
+                    console.error("HLS fatal error:", data.type, data.details);
+                    // 尝试重试
+                    retryPlay();
                   }
                 }
               });
               hlsRef.current = hls;
             } else {
-              setError("当前浏览器不支持 HLS 播放");
+              // hls.js 不支持，直接设置 src（Android 原生可能支持 HLS）
+              video.src = streamUrl;
+              video.play().then(() => {
+                if (useCanvas) startCanvasLoop();
+              }).catch((e) => {
+                console.error("direct play failed:", e);
+                setError("播放失败");
+              });
             }
           } else {
+            // 浏览器原生支持 HLS（如 Safari/macOS）
             video.src = streamUrl;
             video.play().then(() => {
               if (useCanvas) startCanvasLoop();
             }).catch((e) => {
-              console.error(e);
-              setError("播放失败，请尝试使用外部播放器");
+              console.error("native HLS play failed:", e);
+              setError("播放失败");
             });
           }
         } else {
@@ -212,8 +301,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           video.play().then(() => {
             if (useCanvas) startCanvasLoop();
           }).catch((e) => {
-            console.error(e);
-            setError("播放失败，请尝试使用外部播放器");
+            console.error("direct play failed:", e);
+            setError("播放失败");
           });
         }
       } catch (e) {
@@ -315,17 +404,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
     }
   }, [showControls, flashControls]);
 
-  // Open in external player
-  const openExternally = useCallback(async () => {
-    if (streamUrl) {
-      try {
-        await invoke("open_in_player", { url: streamUrl });
-      } catch (e) {
-        console.error(e);
-      }
-    }
-  }, [streamUrl]);
-
   // Close overlay when clicking background (not video area)
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === containerRef.current) onClose();
@@ -364,13 +442,16 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
         WebkitUserSelect: "none",
       }}
     >
-      {/* Top bar — always visible, above video */}
+      {/* Top bar */}
       <div
         style={{
           display: "flex",
           alignItems: "center",
           padding: "24px 16px 10px 16px",
           flexShrink: 0,
+          opacity: showControls ? 1 : 0,
+          transition: "opacity 0.25s ease",
+          pointerEvents: showControls ? "auto" : "none",
         }}
       >
         <button
@@ -403,7 +484,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
         </div>
       </div>
 
-      {/* Video area — fills remaining space */}
+      {/* Video area */}
       <div
         onClick={handleVideoClick}
         style={{
@@ -416,7 +497,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           minHeight: 0,
         }}
       >
-        {/* Loading */}
         {loading && (
           <div style={{ textAlign: "center", color: "rgba(255,255,255,0.7)", zIndex: 5 }}>
             <div
@@ -434,47 +514,27 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           </div>
         )}
 
-        {/* Error */}
         {error && (
           <div style={{ textAlign: "center", color: "#ff6b6b", padding: "20px", zIndex: 5 }}>
             <div style={{ fontSize: "48px", marginBottom: "12px" }}>!</div>
             <div style={{ marginBottom: "16px" }}>{error}</div>
-            <div style={{ display: "flex", gap: "12px", justifyContent: "center" }}>
-              {(streamUrl.startsWith("rtmp://") || streamUrl.startsWith("rtmps://")) && (
-                <button
-                  onClick={openExternally}
-                  style={{
-                    padding: "10px 24px",
-                    backgroundColor: "#bb86fc",
-                    color: "white",
-                    border: "none",
-                    borderRadius: "8px",
-                    fontSize: "16px",
-                    cursor: "pointer",
-                  }}
-                >
-                  用外部播放器打开
-                </button>
-              )}
-              <button
-                onClick={onClose}
-                style={{
-                  padding: "10px 24px",
-                  backgroundColor: "rgba(255,255,255,0.15)",
-                  color: "white",
-                  border: "none",
-                  borderRadius: "8px",
-                  fontSize: "16px",
-                  cursor: "pointer",
-                }}
-              >
-                关闭
-              </button>
-            </div>
+            <button
+              onClick={onClose}
+              style={{
+                padding: "10px 24px",
+                backgroundColor: "rgba(255,255,255,0.15)",
+                color: "white",
+                border: "none",
+                borderRadius: "8px",
+                fontSize: "16px",
+                cursor: "pointer",
+              }}
+            >
+              关闭
+            </button>
           </div>
         )}
 
-        {/* Canvas (Android distortion workaround) */}
         <canvas
           ref={canvasRef}
           style={{
@@ -486,11 +546,11 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           }}
         />
 
-        {/* Video element */}
         <video
           ref={videoRef}
           playsInline
-          crossOrigin="anonymous"
+          // 不设置 crossOrigin="anonymous" 以避免与某些 HLS 流发生 CORS 冲突
+          // 某些流服务器可能不返回 CORS 头部，导致播放失败
           style={{
             display: loading || error ? "none" : useCanvas ? "none" : "block",
             maxWidth: "100%",
@@ -502,7 +562,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           }}
         />
 
-        {/* Center play/pause icon — no background box, shows when controls visible or paused */}
         {!loading && !error && (
           <div
             onClick={(e) => { e.stopPropagation(); togglePlay(); }}
@@ -514,11 +573,11 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              opacity: showControls || !isPlaying ? 0.9 : 0,
+              opacity: showControls ? 0.9 : 0,
               transition: "opacity 0.25s ease",
               cursor: "pointer",
               zIndex: 10,
-              pointerEvents: showControls || !isPlaying ? "auto" : "none",
+              pointerEvents: showControls ? "auto" : "none",
             }}
           >
             {isPlaying ? (
@@ -530,7 +589,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
         )}
       </div>
 
-      {/* Bottom controls — below video, auto-hides after 3s */}
+      {/* Bottom controls */}
       {!loading && !error && (
         <div
           style={{
@@ -541,7 +600,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
             pointerEvents: showControls ? "auto" : "none",
           }}
         >
-          {/* Progress bar — only for seekable (VOD) content */}
           {isSeekable ? (
             <div
               ref={progressRef}
@@ -603,7 +661,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
             </div>
           )}
 
-          {/* Time and play/pause row */}
           <div style={{
             display: "flex",
             alignItems: "center",

@@ -1,4 +1,6 @@
 <resources>
     <string name="app_name">live48</string>
     <string name="main_activity_title">live48</string>
+    <string name="native_player_close">关闭播放</string>
+    <string name="default_video_title">无标题</string>
 </resources>

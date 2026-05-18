@@ -74,6 +74,8 @@ async fn get_record_list(next: String) -> Result<Value, String> {
     Ok(json)
 }
 
+/// 获取直播/录播流地址（从 getLiveOne 接口）
+/// 可能返回 rtmp:// 或 https://...m3u8
 #[tauri::command]
 async fn get_live_stream_url(live_id: String) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -95,6 +97,107 @@ async fn get_live_stream_url(live_id: String) -> Result<String, String> {
         Ok(path.to_string())
     } else {
         Err("Failed to parse playStreamPath".to_string())
+    }
+}
+
+/// 获取直播流地址（使用 getlivestream 接口，streamType=3）
+/// 这个接口返回的通常是 HTTPS m3u8 地址，更适合浏览器播放
+#[tauri::command]
+async fn get_live_stream_url_v2(live_id: String) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "liveId": live_id,
+        "streamType": 3
+    });
+
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getlivestream")
+        .headers(get_headers())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: Value = res.json().await.map_err(|e| e.to_string())?;
+
+    // getlivestream 接口的 content 字段直接是字符串地址
+    if let Some(path) = json["content"].as_str() {
+        Ok(path.to_string())
+    } else {
+        // 如果 getlivestream 失败，回退到 getLiveOne
+        get_live_stream_url(live_id).await
+    }
+}
+
+/// 尝试获取可播放的流地址（优先 HTTPS m3u8，避免 RTMP）
+/// 如果 getLiveOne 返回 RTMP，尝试用 getlivestream 拿 HTTPS 地址
+/// 如果返回的 playStreamPath 是 RTMP，尝试从 playStreams 中取 HTTPS 流
+#[tauri::command]
+async fn get_playable_stream_url(live_id: String) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    // 方法1：先尝试 getOne 看 playStreams 中是否有 HTTPS 流
+    let body1 = serde_json::json!({ "liveId": live_id });
+    let res1 = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveOne")
+        .headers(get_headers())
+        .json(&body1)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let json1: Value = res1.json().await.map_err(|e| e.to_string())?;
+
+    // 先看 playStreams（公演直播有多个清晰度）
+    if let Some(streams) = json1["content"]["playStreams"].as_array() {
+        // 优先选 streamType=3（超清），其次 streamType=1（标清）
+        for st in &[3, 1, 2] {
+            for stream in streams {
+                if stream["streamType"].as_i64() == Some(*st) {
+                    if let Some(path) = stream["streamPath"].as_str() {
+                        if !path.starts_with("rtmp://") && !path.starts_with("rtmps://") {
+                            return Ok(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // playStreams 中全是 RTMP，fallback 继续
+    }
+
+    // 看 playStreamPath
+    if let Some(path) = json1["content"]["playStreamPath"].as_str() {
+        if !path.starts_with("rtmp://") && !path.starts_with("rtmps://") {
+            return Ok(path.to_string());
+        }
+    }
+
+    // 方法2：playStreamPath 是 RTMP，尝试 getlivestream
+    let body2 = serde_json::json!({
+        "liveId": live_id,
+        "streamType": 3
+    });
+    let res2 = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getlivestream")
+        .headers(get_headers())
+        .json(&body2)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let json2: Value = res2.json().await.map_err(|e| e.to_string())?;
+
+    if let Some(path) = json2["content"].as_str() {
+        if !path.starts_with("rtmp://") && !path.starts_with("rtmps://") {
+            return Ok(path.to_string());
+        }
+        // 如果 getlivestream 也返回 RTMP，只能返回原地址
+        return Ok(path.to_string());
+    }
+
+    // 最后 fallback：返回原来的 playStreamPath
+    if let Some(path) = json1["content"]["playStreamPath"].as_str() {
+        Ok(path.to_string())
+    } else {
+        Err("无法获取流地址".to_string())
     }
 }
 
@@ -146,26 +249,6 @@ fn open_in_player(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let _ = Command::new("xdg-open").arg(&url).spawn();
-    }
-
-    // Android: The front-end handles playback via in-app video player (VideoPlayer component)
-    // This command is provided as a fallback to open in system browser, which
-    // may trigger the system's built-in video player for stream URLs
-    #[cfg(target_os = "android")]
-    {
-        use std::process::Stdio;
-        // Use am start to launch an Android Intent to view the stream URL
-        // This will open the system's built-in video player
-        let _ = Command::new("am")
-            .args(&[
-                "start",
-                "-a", "android.intent.action.VIEW",
-                "-d", &url,
-                "-t", "video/*",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
     }
 
     Ok(())
@@ -597,6 +680,8 @@ pub fn run() {
             get_live_list,
             get_record_list,
             get_live_stream_url,
+            get_live_stream_url_v2,
+            get_playable_stream_url,
             open_in_player,
             download_video,
             cancel_download
