@@ -495,11 +495,10 @@ function App() {
                 width: "24px",
                 height: "24px",
                 borderRadius: "50%",
-                background: `conic-gradient(#bb86fc 0deg, #bb86fc ${pullProgress * 360}deg, rgba(255,255,255,0.14) ${pullProgress * 360}deg, rgba(255,255,255,0.14) 360deg)`,
+                background: "rgb(64, 64, 64)",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                animation: pullRefreshing ? "pull-refresh-spin 0.9s linear infinite" : "none",
               }}
             >
               <ArrowClockwiseRegular
@@ -508,6 +507,7 @@ function App() {
                   color: "#fff",
                   transform: `rotate(${pullRefreshing ? 0 : pullProgress * 300}deg)`,
                   transition: pullRefreshing ? "none" : "transform 0.08s linear",
+                  animation: pullRefreshing ? "pull-refresh-spin 0.9s linear infinite" : "none",
                 }}
               />
             </div>
@@ -526,7 +526,7 @@ function App() {
           backgroundColor: "rgb(32, 32, 32)"
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <Text size={600} weight="semibold" style={{ flexShrink: 0 }}>口袋48 列表工具</Text>
+            <Text size={600} weight="semibold" style={{ flexShrink: 0, marginLeft: 10 }}>口袋48直播工具</Text>
 
             {/* Mobile filter toggle (hidden on desktop via CSS) */}
             <Button 
@@ -534,6 +534,7 @@ function App() {
               icon={<FilterRegular />}
               appearance="outline"
               onClick={() => setFilterOpen(prev => !prev)}
+              style={{ marginRight: 6 }}
             >
               筛选
             </Button>
