@@ -347,7 +347,8 @@ function App() {
     gestureRef.current.pulling = false;
     
     if (swipeTranslation !== 0) {
-      const threshold = window.innerWidth / 3;
+      // 极低的触发阈值，只要有超过20像素的水平滑动意图就会直接切换
+      const threshold = 10;
       if (activeTab === "live" && swipeTranslation < -threshold) {
         setActiveTab("record");
       } else if (activeTab === "record" && swipeTranslation > threshold) {
@@ -793,11 +794,17 @@ function App() {
       <div style={{ overflow: "hidden", width: "100%" }}>
         <div style={{
           display: "flex",
+          alignItems: "flex-start",
           width: "200%",
           transform: `translateX(calc(${activeTab === "live" ? 0 : -50}% + ${swipeTranslation}px))`,
           transition: gestureRef.current.tracking ? "none" : "transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)",
         }}>
-          <div style={{ width: "50%", paddingRight: "10px", boxSizing: "border-box" }}>
+          <div style={{ 
+            width: "50%", 
+            paddingRight: "10px", 
+            boxSizing: "border-box",
+            height: activeTab === "live" ? "auto" : 0
+          }}>
             {loading && lives.length === 0 ? (
               <Spinner label="加载列表中..." />
             ) : filteredLiveItems.length === 0 ? (
@@ -806,7 +813,12 @@ function App() {
               renderGrid(filteredLiveItems, false)
             )}
           </div>
-          <div style={{ width: "50%", paddingLeft: "10px", boxSizing: "border-box" }}>
+          <div style={{ 
+            width: "50%", 
+            paddingLeft: "10px", 
+            boxSizing: "border-box",
+            height: activeTab === "record" ? "auto" : 0
+          }}>
             {loading && records.length === 0 ? (
               <Spinner label="加载列表中..." />
             ) : filteredRecordItems.length === 0 ? (
