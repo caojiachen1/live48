@@ -357,14 +357,17 @@ function App() {
       setSwipeTranslation(0);
     }
 
-    setPullDistance(0);
     if (shouldRefresh) {
+      setPullDistance(56); // 保持在下拉的位置转圈
       setPullRefreshing(true);
       try {
         await fetchLiveList();
       } finally {
         setPullRefreshing(false);
+        setPullDistance(0);
       }
+    } else {
+      setPullDistance(0);
     }
   };
 
@@ -656,7 +659,7 @@ function App() {
               left: "50%",
               transform: `translate(-50%, ${Math.max(0, pullDistance - 24)}px)`,
               opacity: pullDistance > 0 || pullRefreshing ? 1 : 0,
-              transition: pullDistance > 0 ? "none" : "opacity 0.2s ease",
+              transition: gestureRef.current.tracking ? "none" : "transform 0.3s ease, opacity 0.2s ease",
               zIndex: 1001,
               pointerEvents: "none",
               display: "flex",
