@@ -492,8 +492,8 @@ function App() {
           >
             <div
               style={{
-                width: "24px",
-                height: "24px",
+                width: "48px",
+                height: "48px",
                 borderRadius: "50%",
                 background: "rgb(64, 64, 64)",
                 display: "flex",
@@ -503,7 +503,7 @@ function App() {
             >
               <ArrowClockwiseRegular
                 style={{
-                  fontSize: "14px",
+                  fontSize: "28px",
                   color: "#fff",
                   transform: `rotate(${pullRefreshing ? 0 : pullProgress * 300}deg)`,
                   transition: pullRefreshing ? "none" : "transform 0.08s linear",
