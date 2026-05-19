@@ -72,6 +72,7 @@ function App() {
   const [filterOpen, setFilterOpen] = useState(false);
   const [pullDistance, setPullDistance] = useState(0);
   const [pullRefreshing, setPullRefreshing] = useState(false);
+  const [swipeTranslation, setSwipeTranslation] = useState(0);
   
   // Video player state (used on mobile/webview platforms)
   const [playingList, setPlayingList] = useState<LiveItem[]>([]);
@@ -89,55 +90,68 @@ function App() {
   const toasterId = useId("toaster");
   const { dispatchToast } = useToastController(toasterId);
 
-  const fetchLiveList = async () => {
-    setLoading(true);
+  const fetchLiveInfo = async () => {
     try {
-      if (activeTab === "live") {
-        const res: any = await invoke("get_live_list");
+      const res: any = await invoke("get_live_list");
+      if (res.content && res.content.liveList) {
+        setLives(res.content.liveList);
+      }
+    } catch (e) {
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>获取直播列表失败</ToastTitle></Toast>, { intent: "error" });
+    }
+  };
+
+  const fetchRecordInfo = async () => {
+    try {
+      const initialTargetTime = dayjs().subtract(1, 'day').startOf('day').valueOf();
+      setTargetLoadTime(initialTargetTime);
+
+      let currentNext = "0";
+      let accumRecords: LiveItem[] = [];
+      let done = false;
+
+      while (!done) {
+        const res: any = await invoke("get_record_list", { next: currentNext });
         if (res.content && res.content.liveList) {
-          setLives(res.content.liveList);
-        }
-      } else {
-        const initialTargetTime = dayjs().subtract(1, 'day').startOf('day').valueOf();
-        setTargetLoadTime(initialTargetTime);
+          const newRecords: LiveItem[] = res.content.liveList;
+          accumRecords = [...accumRecords, ...newRecords];
+          currentNext = res.content.next || "0";
 
-        let currentNext = "0";
-        let accumRecords: LiveItem[] = [];
-        let done = false;
-
-        while (!done) {
-          const res: any = await invoke("get_record_list", { next: currentNext });
-          if (res.content && res.content.liveList) {
-            const newRecords: LiveItem[] = res.content.liveList;
-            accumRecords = [...accumRecords, ...newRecords];
-            currentNext = res.content.next || "0";
-
-            if (newRecords.length > 0) {
-              const lastRecord = newRecords[newRecords.length - 1];
-              if (lastRecord && lastRecord.ctime && Number(lastRecord.ctime) < initialTargetTime) {
-                done = true;
-              }
-            } else {
+          if (newRecords.length > 0) {
+            const lastRecord = newRecords[newRecords.length - 1];
+            if (lastRecord && lastRecord.ctime && Number(lastRecord.ctime) < initialTargetTime) {
               done = true;
             }
           } else {
             done = true;
           }
-
-          if (currentNext === "0") {
-            done = true;
-          }
+        } else {
+          done = true;
         }
 
-        setRecords(accumRecords);
-        setRecordNext(currentNext);
+        if (currentNext === "0") {
+          done = true;
+        }
       }
+
+      setRecords(accumRecords);
+      setRecordNext(currentNext);
     } catch (e) {
       console.error(e);
-      dispatchToast(
-        <Toast><ToastTitle>获取列表失败</ToastTitle></Toast>,
-        { intent: "error" }
-      );
+      dispatchToast(<Toast><ToastTitle>获取录播列表失败</ToastTitle></Toast>, { intent: "error" });
+    }
+  };
+
+  const fetchLiveList = async (tab?: "live" | "record") => {
+    const target = tab || activeTab;
+    setLoading(true);
+    try {
+      if (target === "live") {
+        await fetchLiveInfo();
+      } else {
+        await fetchRecordInfo();
+      }
     } finally {
       setLoading(false);
     }
@@ -192,8 +206,14 @@ function App() {
   };
 
   useEffect(() => {
-    fetchLiveList();
-  }, [activeTab]);
+    // 首次加载时缓存双端数据
+    const initFetch = async () => {
+      setLoading(true);
+      await Promise.all([fetchLiveInfo(), fetchRecordInfo()]);
+      setLoading(false);
+    };
+    initFetch();
+  }, []);
 
   useEffect(() => {
     const unlisten = listen("download-status", (event: any) => {
@@ -237,40 +257,36 @@ function App() {
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) 
     || window.innerWidth <= 768;
 
-  const currentList = activeTab === "live" ? lives : records;
-
-  const filteredItems = currentList.filter(item => {
-    if (activeTab === "record" && targetLoadTime > 0 && item.ctime) {
-      if (Number(item.ctime) < targetLoadTime) {
-        return false;
+  const filterList = (list: LiveItem[], isRecordTab: boolean) => {
+    return list.filter(item => {
+      if (isRecordTab && targetLoadTime > 0 && item.ctime) {
+        if (Number(item.ctime) < targetLoadTime) {
+          return false;
+        }
       }
-    }
 
-    const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
-      (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
+      const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
+        (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
 
-    const matchGroup = filterGroup === "全部" || item.userInfo.nickname.toUpperCase().startsWith(filterGroup);
+      const matchGroup = filterGroup === "全部" || item.userInfo.nickname.toUpperCase().startsWith(filterGroup);
 
-    let matchType = true;
-    if (filterType !== "全部") {
-      if (filterType === "连麦") {
-        matchType = !!item.inMicrophoneConnection;
-      } else {
-        const badge = getLiveTypeBadge(item.liveType);
-        matchType = badge.text === filterType;
+      let matchType = true;
+      if (filterType !== "全部") {
+        if (filterType === "连麦") {
+          matchType = !!item.inMicrophoneConnection;
+        } else {
+          const badge = getLiveTypeBadge(item.liveType);
+          matchType = badge.text === filterType;
+        }
       }
-    }
 
-    return matchSearch && matchGroup && matchType;
-  });
-
-  const switchTabBySwipe = (direction: "left" | "right") => {
-    if (direction === "left" && activeTab === "live") {
-      setActiveTab("record");
-    } else if (direction === "right" && activeTab === "record") {
-      setActiveTab("live");
-    }
+      return matchSearch && matchGroup && matchType;
+    });
   };
+
+  const filteredLiveItems = filterList(lives, false);
+  const filteredRecordItems = filterList(records, true);
+  const filteredItems = activeTab === "live" ? filteredLiveItems : filteredRecordItems;
 
   const shouldIgnoreGestureTarget = (target: EventTarget | null) => {
     if (!(target instanceof HTMLElement)) return false;
@@ -290,6 +306,7 @@ function App() {
     gestureRef.current.tracking = true;
     gestureRef.current.tabSwitched = false;
     gestureRef.current.pulling = false;
+    setSwipeTranslation(0);
   };
 
   const handleListTouchMove = (e: React.TouchEvent | TouchEvent) => {
@@ -302,11 +319,14 @@ function App() {
     const absDx = Math.abs(dx);
     const absDy = Math.abs(dy);
 
-    if (!gestureRef.current.tabSwitched && absDx > 70 && absDx > absDy) {
-      switchTabBySwipe(dx < 0 ? "left" : "right");
-      gestureRef.current.tabSwitched = true;
-      gestureRef.current.tracking = false;
-      setPullDistance(0);
+    if (absDx > absDy && absDx > 10) {
+      if (activeTab === "live" && dx > 0) return; // Cant swipe right from live
+      if (activeTab === "record" && dx < 0) return; // Cant swipe left from record
+      
+      setSwipeTranslation(dx);
+      if (!("cancelable" in e) || e.cancelable) {
+        e.preventDefault();
+      }
       return;
     }
 
@@ -325,7 +345,17 @@ function App() {
     const shouldRefresh = gestureRef.current.pulling && pullDistance >= 56 && !loading;
     gestureRef.current.tracking = false;
     gestureRef.current.pulling = false;
-    gestureRef.current.tabSwitched = false;
+    
+    if (swipeTranslation !== 0) {
+      const threshold = window.innerWidth / 3;
+      if (activeTab === "live" && swipeTranslation < -threshold) {
+        setActiveTab("record");
+      } else if (activeTab === "record" && swipeTranslation > threshold) {
+        setActiveTab("live");
+      }
+      setSwipeTranslation(0);
+    }
+
     setPullDistance(0);
     if (shouldRefresh) {
       setPullRefreshing(true);
@@ -461,6 +491,149 @@ function App() {
     return "https://source3.48.cn" + path;
   };
 
+  const renderGrid = (items: LiveItem[], isRecordTab: boolean) => {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20, width: "100%", flexShrink: 0 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
+          {items.map((item) => {
+            const badge = getLiveTypeBadge(item.liveType);
+            const isItemLiveTab = !isRecordTab;
+            return (
+              <div key={item.liveId} style={{ width: "100%", display: "flex", flexDirection: "column", gap: 0 }}>
+                <Card style={{ width: "100%" }}>
+                  <CardPreview>
+                    <div style={{ position: "relative", width: "100%", lineHeight: 0 }}>
+                      <img src={resolveImgInfo(item.coverPath)} alt="cover" style={{ objectFit: 'cover', width: '100%', aspectRatio: '1 / 1', display: 'block' }} />
+                      
+                      {item.inMicrophoneConnection && (
+                        <div style={{
+                          position: "absolute",
+                          top: "12px",
+                          right: "12px",
+                          backgroundColor: "gray",
+                          color: "white",
+                          padding: "2px 6px",
+                          fontSize: "12px",
+                          fontWeight: "bold",
+                          borderRadius: "4px",
+                          lineHeight: "normal"
+                        }}>
+                          连麦
+                        </div>
+                      )}
+                      
+                      <div style={{
+                          position: "absolute",
+                          top: "12px",
+                          left: "12px",
+                          backgroundColor: isItemLiveTab ? "var(--colorPaletteRedBackground3)" : "#107c10",
+                          color: "white",
+                          padding: "4px 8px",
+                          fontSize: "12px",
+                          fontWeight: "bold",
+                          borderRadius: "4px",
+                          lineHeight: "normal",
+                          boxShadow: "0 2px 4px rgba(0,0,0,0.2)"
+                        }}>
+                          {isItemLiveTab ? "直播" : "录播"}
+                        </div>
+
+                      <div style={{
+                        position: "absolute",
+                        bottom: 0,
+                        left: 0,
+                        width: "100%",
+                        boxSizing: "border-box",
+                        background: "linear-gradient(to top, rgba(0,0,0,0.8) 0%, transparent 100%)",
+                        padding: "30px 12px 12px 12px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        lineHeight: "normal"
+                      }}>
+                        <Text weight="semibold" style={{ color: "white", flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {item.title || "暂无标题"}
+                        </Text>
+                        <div style={{
+                          backgroundColor: badge.color,
+                          color: "white",
+                          padding: "2px 6px",
+                          fontSize: "12px",
+                          fontWeight: "bold",
+                          flexShrink: 0,
+                          borderRadius: "4px"
+                        }}>
+                          {badge.text}
+                        </div>
+                      </div>
+                    </div>
+                  </CardPreview>
+
+                  <CardHeader
+                    header={<Text size={300} weight="semibold">{item.userInfo.nickname}</Text>}
+                    description={item.ctime ? <Text size={200} style={{ color: "var(--colorNeutralForeground3)" }}>{dayjs(Number(item.ctime)).format("YYYY-MM-DD HH:mm:ss")}</Text> : undefined}
+                    image={<Avatar image={{ src: resolveImgInfo(item.userInfo.avatar) }} />}
+                  />
+
+                  <div
+                    style={{
+                      display: "flex",
+                      marginTop: "12px",
+                      justifyContent: isItemLiveTab ? "flex-end" : "center",
+                      gap: "8px"
+                    }}
+                  >
+                    <Button 
+                      icon={<CopyRegular />} 
+                      onClick={() => handlePlayOrCopy(item.liveId, "copy", item)}
+                    >地址</Button>
+                    {isRecordTab && (
+                      <Button 
+                        icon={<ArrowDownloadRegular />} 
+                        onClick={() => handlePlayOrCopy(item.liveId, "download", item)}
+                      >下载</Button>
+                    )}
+                    <Button 
+                      appearance="primary" 
+                      icon={<PlayRegular />} 
+                      onClick={() => handlePlayOrCopy(item.liveId, "play", item)}
+                    >播放</Button>
+                  </div>
+                </Card>
+                {downloadProgresses[item.liveId] !== undefined && (
+                  <div style={{ width: "100%", marginTop: "4px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <ProgressBar
+                        value={downloadProgresses[item.liveId] <= 0 ? 0.02 : downloadProgresses[item.liveId] / 100}
+                        style={{ flex: 1 }}
+                      />
+                      <Button
+                        size="small"
+                        icon={<DismissRegular />}
+                        onClick={() => handleCancelDownload(item.liveId)}
+                        title="取消下载"
+                      />
+                    </div>
+                    <Text size={200} style={{ display: "block", textAlign: "center", marginTop: "4px", color: "var(--colorNeutralForeground3)" }}>
+                      {downloadProgresses[item.liveId] > 0 ? `下载处理中... ${downloadProgresses[item.liveId].toFixed(2)}%` : "准备下载..."}
+                    </Text>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {isRecordTab && recordNext !== "0" && (
+          <div style={{ display: "flex", justifyContent: "center", marginTop: 20 }}>
+            <Button onClick={loadMoreRecords} disabled={loading}>
+              {loading ? "加载中..." : "加载更多录播"}
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const playingItem = playingIndex >= 0 ? playingList[playingIndex] : null;
   const pullProgress = Math.min(1, pullDistance / 56);
 
@@ -588,7 +761,7 @@ function App() {
               onChange={(_, data) => setSearchQuery(data.value)}
               style={{ maxWidth: "300px", width: "100%" }}
             />
-            <Button icon={<ArrowClockwiseRegular />} onClick={fetchLiveList} disabled={loading}>
+            <Button icon={<ArrowClockwiseRegular />} onClick={() => fetchLiveList()} disabled={loading}>
               {loading ? "刷新中..." : "刷新列表"}
             </Button>
           </div>
@@ -617,149 +790,33 @@ function App() {
           </button>
         </nav>
 
-      {loading && currentList.length === 0 ? (
-         <Spinner label="加载列表中..." />
-      ) : filteredItems.length === 0 ? (
-         <div style={{ textAlign: "center", marginTop: "40px", color: "var(--colorNeutralForeground3)" }}>无匹配内容</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
-            {filteredItems.map((item) => {
-              const badge = getLiveTypeBadge(item.liveType);
-              return (
-              <div key={item.liveId} style={{ width: "100%", display: "flex", flexDirection: "column", gap: 0 }}>
-              <Card style={{ width: "100%" }}>
-                <CardPreview>
-                  <div style={{ position: "relative", width: "100%", lineHeight: 0 }}>
-                    <img src={resolveImgInfo(item.coverPath)} alt="cover" style={{ objectFit: 'cover', width: '100%', aspectRatio: '1 / 1', display: 'block' }} />
-                    
-                    {item.inMicrophoneConnection && (
-                      <div style={{
-                        position: "absolute",
-                        top: "12px",
-                        right: "12px",
-                        backgroundColor: "gray",
-                        color: "white",
-                        padding: "2px 6px",
-                        fontSize: "12px",
-                        fontWeight: "bold",
-                        borderRadius: "4px",
-                        lineHeight: "normal"
-                      }}>
-                        连麦
-                      </div>
-                    )}
-                    
-                    <div style={{
-                        position: "absolute",
-                        top: "12px",
-                        left: "12px",
-                        backgroundColor: activeTab === "live" ? "var(--colorPaletteRedBackground3)" : "#107c10",
-                        color: "white",
-                        padding: "4px 8px",
-                        fontSize: "12px",
-                        fontWeight: "bold",
-                        borderRadius: "4px",
-                        lineHeight: "normal",
-                        boxShadow: "0 2px 4px rgba(0,0,0,0.2)"
-                      }}>
-                        {activeTab === "live" ? "直播" : "录播"}
-                      </div>
-
-                    <div style={{
-                      position: "absolute",
-                      bottom: 0,
-                      left: 0,
-                      width: "100%",
-                      boxSizing: "border-box",
-                      background: "linear-gradient(to top, rgba(0,0,0,0.8) 0%, transparent 100%)",
-                      padding: "30px 12px 12px 12px",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "8px",
-                      lineHeight: "normal"
-                    }}>
-                      <Text weight="semibold" style={{ color: "white", flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {item.title || "暂无标题"}
-                      </Text>
-                      <div style={{
-                        backgroundColor: badge.color,
-                        color: "white",
-                        padding: "2px 6px",
-                        fontSize: "12px",
-                        fontWeight: "bold",
-                        flexShrink: 0,
-                        borderRadius: "4px"
-                      }}>
-                        {badge.text}
-                      </div>
-                    </div>
-                  </div>
-                </CardPreview>
-
-                <CardHeader
-                  header={<Text size={300} weight="semibold">{item.userInfo.nickname}</Text>}
-                  description={item.ctime ? <Text size={200} style={{ color: "var(--colorNeutralForeground3)" }}>{dayjs(Number(item.ctime)).format("YYYY-MM-DD HH:mm:ss")}</Text> : undefined}
-                  image={<Avatar image={{ src: resolveImgInfo(item.userInfo.avatar) }} />}
-                />
-
-                <div
-                  style={{
-                    display: "flex",
-                    marginTop: "12px",
-                    justifyContent: activeTab === "live" ? "flex-end" : "center",
-                    gap: "8px"
-                  }}
-                >
-                  <Button 
-                    icon={<CopyRegular />} 
-                    onClick={() => handlePlayOrCopy(item.liveId, "copy", item)}
-                  >地址</Button>
-                  {activeTab === "record" && (
-                    <Button 
-                      icon={<ArrowDownloadRegular />} 
-                      onClick={() => handlePlayOrCopy(item.liveId, "download", item)}
-                    >下载</Button>
-                  )}
-                  <Button 
-                    appearance="primary" 
-                    icon={<PlayRegular />} 
-                    onClick={() => handlePlayOrCopy(item.liveId, "play", item)}
-                  >播放</Button>
-                </div>
-              </Card>
-                {downloadProgresses[item.liveId] !== undefined && (
-                  <div style={{ width: "100%", marginTop: "4px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <ProgressBar
-                        value={downloadProgresses[item.liveId] <= 0 ? 0.02 : downloadProgresses[item.liveId] / 100}
-                        style={{ flex: 1 }}
-                      />
-                      <Button
-                        size="small"
-                        icon={<DismissRegular />}
-                        onClick={() => handleCancelDownload(item.liveId)}
-                        title="取消下载"
-                      />
-                    </div>
-                    <Text size={200} style={{ display: "block", textAlign: "center", marginTop: "4px", color: "var(--colorNeutralForeground3)" }}>
-                      {downloadProgresses[item.liveId] > 0 ? `下载处理中... ${downloadProgresses[item.liveId].toFixed(2)}%` : "准备下载..."}
-                    </Text>
-                  </div>
-                )}
-              </div>
-              );
-            })}
+      <div style={{ overflow: "hidden", width: "100%" }}>
+        <div style={{
+          display: "flex",
+          width: "200%",
+          transform: `translateX(calc(${activeTab === "live" ? 0 : -50}% + ${swipeTranslation}px))`,
+          transition: gestureRef.current.tracking ? "none" : "transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)",
+        }}>
+          <div style={{ width: "50%", paddingRight: "10px", boxSizing: "border-box" }}>
+            {loading && lives.length === 0 ? (
+              <Spinner label="加载列表中..." />
+            ) : filteredLiveItems.length === 0 ? (
+              <div style={{ textAlign: "center", marginTop: "40px", color: "var(--colorNeutralForeground3)" }}>无匹配内容</div>
+            ) : (
+              renderGrid(filteredLiveItems, false)
+            )}
           </div>
-          {activeTab === "record" && recordNext !== "0" && (
-            <div style={{ display: "flex", justifyContent: "center", marginTop: 20 }}>
-              <Button onClick={loadMoreRecords} disabled={loading}>
-                {loading ? "加载中..." : "加载更多录播"}
-              </Button>
-            </div>
-          )}
+          <div style={{ width: "50%", paddingLeft: "10px", boxSizing: "border-box" }}>
+            {loading && records.length === 0 ? (
+              <Spinner label="加载列表中..." />
+            ) : filteredRecordItems.length === 0 ? (
+              <div style={{ textAlign: "center", marginTop: "40px", color: "var(--colorNeutralForeground3)" }}>无匹配内容</div>
+            ) : (
+              renderGrid(filteredRecordItems, true)
+            )}
+          </div>
         </div>
-      )}
+      </div>
 
       {/* In-app video player (used on mobile/Android WebView) */}
       {playingItem && (
