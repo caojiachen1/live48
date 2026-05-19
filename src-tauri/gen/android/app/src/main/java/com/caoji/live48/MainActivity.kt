@@ -34,4 +34,16 @@ class NativePlayerBridge(private val activity: MainActivity) {
       activity.startActivity(intent)
     }
   }
+
+  @JavascriptInterface
+  fun playPlaylist(playlistJson: String, startIndex: Int, isLive: Boolean) {
+    activity.runOnUiThread {
+      val intent = Intent(activity, NativePlayerActivity::class.java).apply {
+        putExtra(NativePlayerActivity.EXTRA_PLAYLIST_JSON, playlistJson)
+        putExtra(NativePlayerActivity.EXTRA_START_INDEX, startIndex)
+        putExtra(NativePlayerActivity.EXTRA_IS_LIVE, isLive)
+      }
+      activity.startActivity(intent)
+    }
+  }
 }

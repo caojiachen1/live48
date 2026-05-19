@@ -8,6 +8,7 @@ interface VideoPlayerProps {
   nickname: string;
   streamUrl?: string;
   isLive?: boolean;
+  onSwitch?: (direction: "prev" | "next") => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -32,7 +33,7 @@ function formatTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClose }: VideoPlayerProps) {
+function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwitch, onClose }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -53,6 +54,17 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
   const [isSeeking, setIsSeeking] = useState(false);
   const [showControls, setShowControls] = useState(false);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
+  const switchingRef = useRef(false);
+  const [switchStyle, setSwitchStyle] = useState<{
+    transform: string;
+    opacity: number;
+    transition: string;
+  }>({
+    transform: "translateY(0)",
+    opacity: 1,
+    transition: "transform 0ms linear, opacity 0ms linear",
+  });
 
   const tryOpenNativeAndroidPlayer = useCallback((url: string) => {
     if (!isAndroid) return false;
@@ -404,6 +416,62 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
     }
   }, [showControls, flashControls]);
 
+  const handleVideoTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch) return;
+    swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
+  }, []);
+
+  const handleVideoTouchEnd = useCallback((e: React.TouchEvent) => {
+    const start = swipeStartRef.current;
+    const touch = e.changedTouches[0];
+    swipeStartRef.current = null;
+    if (!start || !touch || loading || error || !onSwitch) return;
+
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (Math.abs(dy) <= Math.abs(dx) || Math.abs(dy) < 72) return;
+
+    if (switchingRef.current) return;
+    switchingRef.current = true;
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+    setShowControls(false);
+
+    const direction = dy < 0 ? "next" : "prev";
+    const outTransform = direction === "next" ? "translateY(-100%)" : "translateY(100%)";
+    const inTransform = direction === "next" ? "translateY(100%)" : "translateY(-100%)";
+
+    setSwitchStyle({
+      transform: outTransform,
+      opacity: 1,
+      transition: "transform 220ms ease-in-out, opacity 0ms linear",
+    });
+
+    window.setTimeout(async () => {
+      try {
+        await onSwitch(direction);
+      } finally {
+        setSwitchStyle({
+          transform: inTransform,
+          opacity: 1,
+          transition: "transform 0ms linear, opacity 0ms linear",
+        });
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            setSwitchStyle({
+              transform: "translateY(0)",
+              opacity: 1,
+              transition: "transform 220ms ease-in-out, opacity 0ms linear",
+            });
+            window.setTimeout(() => {
+              switchingRef.current = false;
+            }, 230);
+          });
+        });
+      }
+    }, 220);
+  }, [error, loading, onSwitch]);
+
   // Close overlay when clicking background (not video area)
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === containerRef.current) onClose();
@@ -442,35 +510,40 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
         WebkitUserSelect: "none",
       }}
     >
+      <button
+        onClick={(e) => { e.stopPropagation(); onClose(); }}
+        style={{
+          position: "absolute",
+          top: "24px",
+          left: "16px",
+          zIndex: 30,
+          background: "rgba(0,0,0,0.35)",
+          border: "none",
+          color: "white",
+          cursor: "pointer",
+          padding: "6px",
+          borderRadius: "999px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+        aria-label="关闭播放"
+      >
+        <DismissRegular style={{ fontSize: "22px" }} />
+      </button>
+
       {/* Top bar */}
       <div
         style={{
           display: "flex",
           alignItems: "center",
-          padding: "24px 16px 10px 16px",
+          padding: "24px 16px 10px 56px",
           flexShrink: 0,
-          opacity: showControls ? 1 : 0,
-          transition: "opacity 0.25s ease",
-          pointerEvents: showControls ? "auto" : "none",
+          opacity: 1,
+          pointerEvents: "auto",
+          background: "linear-gradient(to bottom, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0) 100%)",
         }}
       >
-        <button
-          onClick={onClose}
-          style={{
-            background: "none",
-            border: "none",
-            color: "white",
-            cursor: "pointer",
-            padding: "4px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flexShrink: 0,
-          }}
-          aria-label="关闭播放"
-        >
-          <DismissRegular style={{ fontSize: "24px" }} />
-        </button>
         <div style={{ marginLeft: "8px", flex: 1, overflow: "hidden" }}>
           <div style={{
             color: "white", fontSize: "15px", fontWeight: 600,
@@ -487,6 +560,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
       {/* Video area */}
       <div
         onClick={handleVideoClick}
+        onTouchStart={handleVideoTouchStart}
+        onTouchEnd={handleVideoTouchEnd}
         style={{
           flex: 1,
           display: "flex",
@@ -495,6 +570,9 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onClo
           overflow: "hidden",
           position: "relative",
           minHeight: 0,
+          transform: switchStyle.transform,
+          opacity: switchStyle.opacity,
+          transition: switchStyle.transition,
         }}
       >
         {loading && (

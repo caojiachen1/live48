@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -30,6 +30,7 @@ import "./App.android.css";
 interface NativeAndroidPlayerBridge {
   isAvailable?: () => boolean;
   playStream: (url: string, title: string, nickname: string, isLive: boolean) => void;
+  playPlaylist?: (playlistJson: string, startIndex: number, isLive: boolean) => void;
 }
 
 interface LiveItem {
@@ -69,10 +70,20 @@ function App() {
   const [filterGroup, setFilterGroup] = useState("全部");
   const [filterType, setFilterType] = useState("全部");
   const [filterOpen, setFilterOpen] = useState(false);
+  const [pullDistance, setPullDistance] = useState(0);
+  const [pullRefreshing, setPullRefreshing] = useState(false);
   
   // Video player state (used on mobile/webview platforms)
-  const [playingItem, setPlayingItem] = useState<LiveItem | null>(null);
+  const [playingList, setPlayingList] = useState<LiveItem[]>([]);
+  const [playingIndex, setPlayingIndex] = useState<number>(-1);
   const [playingUrl, setPlayingUrl] = useState<string>("");
+  const gestureRef = useRef({
+    startX: 0,
+    startY: 0,
+    tracking: false,
+    tabSwitched: false,
+    pulling: false,
+  });
 
   const toasterId = useId("toaster");
   const { dispatchToast } = useToastController(toasterId);
@@ -225,6 +236,123 @@ function App() {
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) 
     || window.innerWidth <= 768;
 
+  const currentList = activeTab === "live" ? lives : records;
+
+  const filteredItems = currentList.filter(item => {
+    if (activeTab === "record" && targetLoadTime > 0 && item.ctime) {
+      if (Number(item.ctime) < targetLoadTime) {
+        return false;
+      }
+    }
+
+    const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
+      (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
+
+    const matchGroup = filterGroup === "全部" || item.userInfo.nickname.toUpperCase().startsWith(filterGroup);
+
+    let matchType = true;
+    if (filterType !== "全部") {
+      if (filterType === "连麦") {
+        matchType = !!item.inMicrophoneConnection;
+      } else {
+        const badge = getLiveTypeBadge(item.liveType);
+        matchType = badge.text === filterType;
+      }
+    }
+
+    return matchSearch && matchGroup && matchType;
+  });
+
+  const switchTabBySwipe = (direction: "left" | "right") => {
+    if (direction === "left" && activeTab === "live") {
+      setActiveTab("record");
+    } else if (direction === "right" && activeTab === "record") {
+      setActiveTab("live");
+    }
+  };
+
+  const shouldIgnoreGestureTarget = (target: EventTarget | null) => {
+    if (!(target instanceof HTMLElement)) return false;
+    return Boolean(
+      target.closest(
+        "button,input,select,textarea,a,[role='button'],[role='tab'],.fui-Button,.fui-Input,.fui-Select,.fui-Tab"
+      )
+    );
+  };
+
+  const handleListTouchStart = (e: React.TouchEvent) => {
+    if (!isMobile || playingIndex >= 0 || shouldIgnoreGestureTarget(e.target)) return;
+    const touch = e.touches[0];
+    if (!touch) return;
+    gestureRef.current.startX = touch.clientX;
+    gestureRef.current.startY = touch.clientY;
+    gestureRef.current.tracking = true;
+    gestureRef.current.tabSwitched = false;
+    gestureRef.current.pulling = false;
+  };
+
+  const handleListTouchMove = (e: React.TouchEvent) => {
+    if (!isMobile || playingIndex >= 0 || !gestureRef.current.tracking) return;
+    const touch = e.touches[0];
+    if (!touch) return;
+
+    const dx = touch.clientX - gestureRef.current.startX;
+    const dy = touch.clientY - gestureRef.current.startY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    if (!gestureRef.current.tabSwitched && absDx > 70 && absDx > absDy) {
+      switchTabBySwipe(dx < 0 ? "left" : "right");
+      gestureRef.current.tabSwitched = true;
+      gestureRef.current.tracking = false;
+      setPullDistance(0);
+      return;
+    }
+
+    if (window.scrollY <= 0 && dy > 0 && absDy > absDx) {
+      gestureRef.current.pulling = true;
+      const nextDistance = Math.min(96, dy * 0.45);
+      setPullDistance(nextDistance);
+      e.preventDefault();
+    }
+  };
+
+  const handleListTouchEnd = async () => {
+    if (playingIndex >= 0) return;
+    const shouldRefresh = gestureRef.current.pulling && pullDistance >= 56 && !loading;
+    gestureRef.current.tracking = false;
+    gestureRef.current.pulling = false;
+    gestureRef.current.tabSwitched = false;
+    setPullDistance(0);
+    if (shouldRefresh) {
+      setPullRefreshing(true);
+      try {
+        await fetchLiveList();
+      } finally {
+        setPullRefreshing(false);
+      }
+    }
+  };
+
+  const switchWebPlayback = async (direction: "prev" | "next") => {
+    if (playingIndex < 0 || playingList.length === 0) return;
+    const nextIndex = direction === "next" ? playingIndex + 1 : playingIndex - 1;
+    if (nextIndex < 0 || nextIndex >= playingList.length) return;
+
+    const nextItem = playingList[nextIndex];
+    try {
+      const nextUrl: string = await invoke("get_live_stream_url", { liveId: nextItem.liveId });
+      setPlayingIndex(nextIndex);
+      setPlayingUrl(nextUrl);
+    } catch (e) {
+      console.error(e);
+      dispatchToast(
+        <Toast><ToastTitle>切换播放失败</ToastTitle></Toast>,
+        { intent: "error" }
+      );
+    }
+  };
+
   const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download", item?: LiveItem) => {
     try {
       const url: string = await invoke("get_live_stream_url", { liveId });
@@ -244,12 +372,25 @@ function App() {
           await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
+        const startIndex = filteredItems.findIndex(i => i.liveId === liveId);
+        const orderedItems = startIndex >= 0 ? filteredItems : (item ? [item] : []);
+
         // Android: all streams (live + record) use native player first
         if (isAndroid && item) {
           const bridge = (window as Window & { Live48NativePlayer?: NativeAndroidPlayerBridge }).Live48NativePlayer;
           if (bridge && typeof bridge.playStream === "function") {
             if (!bridge.isAvailable || bridge.isAvailable()) {
-              bridge.playStream(url, item.title || "无标题", item.userInfo.nickname, activeTab === "live");
+              if (bridge.playPlaylist && orderedItems.length > 0) {
+                const playlistPayload = orderedItems.map((entry) => ({
+                  liveId: entry.liveId,
+                  title: entry.title || "无标题",
+                  nickname: entry.userInfo.nickname,
+                  streamUrl: entry.liveId === liveId ? url : "",
+                }));
+                bridge.playPlaylist(JSON.stringify(playlistPayload), Math.max(0, startIndex), activeTab === "live");
+              } else {
+                bridge.playStream(url, item.title || "无标题", item.userInfo.nickname, activeTab === "live");
+              }
               return;
             }
           }
@@ -257,8 +398,9 @@ function App() {
 
         // Non-Android mobile fallback: in-app web player
         if (isMobile && item) {
+          setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
+          setPlayingIndex(Math.max(0, startIndex));
           setPlayingUrl(url);
-          setPlayingItem(item);
         } else {
           // Desktop: use external player (PotPlayer, etc.)
           await invoke("open_in_player", { url });
@@ -304,36 +446,58 @@ function App() {
     return "https://source3.48.cn" + path;
   };
 
-  const currentList = activeTab === "live" ? lives : records;
-
-  const filteredItems = currentList.filter(item => {
-    if (activeTab === "record" && targetLoadTime > 0 && item.ctime) {
-      if (Number(item.ctime) < targetLoadTime) {
-        return false;
-      }
-    }
-
-    const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
-      (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
-
-    const matchGroup = filterGroup === "全部" || item.userInfo.nickname.toUpperCase().startsWith(filterGroup);
-
-    let matchType = true;
-    if (filterType !== "全部") {
-      if (filterType === "连麦") {
-        matchType = !!item.inMicrophoneConnection;
-      } else {
-        const badge = getLiveTypeBadge(item.liveType);
-        matchType = badge.text === filterType;
-      }
-    }
-
-    return matchSearch && matchGroup && matchType;
-  });
+  const playingItem = playingIndex >= 0 ? playingList[playingIndex] : null;
+  const pullProgress = Math.min(1, pullDistance / 56);
 
   return (
-      <div id="app-root" style={{ padding: "0 20px 20px 20px" }}>
+      <div
+        id="app-root"
+        style={{ padding: "0 20px 20px 20px", minHeight: "100vh", boxSizing: "border-box" }}
+        onTouchStart={handleListTouchStart}
+        onTouchMove={handleListTouchMove}
+        onTouchEnd={handleListTouchEnd}
+        onTouchCancel={handleListTouchEnd}
+      >
         <Toaster toasterId={toasterId} offset={{ vertical: 96 }} />
+        {isMobile && (
+          <div
+            style={{
+              position: "fixed",
+              top: 6,
+              left: "50%",
+              transform: `translate(-50%, ${Math.max(0, pullDistance - 24)}px)`,
+              opacity: pullDistance > 0 || pullRefreshing ? 1 : 0,
+              transition: pullDistance > 0 ? "none" : "opacity 0.2s ease",
+              zIndex: 1001,
+              pointerEvents: "none",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <div
+              style={{
+                width: "24px",
+                height: "24px",
+                borderRadius: "50%",
+                background: `conic-gradient(#bb86fc 0deg, #bb86fc ${pullProgress * 360}deg, rgba(255,255,255,0.14) ${pullProgress * 360}deg, rgba(255,255,255,0.14) 360deg)`,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                animation: pullRefreshing ? "pull-refresh-spin 0.9s linear infinite" : "none",
+              }}
+            >
+              <ArrowClockwiseRegular
+                style={{
+                  fontSize: "14px",
+                  color: "#fff",
+                  transform: `rotate(${pullRefreshing ? 0 : pullProgress * 300}deg)`,
+                  transition: pullRefreshing ? "none" : "transform 0.08s linear",
+                }}
+              />
+            </div>
+          </div>
+        )}
         
         <div style={{ 
           display: "flex", 
@@ -589,9 +753,20 @@ function App() {
           nickname={playingItem.userInfo.nickname}
           streamUrl={playingUrl}
           isLive={activeTab === "live"}
-          onClose={() => { setPlayingItem(null); setPlayingUrl(""); }}
+          onSwitch={switchWebPlayback}
+          onClose={() => {
+            setPlayingIndex(-1);
+            setPlayingList([]);
+            setPlayingUrl("");
+          }}
         />
       )}
+      <style>{`
+        @keyframes pull-refresh-spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
     </div>
   );
 }
