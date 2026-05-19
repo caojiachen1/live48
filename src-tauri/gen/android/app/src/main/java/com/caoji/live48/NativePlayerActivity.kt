@@ -1,9 +1,12 @@
 package com.caoji.live48
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Bundle
 import android.view.MotionEvent
 import android.view.View
+import android.widget.ImageView
 import android.widget.Toast
 import android.widget.TextView
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +31,7 @@ class NativePlayerActivity : AppCompatActivity() {
 
   private var player: ExoPlayer? = null
   private lateinit var playerView: PlayerView
+  private lateinit var transitionView: ImageView
   private lateinit var topBar: View
   private lateinit var titleView: TextView
   private lateinit var subtitleView: TextView
@@ -46,6 +50,7 @@ class NativePlayerActivity : AppCompatActivity() {
     setContentView(R.layout.activity_native_player)
 
     playerView = findViewById(R.id.native_player_view)
+    transitionView = findViewById(R.id.native_player_transition)
     topBar = findViewById(R.id.native_player_top_bar)
     titleView = findViewById(R.id.native_player_title)
     subtitleView = findViewById(R.id.native_player_subtitle)
@@ -171,23 +176,43 @@ class NativePlayerActivity : AppCompatActivity() {
     val outY = if (delta > 0) -distance else distance
     val inY = -outY
 
+    val snapshot = capturePlayerFrame()
+    if (snapshot != null) {
+      transitionView.setImageBitmap(snapshot)
+      transitionView.visibility = View.VISIBLE
+      transitionView.translationY = 0f
+      transitionView.alpha = 1f
+    } else {
+      transitionView.visibility = View.GONE
+    }
+
+    playerView.animate().cancel()
+    transitionView.animate().cancel()
+
+    playerView.translationY = inY
+    playerView.alpha = 1f
+    currentIndex = nextIndex
+    playCurrent()
+
+    val duration = 260L
+    if (snapshot != null) {
+      transitionView.animate()
+        .translationY(outY)
+        .alpha(1f)
+        .setDuration(duration)
+        .withEndAction {
+          transitionView.setImageDrawable(null)
+          transitionView.visibility = View.GONE
+        }
+        .start()
+    }
+
     playerView.animate()
-      .translationY(outY)
+      .translationY(0f)
       .alpha(1f)
-      .setDuration(220)
+      .setDuration(duration)
       .withEndAction {
-        currentIndex = nextIndex
-        playCurrent()
-        playerView.translationY = inY
-        playerView.alpha = 1f
-        playerView.animate()
-          .translationY(0f)
-          .alpha(1f)
-          .setDuration(220)
-          .withEndAction {
-            isSwitchAnimating = false
-          }
-          .start()
+        isSwitchAnimating = false
       }
       .start()
   }
@@ -296,6 +321,20 @@ class NativePlayerActivity : AppCompatActivity() {
   private fun releasePlayer() {
     player?.release()
     player = null
+  }
+
+  private fun capturePlayerFrame(): Bitmap? {
+    val width = playerView.width
+    val height = playerView.height
+    if (width <= 0 || height <= 0) return null
+    return try {
+      val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+      val canvas = Canvas(bitmap)
+      playerView.draw(canvas)
+      bitmap
+    } catch (_: Exception) {
+      null
+    }
   }
 
   private fun preloadAdjacent(index: Int) {

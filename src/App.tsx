@@ -77,6 +77,7 @@ function App() {
   const [playingList, setPlayingList] = useState<LiveItem[]>([]);
   const [playingIndex, setPlayingIndex] = useState<number>(-1);
   const [playingUrl, setPlayingUrl] = useState<string>("");
+  const rootRef = useRef<HTMLDivElement>(null);
   const gestureRef = useRef({
     startX: 0,
     startY: 0,
@@ -291,7 +292,7 @@ function App() {
     gestureRef.current.pulling = false;
   };
 
-  const handleListTouchMove = (e: React.TouchEvent) => {
+  const handleListTouchMove = (e: React.TouchEvent | TouchEvent) => {
     if (!isMobile || playingIndex >= 0 || !gestureRef.current.tracking) return;
     const touch = e.touches[0];
     if (!touch) return;
@@ -313,7 +314,9 @@ function App() {
       gestureRef.current.pulling = true;
       const nextDistance = Math.min(96, dy * 0.45);
       setPullDistance(nextDistance);
-      e.preventDefault();
+      if (!("cancelable" in e) || e.cancelable) {
+        e.preventDefault();
+      }
     }
   };
 
@@ -352,6 +355,18 @@ function App() {
       );
     }
   };
+
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const handler = (event: TouchEvent) => {
+      handleListTouchMove(event);
+    };
+    root.addEventListener("touchmove", handler, { passive: false });
+    return () => {
+      root.removeEventListener("touchmove", handler);
+    };
+  }, [handleListTouchMove]);
 
   const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download", item?: LiveItem) => {
     try {
@@ -452,9 +467,9 @@ function App() {
   return (
       <div
         id="app-root"
+        ref={rootRef}
         style={{ padding: "0 20px 20px 20px", minHeight: "100vh", boxSizing: "border-box" }}
         onTouchStart={handleListTouchStart}
-        onTouchMove={handleListTouchMove}
         onTouchEnd={handleListTouchEnd}
         onTouchCancel={handleListTouchEnd}
       >
