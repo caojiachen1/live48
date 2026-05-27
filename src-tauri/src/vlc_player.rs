@@ -1,6 +1,6 @@
 use std::ffi::{c_int, c_void, CString};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::thread;
@@ -50,8 +50,8 @@ pub struct Libvlc {
     media_add_option: unsafe extern "C" fn(*mut c_void, *const i8),
 }
 
-/// 获取 VLC DLL 自带的目录
-fn bundled_dir() -> Option<PathBuf> {
+/// 获取 VLC DLL 自带的目录（公开给 lib.rs 使用）
+pub fn bundled_dir() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
     {
         // 开发模式：相对于 crate 源目录
@@ -127,32 +127,43 @@ fn download_vlc_to(target_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 检查 VLC 完整性：验证所有必需文件存在且可以加载 libvlc
+pub fn check_vlc_integrity() -> Result<(), String> {
+    let Some(target) = bundled_dir() else {
+        return Err("无法确定 VLC 目录位置".to_string());
+    };
+
+    // 检查关键文件
+    let libvlc_dll = target.join("libvlc.dll");
+    let libvlccore_dll = target.join("libvlccore.dll");
+    let plugins_dir = target.join("plugins");
+
+    if !libvlc_dll.exists() {
+        return Err("libvlc.dll 不存在".to_string());
+    }
+    if !libvlccore_dll.exists() {
+        return Err("libvlccore.dll 不存在".to_string());
+    }
+    if !plugins_dir.exists() || !plugins_dir.is_dir() {
+        return Err("plugins 目录不存在".to_string());
+    }
+
+    // 尝试加载 libvlc 验证 DLL 可正常加载
+    match Libvlc::load() {
+        Ok(_) => {
+            eprintln!("[vlc] 完整性检查通过");
+            Ok(())
+        }
+        Err(e) => {
+            Err(format!("libvlc 加载验证失败: {}", e))
+        }
+    }
+}
+
 /// 确保自带 VLC DLL 存在（如缺失则尝试自动下载）
 /// 应在 Tauri 启动阶段调用，避免在持有 Mutex 时触发下载
 pub fn ensure_vlc_downloaded() {
-    // 每 session 只尝试一次
-    static DOWNLOAD_ATTEMPTED: OnceLock<bool> = OnceLock::new();
-    if DOWNLOAD_ATTEMPTED.get().is_some() {
-        return;
-    }
-    DOWNLOAD_ATTEMPTED.set(true).ok();
-
-    let Some(target) = bundled_dir() else { return };
-    if target.join("libvlc.dll").exists() {
-        return; // 已经有了
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Err(e) = download_vlc_to(&target) {
-            eprintln!("[vlc] 自动下载失败: {}", e);
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = target; // 非 Windows 暂不支持自动下载
-    }
+    // 不再自动下载，改为由用户在设置面板手动触发
 }
 
 /// 查找自带的（bundled）libvlc 动态库并验证 plugins/ 目录存在

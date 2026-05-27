@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { Switch, Text, Button } from "@fluentui/react-components";
-import { DismissRegular, SettingsRegular } from "@fluentui/react-icons";
+import { Switch, Text, Button, ProgressBar } from "@fluentui/react-components";
+import { DismissRegular, SettingsRegular, ArrowDownloadRegular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 interface SettingsPanelProps {
   open: boolean;
@@ -12,23 +13,134 @@ interface SettingsPanelProps {
   onVlcStop: () => void;
 }
 
+interface VlcDownloadProgress {
+  progress: number;
+  message: string;
+}
+
 function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vlcPlaying, onVlcStop }: SettingsPanelProps) {
   const [vlcAvailable, setVlcAvailable] = useState<boolean | null>(null);
+  const [vlcIntegrated, setVlcIntegrated] = useState<boolean | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<VlcDownloadProgress | null>(null);
+
+  // Re-check VLC status
+  const checkVlcStatus = useCallback(async () => {
+    try {
+      const installed = await invoke<boolean>("check_vlc_installed");
+      setVlcAvailable(installed);
+      
+      // Also check integrity to see if bundled VLC is complete
+      try {
+        await invoke<string>("check_vlc_integrity");
+        setVlcIntegrated(true);
+      } catch {
+        setVlcIntegrated(false);
+      }
+    } catch {
+      setVlcAvailable(false);
+      setVlcIntegrated(false);
+    }
+  }, []);
+
+  // Listen for VLC download progress events
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    const setup = async () => {
+      const unlistenFn = await listen<VlcDownloadProgress>("vlc-download-progress", (event) => {
+        const payload = event.payload;
+        
+        if (payload.progress === 0) {
+          setDownloading(true);
+          setDownloadProgress(payload);
+        } else if (payload.progress === 100) {
+          setDownloadProgress(payload);
+          // Download completed successfully, re-check status
+          setTimeout(() => {
+            setDownloading(false);
+            setDownloadProgress(null);
+            checkVlcStatus();
+          }, 1500);
+        } else if (payload.progress < 0) {
+          // Error
+          setDownloadProgress(payload);
+          setTimeout(() => {
+            setDownloading(false);
+            setDownloadProgress(null);
+          }, 5000);
+        } else {
+          setDownloadProgress(payload);
+        }
+      });
+      unlisten = unlistenFn;
+    };
+    setup();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [checkVlcStatus]);
 
   // Check VLC availability on open
   useEffect(() => {
     if (open) {
-      invoke<boolean>("check_vlc_installed")
-        .then(setVlcAvailable)
-        .catch(() => setVlcAvailable(false));
+      checkVlcStatus();
     }
-  }, [open]);
+  }, [open, checkVlcStatus]);
+
+  const handleDownloadVlc = async () => {
+    setDownloading(true);
+    setDownloadProgress({ progress: 0, message: "正在准备下载..." });
+    try {
+      await invoke("download_vlc");
+    } catch (e) {
+      console.error(e);
+      setDownloadProgress({ progress: -1, message: `启动下载失败: ${e}` });
+      setTimeout(() => {
+        setDownloading(false);
+        setDownloadProgress(null);
+      }, 5000);
+    }
+  };
+
+  const handleSwitchChange = (value: boolean) => {
+    // When trying to enable VLC, check integrity first
+    if (value && vlcIntegrated !== true) {
+      // Integrity check failed or not available - don't allow switching
+      return;
+    }
+    onUseBuiltInVlcChange(value);
+  };
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Escape") onClose();
   }, [onClose]);
 
   if (!open) return null;
+
+  // Determine if VLC switch should be disabled
+  const vlcSwitchDisabled = vlcAvailable !== true || vlcIntegrated !== true;
+  
+  // Show appropriate status message
+  let statusText = "";
+  let statusColor = "rgba(255,255,255,0.3)";
+  if (vlcAvailable === null) {
+    statusText = "正在检测 libVLC 引擎...";
+    statusColor = "rgba(255,255,255,0.3)";
+  } else if (downloading) {
+    statusText = downloadProgress?.message || "正在下载...";
+    statusColor = "#4fc3f7";
+  } else if (vlcAvailable && vlcIntegrated) {
+    statusText = "libVLC 引擎可用 (已内置)";
+    statusColor = "#4caf50";
+  } else if (vlcAvailable && !vlcIntegrated) {
+    statusText = "libVLC 引擎不可用 (系统安装但未内置)";
+    statusColor = "#ff9800";
+  } else {
+    statusText = "libVLC 引擎不可用，请点击下载";
+    statusColor = "#ff5252";
+  }
 
   return (
     <>
@@ -115,12 +227,17 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
             <Switch
               label="使用 VLC 内置播放器"
               checked={useBuiltInVlc}
-              onChange={(_, data) => onUseBuiltInVlcChange(data.checked as boolean)}
+              disabled={vlcSwitchDisabled}
+              onChange={(_, data) => handleSwitchChange(data.checked as boolean)}
             />
+            {vlcSwitchDisabled && !downloading && (
+              <Text size={200} style={{ color: "var(--colorNeutralForeground3)", lineHeight: 1.5 }}>
+                需要先下载 VLC 引擎才能启用此功能
+              </Text>
+            )}
             <Text size={200} style={{ color: "var(--colorNeutralForeground3)", lineHeight: 1.5 }}>
               开启后，桌面端播放直播/录播时将使用 libVLC 引擎在程序
               内部窗口直接播放，支持 RTMP 协议流，无需外部播放器。
-              VLC 引擎会在首次使用时自动下载。
             </Text>
           </div>
 
@@ -141,23 +258,50 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
                   width: "8px",
                   height: "8px",
                   borderRadius: "50%",
-                  backgroundColor:
-                    vlcAvailable === null
-                      ? "rgba(255,255,255,0.3)"
-                      : vlcAvailable
-                      ? "#4caf50"
-                      : "#ff5252",
+                  backgroundColor: statusColor,
                   flexShrink: 0,
                 }}
               />
-              <Text size={200}>
-                {vlcAvailable === null
-                  ? "正在检测 libVLC 引擎..."
-                  : vlcAvailable
-                  ? "libVLC 引擎可用"
-                  : "libVLC 引擎不可用，请安装 VLC"}
+              <Text size={200} style={{ flex: 1 }}>
+                {statusText}
               </Text>
             </div>
+
+            {/* Download Progress */}
+            {downloading && downloadProgress && (
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <ProgressBar
+                  value={downloadProgress.progress > 0 ? Math.min(downloadProgress.progress / 100, 0.99) : undefined}
+                  style={{ width: "100%" }}
+                />
+                <Text size={200} style={{ color: "var(--colorNeutralForeground3)", textAlign: "center" }}>
+                  {downloadProgress.progress > 0
+                    ? `${downloadProgress.progress.toFixed(1)}% - ${downloadProgress.message}`
+                    : downloadProgress.message}
+                </Text>
+              </div>
+            )}
+
+            {/* Download Error */}
+            {downloadProgress && downloadProgress.progress < 0 && (
+              <Text size={200} style={{ color: "#ff5252", lineHeight: 1.4 }}>
+                {downloadProgress.message}
+              </Text>
+            )}
+
+            {/* Download Button - only show if VLC not available/integrated and not currently downloading */}
+            {vlcIntegrated !== true && !downloading && (
+              <Button
+                appearance="primary"
+                icon={<ArrowDownloadRegular />}
+                onClick={handleDownloadVlc}
+                style={{ width: "100%" }}
+              >
+                下载 VLC 引擎 (~101 MB)
+              </Button>
+            )}
+
+            {/* VLC Stop Button */}
             {vlcPlaying && (
               <Button
                 appearance="primary"

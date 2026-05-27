@@ -288,6 +288,200 @@ async fn check_vlc_installed() -> bool {
     Libvlc::load().is_ok()
 }
 
+/// 检查 VLC 完整性（文件存在 + 可加载）
+#[tauri::command]
+async fn check_vlc_integrity() -> Result<String, String> {
+    match vlc_player::check_vlc_integrity() {
+        Ok(()) => Ok("ok".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct VlcDownloadProgress {
+    progress: f64,
+    message: String,
+}
+
+/// 下载 VLC 引擎（从 NuGet），下载完成后自动做完整性检查
+#[tauri::command]
+async fn download_vlc(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let app_clone = app_handle.clone();
+    
+    // 通知开始
+    let _ = app_clone.emit(
+        "vlc-download-progress",
+        VlcDownloadProgress {
+            progress: 0.0,
+            message: "开始下载 VLC 引擎...".to_string(),
+        },
+    );
+
+    // 在独立线程中执行阻塞的下载和解压操作
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let target_dir = vlc_player::bundled_dir().ok_or("无法确定 VLC 目录位置")?;
+            
+            let url = "https://www.nuget.org/api/v2/package/VideoLAN.LibVLC.Windows/3.0.21";
+            
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+            
+            let _ = app_clone.emit(
+                "vlc-download-progress",
+                VlcDownloadProgress {
+                    progress: 5.0,
+                    message: "正在连接下载服务器...".to_string(),
+                },
+            );
+
+            let resp = client.get(url).send()
+                .map_err(|e| format!("下载 VLC 引擎失败: {}", e))?;
+            
+            let total_size = resp.content_length().unwrap_or(0);
+            let _ = app_clone.emit(
+                "vlc-download-progress",
+                VlcDownloadProgress {
+                    progress: 10.0,
+                    message: format!("正在下载 (共 {:.1} MB)...", total_size as f64 / 1_048_576.0),
+                },
+            );
+
+            // 将响应体流式读入内存
+            let mut downloaded: u64 = 0;
+            let mut bytes = Vec::with_capacity(total_size as usize);
+            let mut buf = [0u8; 65536];
+            let mut stream = resp;
+            
+            loop {
+                let n = stream.read(&mut buf).map_err(|e| format!("读取数据失败: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                downloaded += n as u64;
+                
+                if total_size > 0 {
+                    let pct = 10.0 + (downloaded as f64 / total_size as f64) * 80.0;
+                    let _ = app_clone.emit(
+                        "vlc-download-progress",
+                        VlcDownloadProgress {
+                            progress: pct,
+                            message: format!("下载中... {:.1}%", pct),
+                        },
+                    );
+                }
+            }
+
+            let _ = app_clone.emit(
+                "vlc-download-progress",
+                VlcDownloadProgress {
+                    progress: 90.0,
+                    message: "正在解压...".to_string(),
+                },
+            );
+
+            // 解压到目标目录
+            let cursor = std::io::Cursor::new(bytes);
+            let mut archive = zip::ZipArchive::new(cursor)
+                .map_err(|e| format!("解压文件失败: {}", e))?;
+
+            // 找到 libvlc.dll 所在的前缀目录
+            let prefix = (0..archive.len())
+                .find_map(|i| {
+                    let entry = archive.by_index(i).ok()?;
+                    let name = entry.name().replace('\\', "/");
+                    if name.ends_with("/libvlc.dll") || name.ends_with("/libvlccore.dll") {
+                        name.rfind('/').map(|idx| name[..=idx].to_string())
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("在 NuGet 包中未找到 libvlc.dll")?;
+
+            // 先清空旧目录
+            if target_dir.exists() {
+                std::fs::remove_dir_all(&target_dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+
+            let total_files = archive.len();
+            for i in 0..total_files {
+                let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+                let name = entry.name().replace('\\', "/");
+
+                if !name.starts_with(&prefix) {
+                    continue;
+                }
+
+                let rel_path = &name[prefix.len()..];
+                let target_path = target_dir.join(rel_path);
+
+                if entry.is_dir() {
+                    let _ = std::fs::create_dir_all(&target_path);
+                } else if entry.is_file() {
+                    if let Some(parent) = target_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let mut out = std::fs::File::create(&target_path)
+                        .map_err(|e| format!("创建文件失败: {}", e))?;
+                    std::io::copy(&mut entry, &mut out)
+                        .map_err(|e| format!("写入文件失败: {}", e))?;
+                }
+
+                if i % 20 == 0 {
+                    let extract_pct = 90.0 + (i as f64 / total_files as f64) * 9.0;
+                    let _ = app_clone.emit(
+                        "vlc-download-progress",
+                        VlcDownloadProgress {
+                            progress: extract_pct.min(99.0),
+                            message: format!("解压中... {} / {}", i, total_files),
+                        },
+                    );
+                }
+            }
+
+            let _ = app_clone.emit(
+                "vlc-download-progress",
+                VlcDownloadProgress {
+                    progress: 99.0,
+                    message: "正在验证完整性...".to_string(),
+                },
+            );
+
+            // 完整性检查
+            vlc_player::check_vlc_integrity().map_err(|e| format!("完整性检查失败: {}", e))?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = app_clone.emit(
+                    "vlc-download-progress",
+                    VlcDownloadProgress {
+                        progress: 100.0,
+                        message: "VLC 引擎下载完成".to_string(),
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app_clone.emit(
+                    "vlc-download-progress",
+                    VlcDownloadProgress {
+                        progress: -1.0,
+                        message: format!("下载失败: {}", e),
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(())
+}
+
 /// 检查 VLC 转码是否正在运行
 #[tauri::command]
 async fn vlc_stream_running(
@@ -733,6 +927,8 @@ pub fn run() {
             vlc_play,
             vlc_stop,
             check_vlc_installed,
+            check_vlc_integrity,
+            download_vlc,
             vlc_stream_running,
             download_video,
             cancel_download
