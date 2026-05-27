@@ -8,7 +8,9 @@ interface VideoPlayerProps {
   nickname: string;
   streamUrl?: string;
   isLive?: boolean;
-  onSwitch?: (direction: "prev" | "next") => void | Promise<void>;
+  canSwitchPrev?: boolean;
+  canSwitchNext?: boolean;
+  onSwitch?: (direction: "prev" | "next") => string | void | Promise<string | void>;
   onClose: () => void;
 }
 
@@ -33,7 +35,7 @@ function formatTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwitch, onClose }: VideoPlayerProps) {
+function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSwitchPrev, canSwitchNext, onSwitch, onClose }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -58,6 +60,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const switchingRef = useRef(false);
+  const [boundaryToast, setBoundaryToast] = useState<string | null>(null);
+  const boundaryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchStyle, setSwitchStyle] = useState<{
     transform: string;
     opacity: number;
@@ -87,6 +91,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
   useEffect(() => {
     return () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
+      if (boundaryTimerRef.current) clearTimeout(boundaryTimerRef.current);
     };
   }, []);
 
@@ -482,28 +487,20 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
     }
   }, [showControls, flashControls]);
 
-  const handleVideoTouchStart = useCallback((e: React.TouchEvent) => {
-    const touch = e.touches[0];
-    if (!touch) return;
-    swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
+  const showBoundaryToast = useCallback((msg: string) => {
+    setBoundaryToast(msg);
+    if (boundaryTimerRef.current) clearTimeout(boundaryTimerRef.current);
+    boundaryTimerRef.current = setTimeout(() => setBoundaryToast(null), 2000);
   }, []);
 
-  const handleVideoTouchEnd = useCallback((e: React.TouchEvent) => {
-    const start = swipeStartRef.current;
-    const touch = e.changedTouches[0];
-    swipeStartRef.current = null;
-    if (!start || !touch || loading || error || !onSwitch) return;
-
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    if (Math.abs(dy) <= Math.abs(dx) || Math.abs(dy) < 72) return;
-
-    if (switchingRef.current) return;
+  const performSwitch = useCallback(async (direction: "prev" | "next") => {
+    if (switchingRef.current || !onSwitch) return;
+    if (direction === "prev" && !canSwitchPrev) { showBoundaryToast("已经是第一个了"); return; }
+    if (direction === "next" && !canSwitchNext) { showBoundaryToast("已经是最后一个了"); return; }
     switchingRef.current = true;
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current);
     setShowControls(false);
 
-    const direction = dy < 0 ? "next" : "prev";
     const outTransform = direction === "next" ? "translateY(-100%)" : "translateY(100%)";
     const inTransform = direction === "next" ? "translateY(100%)" : "translateY(-100%)";
 
@@ -515,7 +512,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
 
     window.setTimeout(async () => {
       try {
-        await onSwitch(direction);
+        const msg = await onSwitch(direction);
+        if (msg) showBoundaryToast(msg);
       } finally {
         setSwitchStyle({
           transform: inTransform,
@@ -536,12 +534,57 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
         });
       }
     }, 220);
-  }, [error, loading, onSwitch]);
+  }, [onSwitch, canSwitchPrev, canSwitchNext, showBoundaryToast]);
+
+  const handleVideoTouchStart = useCallback((e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch) return;
+    swipeStartRef.current = { x: touch.clientX, y: touch.clientY };
+  }, []);
+
+  const handleVideoTouchEnd = useCallback((e: React.TouchEvent) => {
+    const start = swipeStartRef.current;
+    const touch = e.changedTouches[0];
+    swipeStartRef.current = null;
+    if (!start || !touch || loading || error || !onSwitch) return;
+
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (Math.abs(dy) <= Math.abs(dx) || Math.abs(dy) < 72) return;
+
+    performSwitch(dy < 0 ? "next" : "prev");
+  }, [error, loading, onSwitch, performSwitch]);
+
+  // Mouse wheel to switch prev/next video
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    if (loading || error || !onSwitch) return;
+    if (Math.abs(e.deltaY) < 30) return;
+    performSwitch(e.deltaY > 0 ? "next" : "prev");
+  }, [error, loading, onSwitch, performSwitch]);
+
+  // Keyboard up/down arrow to switch prev/next video
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        performSwitch(e.key === "ArrowUp" ? "prev" : "next");
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [performSwitch]);
 
   // Close overlay when clicking background (not video area)
   const handleOverlayClick = (e: React.MouseEvent) => {
     if (e.target === containerRef.current) onClose();
   };
+
+  // Block body scroll while player is open
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, []);
 
   // Escape key
   useEffect(() => {
@@ -572,6 +615,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
         zIndex: 9999,
         display: "flex",
         flexDirection: "column",
+        overflow: "hidden",
         userSelect: "none",
         WebkitUserSelect: "none",
       }}
@@ -653,6 +697,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
         onClick={handleVideoClick}
         onTouchStart={handleVideoTouchStart}
         onTouchEnd={handleVideoTouchEnd}
+        onWheel={handleWheel}
         style={{
           flex: 1,
           display: "flex",
@@ -757,6 +802,26 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
           </div>
         )}
       </div>
+
+      {/* Boundary toast */}
+      {boundaryToast && (
+        <div style={{
+          position: "absolute",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
+          background: "rgba(0,0,0,0.7)",
+          color: "rgba(255,255,255,0.9)",
+          padding: "10px 24px",
+          borderRadius: "8px",
+          fontSize: "14px",
+          zIndex: 50,
+          pointerEvents: "none",
+          whiteSpace: "nowrap",
+        }}>
+          {boundaryToast}
+        </div>
+      )}
 
       {/* Bottom controls */}
       {!loading && !error && (

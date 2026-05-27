@@ -396,7 +396,9 @@ function App() {
   const switchWebPlayback = async (direction: "prev" | "next") => {
     if (playingIndex < 0 || playingList.length === 0) return;
     const nextIndex = direction === "next" ? playingIndex + 1 : playingIndex - 1;
-    if (nextIndex < 0 || nextIndex >= playingList.length) return;
+    if (nextIndex < 0 || nextIndex >= playingList.length) {
+      return direction === "next" ? "已经是最后一个了" : "已经是第一个了";
+    }
 
     const nextItem = playingList[nextIndex];
     try {
@@ -891,6 +893,8 @@ function App() {
           nickname={playingItem.userInfo.nickname}
           streamUrl={playingUrl}
           isLive={activeTab === "live"}
+          canSwitchPrev={playingIndex > 0}
+          canSwitchNext={playingIndex < playingList.length - 1}
           onSwitch={switchWebPlayback}
           onClose={() => {
             setPlayingIndex(-1);
