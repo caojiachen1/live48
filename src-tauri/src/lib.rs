@@ -192,16 +192,10 @@ async fn get_playable_stream_url(live_id: String) -> Result<String, String> {
         if !path.starts_with("rtmp://") && !path.starts_with("rtmps://") {
             return Ok(path.to_string());
         }
-        // 如果 getlivestream 也返回 RTMP，只能返回原地址
-        return Ok(path.to_string());
     }
 
-    // 最后 fallback：返回原来的 playStreamPath
-    if let Some(path) = json1["content"]["playStreamPath"].as_str() {
-        Ok(path.to_string())
-    } else {
-        Err("无法获取流地址".to_string())
-    }
+    // 所有接口都返回 RTMP，无法在浏览器中播放
+    Err("所有可用流地址均为 RTMP 协议，浏览器无法直接播放".to_string())
 }
 
 #[tauri::command]

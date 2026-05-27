@@ -50,6 +50,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const [retryKey, setRetryKey] = useState(0);
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
+  const vlcUsedRef = useRef(false);
 
   // Timeline state
   const [currentTime, setCurrentTime] = useState(0);
@@ -188,16 +189,26 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         }
 
         if (cancelled) return;
-        setStreamUrl(url);
 
+        // 如果拿到的仍然是 RTMP 流，尝试 VLC 转码
         if (url.startsWith("rtmp://") || url.startsWith("rtmps://")) {
-          if (tryOpenNativeAndroidPlayer(url)) {
-            onClose();
+          try {
+            const localUrl = await invoke("vlc_play", { url }) as string;
+            if (cancelled) return;
+            url = localUrl;
+            vlcUsedRef.current = true;
+          } catch {
+            if (cancelled) return;
+            if (tryOpenNativeAndroidPlayer(url)) {
+              onClose();
+              return;
+            }
+            setError("获取到的流地址为 RTMP 协议，当前环境无法直接播放");
             return;
           }
-          setError("获取到的流地址为 RTMP 协议，当前环境无法直接播放");
-          return;
         }
+
+        setStreamUrl(url);
 
         if (isAndroid && isLive) {
           setUseCanvas(true);
@@ -216,6 +227,10 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
     loadStream();
     return () => {
       cancelled = true;
+      if (vlcUsedRef.current) {
+        vlcUsedRef.current = false;
+        invoke("vlc_stop").catch(() => {});
+      }
     };
   }, [liveId, preUrl, isLive, onClose, tryOpenNativeAndroidPlayer]);
 

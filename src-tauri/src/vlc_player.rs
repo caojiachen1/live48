@@ -684,9 +684,9 @@ impl VlcStreamer {
         let temp_path = temp_file.to_string_lossy().to_string();
 
         // VLC sout：输出到本地文件（路径反斜杠转正斜杠，libVLC 兼容）
-        // 添加 transcode 确保格式兼容性，避免 mpegts.js 无法解码某些 RTMP 流
+        // 输入已是 h264+AAC，直接 remux 到 TS 容器即可，无需转码
         let sout = format!(
-            ":sout=#transcode{{vcodec=h264,acodec=mpga,ab=128,channels=2,samplerate=44100,deinterlace}}:std{{access=file,mux=ts,dst={}}}",
+            ":sout=#std{{access=file,mux=ts,dst={}}}",
             temp_path.replace('\\', "/")
         );
 
