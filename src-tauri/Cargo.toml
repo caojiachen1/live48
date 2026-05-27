@@ -28,4 +28,7 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 url = "2.5.8"
+libloading = "0.8"
+zip = "0.6"
+
 

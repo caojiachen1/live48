@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { DismissRegular, PlayRegular, PauseRegular } from "@fluentui/react-icons";
+import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular } from "@fluentui/react-icons";
 
 interface VideoPlayerProps {
   liveId: string;
@@ -45,7 +45,9 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
   const [error, setError] = useState<string>("");
   const [isPlaying, setIsPlaying] = useState(false);
   const [useCanvas, setUseCanvas] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
   const hlsRef = useRef<any>(null);
+  const mpegtsRef = useRef<any>(null);
 
   // Timeline state
   const [currentTime, setCurrentTime] = useState(0);
@@ -303,18 +305,75 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
             video.src = streamUrl;
             video.play().then(() => {
               if (useCanvas) startCanvasLoop();
-            }).catch((e) => {
-              console.error("native HLS play failed:", e);
-              setError("播放失败");
+            }).catch((e: any) => {
+              if (e.name !== "AbortError") {
+                console.error("native HLS play failed:", e);
+                setError("播放失败");
+              }
+            });
+          }
+        } else if (streamUrl.endsWith(".mpegts") || streamUrl.endsWith(".ts")) {
+          // MPEG-TS 流，浏览器不支持原生播放，使用 mpegts.js 解码
+          const Mpegts = (await import("mpegts.js")).default;
+          if (Mpegts.isSupported()) {
+            const player = Mpegts.createPlayer({
+              type: "mpegts",
+              url: streamUrl,
+              isLive: true,
+              hasVideo: true,
+              hasAudio: true,
+            }, {
+              enableStashBuffer: false,
+              liveBufferLatencyChasing: true,
+              liveBufferLatencyMaxLatency: 2.5,
+              liveBufferLatencyMinRemain: 0.3,
+            });
+            player.attachMediaElement(video);
+            player.load();
+            const playPromise = player.play();
+            if (playPromise !== undefined) {
+              playPromise.catch((e: any) => {
+                if (e.name !== "AbortError") {
+                  console.error("mpegts play failed:", e);
+                }
+              });
+            }
+
+            // 直播流断流自动重连（最多 5 次，指数退避）
+            let tsRetries = 0;
+            player.on(Mpegts.Events.ERROR, () => {
+              if (cancelled || tsRetries >= 5) return;
+              tsRetries++;
+              const delay = Math.min(1000 * Math.pow(2, tsRetries - 1), 8000);
+              console.log(`mpegts error, retry ${tsRetries}/5 in ${delay}ms...`);
+              setTimeout(() => {
+                if (cancelled) return;
+                try { player.unload(); player.load(); player.play()?.catch(() => {}); } catch {}
+              }, delay);
+            });
+
+            mpegtsRef.current = player;
+          } else {
+            // mpegts.js 不支持，回退直接播放
+            video.src = streamUrl;
+            video.play().then(() => {
+              if (useCanvas) startCanvasLoop();
+            }).catch((e: any) => {
+              if (e.name !== "AbortError") {
+                console.error("direct play failed:", e);
+                setError("播放失败");
+              }
             });
           }
         } else {
           video.src = streamUrl;
           video.play().then(() => {
             if (useCanvas) startCanvasLoop();
-          }).catch((e) => {
-            console.error("direct play failed:", e);
-            setError("播放失败");
+          }).catch((e: any) => {
+            if (e.name !== "AbortError") {
+              console.error("direct play failed:", e);
+              setError("播放失败");
+            }
           });
         }
       } catch (e) {
@@ -335,18 +394,25 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
-      video.pause();
+      if (mpegtsRef.current) {
+        mpegtsRef.current.destroy();
+        mpegtsRef.current = null;
+      }
+      // play() promise 可能未完成，pause() 触发 AbortError — 安全忽略
+      try { video.pause(); } catch {}
       video.removeAttribute("src");
       video.load();
     };
-  }, [streamUrl, useCanvas, startCanvasLoop]);
+  }, [streamUrl, useCanvas, startCanvasLoop, retryKey]);
 
   // Play/Pause toggle
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      video.play().catch(console.error);
+      video.play().catch((e: any) => {
+        if (e.name !== "AbortError") console.error(e);
+      });
     } else {
       video.pause();
     }
@@ -531,6 +597,31 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, onSwi
       >
         <DismissRegular style={{ fontSize: "22px" }} />
       </button>
+
+      {isLive && (
+        <button
+          onClick={(e) => { e.stopPropagation(); setRetryKey(k => k + 1); }}
+          style={{
+            position: "absolute",
+            top: "24px",
+            right: "16px",
+            zIndex: 30,
+            background: "rgba(0,0,0,0.35)",
+            border: "none",
+            color: "white",
+            cursor: "pointer",
+            padding: "6px",
+            borderRadius: "999px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          aria-label="刷新直播流"
+          title="刷新直播流"
+        >
+          <ArrowClockwiseRegular style={{ fontSize: "20px" }} />
+        </button>
+      )}
 
       {/* Top bar */}
       <div

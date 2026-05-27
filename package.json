@@ -8,6 +8,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "dayjs": "^1.11.20",
     "hls.js": "^1.6.16",
+    "mpegts.js": "^1.8.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

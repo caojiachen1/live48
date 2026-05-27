@@ -22,8 +22,9 @@ import {
   Tab,
   ProgressBar
 } from "@fluentui/react-components";
-import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular } from "@fluentui/react-icons";
+import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular, SettingsRegular } from "@fluentui/react-icons";
 import VideoPlayer from "./VideoPlayer";
+import SettingsPanel from "./SettingsPanel";
 import dayjs from "dayjs";
 import "./App.android.css";
 
@@ -74,6 +75,27 @@ function App() {
   const [pullRefreshing, setPullRefreshing] = useState(false);
   const [swipeTranslation, setSwipeTranslation] = useState(0);
   
+  // Settings state
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [useBuiltInVlc, setUseBuiltInVlc] = useState(() => {
+    return localStorage.getItem("useBuiltInVlc") === "true";
+  });
+  const [vlcPlaying, setVlcPlaying] = useState(false);
+
+  const handleUseBuiltInVlcChange = (value: boolean) => {
+    setUseBuiltInVlc(value);
+    localStorage.setItem("useBuiltInVlc", String(value));
+  };
+
+  const handleVlcStop = async () => {
+    try {
+      await invoke("vlc_stop");
+      setVlcPlaying(false);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   // Video player state (used on mobile/webview platforms)
   const [playingList, setPlayingList] = useState<LiveItem[]>([]);
   const [playingIndex, setPlayingIndex] = useState<number>(-1);
@@ -450,19 +472,37 @@ function App() {
           setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
           setPlayingIndex(Math.max(0, startIndex));
           setPlayingUrl(url);
-        } else {
-          // Desktop: use external player (PotPlayer, etc.)
-          await invoke("open_in_player", { url });
-          dispatchToast(
-            <Toast><ToastTitle>正在启动播放器</ToastTitle></Toast>,
-            { intent: "info" }
-          );
+          } else {
+            // Desktop
+            if (useBuiltInVlc) {
+              // 仅 RTMP 需要 VLC 转码，m3u8/HLS 直接通过 hls.js 播放
+              const needsVlc = url.startsWith("rtmp://") || url.startsWith("rtmps://");
+              const playUrl: string = needsVlc ? await invoke("vlc_play", { url }) : url;
+              setVlcPlaying(needsVlc);
+              if (item) {
+                setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
+                setPlayingIndex(Math.max(0, startIndex));
+                setPlayingUrl(playUrl);
+              }
+              dispatchToast(
+                <Toast><ToastTitle>已启动内置{needsVlc ? ' VLC 转码' : ' HLS'}播放</ToastTitle></Toast>,
+                { intent: "info" }
+              );
+          } else {
+            // use external player (PotPlayer, etc.)
+            await invoke("open_in_player", { url });
+            dispatchToast(
+              <Toast><ToastTitle>正在启动播放器</ToastTitle></Toast>,
+              { intent: "info" }
+            );
+          }
         }
       }
     } catch (e) {
-      console.error(e);
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error("handlePlayOrCopy 错误:", e);
       dispatchToast(
-        <Toast><ToastTitle>获取(流/录播)地址失败</ToastTitle></Toast>,
+        <Toast><ToastTitle>播放失败: {errMsg}</ToastTitle></Toast>,
         { intent: "error" }
       );
     }
@@ -703,7 +743,17 @@ function App() {
           backgroundColor: "rgb(32, 32, 32)"
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <Text size={600} weight="semibold" style={{ flexShrink: 0, marginLeft: 10 }}>口袋48直播工具</Text>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <Text size={600} weight="semibold" style={{ flexShrink: 0, marginLeft: 10 }}>口袋48直播工具</Text>
+              <Button
+                appearance="subtle"
+                icon={<SettingsRegular />}
+                onClick={() => setSettingsOpen(true)}
+                title="播放设置"
+                aria-label="播放设置"
+                style={{ minWidth: "36px", padding: "4px" }}
+              />
+            </div>
 
             {/* Mobile filter toggle (hidden on desktop via CSS) */}
             <Button 
@@ -849,6 +899,16 @@ function App() {
           }}
         />
       )}
+
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        useBuiltInVlc={useBuiltInVlc}
+        onUseBuiltInVlcChange={handleUseBuiltInVlcChange}
+        vlcPlaying={vlcPlaying}
+        onVlcStop={handleVlcStop}
+      />
+
       <style>{`
         @keyframes pull-refresh-spin {
           from { transform: rotate(0deg); }

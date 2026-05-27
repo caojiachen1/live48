@@ -10,6 +10,9 @@ use tauri::Manager;
 use tauri_plugin_fs::FsExt;
 use url::Url;
 
+mod vlc_player;
+use vlc_player::{Libvlc, VlcStreamer, VlcStreamState};
+
 // 构造统一的请求头
 fn get_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -252,6 +255,46 @@ fn open_in_player(url: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 启动 VLC 后台转码：将 RTMP 流实时转为 HTTP MPEG-TS 流
+/// 返回本地 HTTP URL，前端用 hls.js / <video> 在当前窗口播放
+#[tauri::command]
+async fn vlc_play(
+    state: tauri::State<'_, VlcStreamState>,
+    url: String,
+) -> Result<String, String> {
+    let mut streamer = state.inner().0.lock().unwrap_or_else(|p| p.into_inner());
+    let local_url = streamer.start_stream(&url).map_err(|e| {
+        eprintln!("[vlc_play] 完整错误: {}", e);
+        e
+    })?;
+    Ok(local_url)
+}
+
+/// 停止 VLC 后台转码
+#[tauri::command]
+async fn vlc_stop(
+    state: tauri::State<'_, VlcStreamState>,
+) -> Result<(), String> {
+    let mut streamer = state.inner().0.lock().unwrap_or_else(|p| p.into_inner());
+    streamer.stop_stream();
+    Ok(())
+}
+
+/// 检查 VLC 是否可用（尝试加载 libvlc）
+#[tauri::command]
+async fn check_vlc_installed() -> bool {
+    Libvlc::load().is_ok()
+}
+
+/// 检查 VLC 转码是否正在运行
+#[tauri::command]
+async fn vlc_stream_running(
+    state: tauri::State<'_, VlcStreamState>,
+) -> Result<bool, String> {
+    let streamer = state.inner().0.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(streamer.is_running())
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -670,12 +713,16 @@ async fn download_via_std_fs(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 启动阶段确保 VLC DLL 就绪（如缺失会自动下载，避免后续在持有锁时下载）
+    vlc_player::ensure_vlc_downloaded();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .manage::<CancelMap>(Arc::new(Mutex::new(HashMap::new())))
+        .manage(VlcStreamState(Mutex::new(VlcStreamer::new())))
         .invoke_handler(tauri::generate_handler![
             get_live_list,
             get_record_list,
@@ -683,6 +730,10 @@ pub fn run() {
             get_live_stream_url_v2,
             get_playable_stream_url,
             open_in_player,
+            vlc_play,
+            vlc_stop,
+            check_vlc_installed,
+            vlc_stream_running,
             download_video,
             cancel_download
         ])
