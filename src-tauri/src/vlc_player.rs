@@ -454,6 +454,11 @@ impl Libvlc {
             CString::new("vlc").unwrap(),
             CString::new("--verbose=2").unwrap(),
             CString::new(plugins_arg).unwrap(),
+            // 低延迟选项：减少 VLC 内部缓冲
+            CString::new("--network-caching=300").unwrap(),
+            CString::new("--sout-mux-caching=100").unwrap(),
+            CString::new("--file-caching=300").unwrap(),
+            CString::new("--live-caching=300").unwrap(),
         ];
         let mut c_args: Vec<*const std::ffi::c_char> = args.iter().map(|s| s.as_ptr()).collect();
         let ptr = unsafe { (self.new)(c_args.len() as c_int, c_args.as_mut_ptr() as *mut *const c_void) };
@@ -720,8 +725,8 @@ impl VlcStreamer {
         let file_path = temp_file.clone();
 
         let handle = thread::spawn(move || {
-            // 等待 VLC 开始写入文件（给 libVLC 一些初始化时间）
-            thread::sleep(std::time::Duration::from_millis(800));
+            // 等待 VLC 开始写入文件
+            thread::sleep(std::time::Duration::from_millis(200));
             serve_ts_http(listener, file_path, running_copy);
         });
 
@@ -802,6 +807,7 @@ fn serve_ts_http(
                 let header = b"HTTP/1.1 200 OK\r\n\
                     Content-Type: video/mp2t\r\n\
                     Access-Control-Allow-Origin: *\r\n\
+                    Cache-Control: no-cache\r\n\
                     Connection: close\r\n\r\n";
                 if stream.write_all(header).is_err() {
                     continue;
@@ -809,30 +815,28 @@ fn serve_ts_http(
 
                 // 等待文件出现（VLC 可能尚未创建）
                 while running.load(Ordering::SeqCst) && !file_path.exists() {
-                    thread::sleep(std::time::Duration::from_millis(200));
+                    thread::sleep(std::time::Duration::from_millis(50));
                 }
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // 持续读取文件新数据并发送
+                // 打开文件并跳到末尾，只输出新数据（避免客户端从文件头追赶导致卡顿）
                 let mut file = match std::fs::File::open(&file_path) {
                     Ok(f) => f,
-                    Err(_) => {
-                        // 文件仍无法打开 — 丢弃此连接，继续服务下一个
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
-                let mut pos: u64 = 0;
+                let mut pos = file.seek(SeekFrom::End(0)).unwrap_or(0);
+
                 while running.load(Ordering::SeqCst) {
                     match file.seek(SeekFrom::Start(pos)) {
                         Ok(_) => {}
                         Err(_) => break,
                     }
-                    let mut buf = [0u8; 32768];
+                    let mut buf = [0u8; 65536];
                     match file.read(&mut buf) {
                         Ok(0) => {
-                            thread::sleep(std::time::Duration::from_millis(50));
+                            thread::sleep(std::time::Duration::from_millis(10));
                             continue;
                         }
                         Ok(n) => {
@@ -846,11 +850,11 @@ fn serve_ts_http(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
             Err(_) => {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }

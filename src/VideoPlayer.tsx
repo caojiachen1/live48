@@ -345,8 +345,10 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
             }, {
               enableStashBuffer: false,
               liveBufferLatencyChasing: true,
-              liveBufferLatencyMaxLatency: 2.5,
-              liveBufferLatencyMinRemain: 0.3,
+              liveBufferLatencyMaxLatency: 1.5,
+              liveBufferLatencyMinRemain: 0.2,
+              lazyLoadMaxDuration: 0.5,
+              deferLoadAfterSourceOpen: false,
             });
             player.attachMediaElement(video);
             player.load();
