@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular } from "@fluentui/react-icons";
+import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular, ListRegular } from "@fluentui/react-icons";
+
+interface PlaylistItem {
+  liveId: string;
+  title?: string;
+  nickname?: string;
+  coverPath?: string;
+  userInfo?: { nickname: string };
+}
 
 interface VideoPlayerProps {
   liveId: string;
@@ -11,6 +19,9 @@ interface VideoPlayerProps {
   canSwitchPrev?: boolean;
   canSwitchNext?: boolean;
   onSwitch?: (direction: "prev" | "next") => string | void | Promise<string | void>;
+  playlist?: PlaylistItem[];
+  currentIndex?: number;
+  onSelect?: (index: number) => void;
   onClose: () => void;
 }
 
@@ -35,7 +46,7 @@ function formatTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSwitchPrev, canSwitchNext, onSwitch, onClose }: VideoPlayerProps) {
+function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSwitchPrev, canSwitchNext, onSwitch, playlist, currentIndex, onSelect, onClose }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -62,6 +73,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const switchingRef = useRef(false);
   const [boundaryToast, setBoundaryToast] = useState<string | null>(null);
+  const [showPlaylist, setShowPlaylist] = useState(false);
+  const playlistRef = useRef<HTMLDivElement>(null);
   const boundaryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchStyle, setSwitchStyle] = useState<{
     transform: string;
@@ -665,7 +678,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
           style={{
             position: "absolute",
             top: "24px",
-            right: "16px",
+            right: playlist && playlist.length > 1 ? "56px" : "16px",
             zIndex: 30,
             background: "rgba(0,0,0,0.35)",
             border: "none",
@@ -681,6 +694,31 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
           title="刷新直播流"
         >
           <ArrowClockwiseRegular style={{ fontSize: "20px" }} />
+        </button>
+      )}
+
+      {playlist && playlist.length > 1 && (
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowPlaylist(v => !v); }}
+          style={{
+            position: "absolute",
+            top: "24px",
+            right: "16px",
+            zIndex: 30,
+            background: showPlaylist ? "rgba(187,134,252,0.5)" : "rgba(0,0,0,0.35)",
+            border: "none",
+            color: "white",
+            cursor: "pointer",
+            padding: "6px",
+            borderRadius: "999px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          aria-label="播放列表"
+          title="播放列表"
+        >
+          <ListRegular style={{ fontSize: "20px" }} />
         </button>
       )}
 
@@ -840,6 +878,153 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         </div>
       )}
 
+      {/* Playlist panel */}
+      {showPlaylist && playlist && playlist.length > 1 && (
+        <>
+          <div
+            onClick={(e) => { e.stopPropagation(); setShowPlaylist(false); }}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 25,
+              background: "rgba(0,0,0,0.3)",
+            }}
+          />
+          <div
+            ref={playlistRef}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "absolute",
+              top: 0,
+              right: 0,
+              bottom: 0,
+              width: "280px",
+              maxWidth: "80vw",
+              zIndex: 30,
+              background: "rgba(20,20,20,0.95)",
+              borderLeft: "1px solid rgba(255,255,255,0.1)",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              animation: "playlist-slide-in 0.2s ease-out",
+            }}
+          >
+            <div style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "16px",
+              borderBottom: "1px solid rgba(255,255,255,0.1)",
+              flexShrink: 0,
+            }}>
+              <span style={{ color: "rgba(255,255,255,0.9)", fontSize: "14px", fontWeight: 600 }}>
+                播放列表 ({playlist.length})
+              </span>
+              <button
+                onClick={() => setShowPlaylist(false)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "rgba(255,255,255,0.6)",
+                  cursor: "pointer",
+                  padding: "4px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <DismissRegular style={{ fontSize: "16px" }} />
+              </button>
+            </div>
+            <div style={{
+              flex: 1,
+              overflowY: "auto",
+              overflowX: "hidden",
+            }}>
+              {playlist.map((item, idx) => {
+                const isCurrent = idx === currentIndex;
+                return (
+                  <div
+                    key={item.liveId}
+                    onClick={() => {
+                      if (!isCurrent && onSelect) {
+                        onSelect(idx);
+                        setShowPlaylist(false);
+                      }
+                    }}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      padding: "10px 16px",
+                      cursor: isCurrent ? "default" : "pointer",
+                      background: isCurrent ? "rgba(187,134,252,0.15)" : "transparent",
+                      borderLeft: isCurrent ? "3px solid #bb86fc" : "3px solid transparent",
+                      transition: "background 0.15s ease",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isCurrent) (e.currentTarget as HTMLDivElement).style.background = "rgba(255,255,255,0.06)";
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isCurrent) (e.currentTarget as HTMLDivElement).style.background = "transparent";
+                    }}
+                  >
+                    {item.coverPath && (
+                      <img
+                        src={item.coverPath.startsWith("http") ? item.coverPath : `https://source3.48.cn${item.coverPath}`}
+                        alt=""
+                        style={{
+                          width: "48px",
+                          height: "48px",
+                          objectFit: "cover",
+                          borderRadius: "4px",
+                          flexShrink: 0,
+                        }}
+                      />
+                    )}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        color: isCurrent ? "#bb86fc" : "rgba(255,255,255,0.85)",
+                        fontSize: "13px",
+                        fontWeight: isCurrent ? 600 : 400,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}>
+                        {item.title || "无标题"}
+                      </div>
+                      <div style={{
+                        color: "rgba(255,255,255,0.45)",
+                        fontSize: "11px",
+                        marginTop: "2px",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}>
+                        {item.nickname || item.userInfo?.nickname || ""}
+                      </div>
+                    </div>
+                    {isCurrent && (
+                      <div style={{
+                        width: "8px",
+                        height: "8px",
+                        borderRadius: "50%",
+                        backgroundColor: "#bb86fc",
+                        flexShrink: 0,
+                        animation: "player-live-pulse 1.5s ease-in-out infinite",
+                      }} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+
       {/* Bottom controls */}
       {!loading && !error && (
         <div
@@ -961,6 +1146,10 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         @keyframes player-live-pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.3; }
+        }
+        @keyframes playlist-slide-in {
+          from { transform: translateX(100%); }
+          to { transform: translateX(0); }
         }
       `}</style>
     </div>

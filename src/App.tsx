@@ -414,6 +414,22 @@ function App() {
     }
   };
 
+  const handleSelectPlaylistItem = async (index: number) => {
+    if (index < 0 || index >= playingList.length || index === playingIndex) return;
+    const item = playingList[index];
+    try {
+      const url: string = await invoke("get_live_stream_url", { liveId: item.liveId });
+      setPlayingIndex(index);
+      setPlayingUrl(url);
+    } catch (e) {
+      console.error(e);
+      dispatchToast(
+        <Toast><ToastTitle>切换播放失败</ToastTitle></Toast>,
+        { intent: "error" }
+      );
+    }
+  };
+
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
@@ -896,6 +912,9 @@ function App() {
           canSwitchPrev={playingIndex > 0}
           canSwitchNext={playingIndex < playingList.length - 1}
           onSwitch={switchWebPlayback}
+          playlist={playingList}
+          currentIndex={playingIndex}
+          onSelect={handleSelectPlaylistItem}
           onClose={() => {
             setPlayingIndex(-1);
             setPlayingList([]);
