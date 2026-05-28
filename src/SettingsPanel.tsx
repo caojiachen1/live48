@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
-import { Switch, Text, Button, ProgressBar } from "@fluentui/react-components";
+import { Radio, RadioGroup, Text, Button, ProgressBar } from "@fluentui/react-components";
 import { DismissRegular, SettingsRegular, ArrowDownloadRegular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+export type PlayerMode = "system" | "vlc" | "builtin";
+
 interface SettingsPanelProps {
   open: boolean;
   onClose: () => void;
-  useBuiltInVlc: boolean;
-  onUseBuiltInVlcChange: (value: boolean) => void;
+  playerMode: PlayerMode;
+  onPlayerModeChange: (mode: PlayerMode) => void;
   vlcPlaying: boolean;
   onVlcStop: () => void;
 }
@@ -18,7 +20,7 @@ interface VlcDownloadProgress {
   message: string;
 }
 
-function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vlcPlaying, onVlcStop }: SettingsPanelProps) {
+function SettingsPanel({ open, onClose, playerMode, onPlayerModeChange, vlcPlaying, onVlcStop }: SettingsPanelProps) {
   const [vlcAvailable, setVlcAvailable] = useState<boolean | null>(null);
   const [vlcIntegrated, setVlcIntegrated] = useState<boolean | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -104,13 +106,12 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
     }
   };
 
-  const handleSwitchChange = (value: boolean) => {
-    // When trying to enable VLC, check integrity first
-    if (value && vlcIntegrated !== true) {
-      // Integrity check failed or not available - don't allow switching
-      return;
+  const handlePlayerModeChange = (_: any, data: { value: string }) => {
+    const mode = data.value as PlayerMode;
+    if (mode === "builtin" && vlcIntegrated !== true) {
+      return; // VLC not available, don't allow switching
     }
-    onUseBuiltInVlcChange(value);
+    onPlayerModeChange(mode);
   };
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -119,8 +120,7 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
 
   if (!open) return null;
 
-  // Determine if VLC switch should be disabled
-  const vlcSwitchDisabled = vlcAvailable !== true || vlcIntegrated !== true;
+  const builtinDisabled = vlcAvailable !== true || vlcIntegrated !== true;
   
   // Show appropriate status message
   let statusText = "";
@@ -213,7 +213,7 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
             gap: "24px",
           }}
         >
-          {/* VLC Switch */}
+          {/* Player Mode Selection */}
           <div
             style={{
               display: "flex",
@@ -224,21 +224,32 @@ function SettingsPanel({ open, onClose, useBuiltInVlc, onUseBuiltInVlcChange, vl
               borderRadius: "8px",
             }}
           >
-            <Switch
-              label="使用 VLC 内置播放器"
-              checked={useBuiltInVlc}
-              disabled={vlcSwitchDisabled}
-              onChange={(_, data) => handleSwitchChange(data.checked as boolean)}
-            />
-            {vlcSwitchDisabled && !downloading && (
-              <Text size={200} style={{ color: "var(--colorNeutralForeground3)", lineHeight: 1.5 }}>
-                需要先下载 VLC 引擎才能启用此功能
+            <Text size={300} weight="semibold" style={{ color: "rgba(255,255,255,0.7)" }}>
+              播放器选择
+            </Text>
+            <RadioGroup
+              value={playerMode}
+              onChange={handlePlayerModeChange}
+              style={{ display: "flex", flexDirection: "column", gap: "6px" }}
+            >
+              <Radio value="system" label="系统默认播放器" />
+              <Text size={200} style={{ color: "var(--colorNeutralForeground3)", marginLeft: "24px", marginTop: "-4px" }}>
+                使用 PotPlayer 或系统关联播放器打开
+              </Text>
+              <Radio value="vlc" label="VLC 播放器" />
+              <Text size={200} style={{ color: "var(--colorNeutralForeground3)", marginLeft: "24px", marginTop: "-4px" }}>
+                使用已安装的 VLC 播放器打开
+              </Text>
+              <Radio value="builtin" label="内置播放器 (libVLC)" disabled={builtinDisabled} />
+              <Text size={200} style={{ color: "var(--colorNeutralForeground3)", marginLeft: "24px", marginTop: "-4px" }}>
+                程序内直接播放，支持 RTMP 流，需下载 VLC 引擎
+              </Text>
+            </RadioGroup>
+            {builtinDisabled && !downloading && playerMode !== "builtin" && (
+              <Text size={200} style={{ color: "#ff9800", lineHeight: 1.5, marginTop: "4px" }}>
+                内置播放器需要先下载 VLC 引擎
               </Text>
             )}
-            <Text size={200} style={{ color: "var(--colorNeutralForeground3)", lineHeight: 1.5 }}>
-              开启后，桌面端播放直播/录播时将使用 libVLC 引擎在程序
-              内部窗口直接播放，支持 RTMP 协议流，无需外部播放器。
-            </Text>
           </div>
 
           {/* VLC Status */}

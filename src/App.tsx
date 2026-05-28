@@ -26,6 +26,7 @@ import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDo
 import VideoPlayer from "./VideoPlayer";
 import FilterPanel from "./FilterPanel";
 import SettingsPanel from "./SettingsPanel";
+import type { PlayerMode } from "./SettingsPanel";
 import dayjs from "dayjs";
 import "./App.android.css";
 
@@ -81,14 +82,18 @@ function App() {
   
   // Settings state
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [useBuiltInVlc, setUseBuiltInVlc] = useState(() => {
-    return localStorage.getItem("useBuiltInVlc") === "true";
+  const [playerMode, setPlayerMode] = useState<PlayerMode>(() => {
+    const saved = localStorage.getItem("playerMode");
+    if (saved === "vlc" || saved === "builtin" || saved === "system") return saved;
+    // Migrate from old boolean setting
+    if (localStorage.getItem("useBuiltInVlc") === "true") return "builtin";
+    return "system";
   });
   const [vlcPlaying, setVlcPlaying] = useState(false);
 
-  const handleUseBuiltInVlcChange = (value: boolean) => {
-    setUseBuiltInVlc(value);
-    localStorage.setItem("useBuiltInVlc", String(value));
+  const handlePlayerModeChange = (mode: PlayerMode) => {
+    setPlayerMode(mode);
+    localStorage.setItem("playerMode", mode);
   };
 
   const handleVlcStop = async () => {
@@ -526,7 +531,7 @@ function App() {
           setPlayingUrl(url);
           } else {
             // Desktop
-            if (useBuiltInVlc) {
+            if (playerMode === "builtin") {
               // 仅 RTMP 需要 VLC 转码，m3u8/HLS 直接通过 hls.js 播放
               const needsVlc = url.startsWith("rtmp://") || url.startsWith("rtmps://");
               const playUrl: string = needsVlc ? await invoke("vlc_play", { url }) : url;
@@ -540,8 +545,13 @@ function App() {
                 <Toast><ToastTitle>已启动内置{needsVlc ? ' VLC 转码' : ' HLS'}播放</ToastTitle></Toast>,
                 { intent: "info" }
               );
+          } else if (playerMode === "vlc") {
+            await invoke("open_in_vlc", { url });
+            dispatchToast(
+              <Toast><ToastTitle>正在启动 VLC 播放器</ToastTitle></Toast>,
+              { intent: "info" }
+            );
           } else {
-            // use external player (PotPlayer, etc.)
             await invoke("open_in_player", { url });
             dispatchToast(
               <Toast><ToastTitle>正在启动播放器</ToastTitle></Toast>,
@@ -983,8 +993,8 @@ function App() {
       <SettingsPanel
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
-        useBuiltInVlc={useBuiltInVlc}
-        onUseBuiltInVlcChange={handleUseBuiltInVlcChange}
+        playerMode={playerMode}
+        onPlayerModeChange={handlePlayerModeChange}
         vlcPlaying={vlcPlaying}
         onVlcStop={handleVlcStop}
       />

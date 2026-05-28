@@ -251,6 +251,40 @@ fn open_in_player(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn open_in_vlc(url: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let vlc_paths = vec![
+            "vlc",
+            "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
+            "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+        ];
+        for path in vlc_paths {
+            if Command::new(path).arg(&url).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        return Err("未找到 VLC 播放器，请先安装 VLC".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Command::new("open").args(&["-a", "VLC", &url]).spawn().is_ok() {
+            return Ok(());
+        }
+        return Err("未找到 VLC 播放器".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if Command::new("vlc").arg(&url).spawn().is_ok() {
+            return Ok(());
+        }
+        return Err("未找到 VLC 播放器".to_string());
+    }
+}
+
 /// 启动 VLC 后台转码：将 RTMP 流实时转为 HTTP MPEG-TS 流
 /// 返回本地 HTTP URL，前端用 hls.js / <video> 在当前窗口播放
 #[tauri::command]
@@ -918,6 +952,7 @@ pub fn run() {
             get_live_stream_url_v2,
             get_playable_stream_url,
             open_in_player,
+            open_in_vlc,
             vlc_play,
             vlc_stop,
             check_vlc_installed,
