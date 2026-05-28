@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular, ListRegular } from "@fluentui/react-icons";
+import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular, ListRegular, PictureInPictureEnterRegular, PictureInPictureExitRegular } from "@fluentui/react-icons";
 
 interface PlaylistItem {
   liveId: string;
@@ -75,6 +75,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const [boundaryToast, setBoundaryToast] = useState<string | null>(null);
   const [showPlaylist, setShowPlaylist] = useState(false);
   const playlistRef = useRef<HTMLDivElement>(null);
+  const [miniMode, setMiniMode] = useState(false);
   const boundaryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchStyle, setSwitchStyle] = useState<{
     transform: string;
@@ -597,12 +598,16 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
     if (e.target === containerRef.current) onClose();
   };
 
-  // Block body scroll while player is open
+  // Block body scroll while player is open (not in mini mode)
   useEffect(() => {
+    if (miniMode) {
+      document.body.style.overflow = "";
+      return;
+    }
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = prev; };
-  }, []);
+  }, [miniMode]);
 
   // Escape key
   useEffect(() => {
@@ -620,15 +625,25 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   return (
     <div
       ref={containerRef}
-      onClick={handleOverlayClick}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
+      onClick={miniMode ? undefined : handleOverlayClick}
+      onMouseMove={miniMode ? undefined : handleMouseMove}
+      onMouseUp={miniMode ? undefined : handleMouseUp}
       style={{
         position: "fixed",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
+        ...(miniMode ? {
+          bottom: "20px",
+          right: "20px",
+          width: "320px",
+          height: "180px",
+          borderRadius: "12px",
+          top: "auto",
+          left: "auto",
+        } : {
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+        }),
         backgroundColor: "#000",
         zIndex: 9999,
         display: "flex",
@@ -636,8 +651,13 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         overflow: "hidden",
         userSelect: "none",
         WebkitUserSelect: "none",
+        boxShadow: miniMode ? "0 4px 20px rgba(0,0,0,0.6)" : undefined,
+        border: miniMode ? "1px solid rgba(255,255,255,0.15)" : undefined,
+        transition: "all 0.25s ease",
       }}
     >
+      {!miniMode && (
+      <>
       <button
         onClick={(e) => { e.stopPropagation(); onClose(); }}
         style={{
@@ -658,6 +678,29 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         aria-label="关闭播放"
       >
         <DismissRegular style={{ fontSize: "22px" }} />
+      </button>
+
+      <button
+        onClick={(e) => { e.stopPropagation(); setMiniMode(true); }}
+        style={{
+          position: "absolute",
+          top: "24px",
+          left: "56px",
+          zIndex: 30,
+          background: "rgba(0,0,0,0.35)",
+          border: "none",
+          color: "white",
+          cursor: "pointer",
+          padding: "6px",
+          borderRadius: "999px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+        aria-label="小窗播放"
+        title="小窗播放"
+      >
+        <PictureInPictureEnterRegular style={{ fontSize: "20px" }} />
       </button>
 
       {isLive && (
@@ -715,7 +758,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         style={{
           display: "flex",
           alignItems: "center",
-          padding: "24px 16px 10px 56px",
+          padding: "24px 16px 10px 96px",
           flexShrink: 0,
           opacity: 1,
           pointerEvents: "auto",
@@ -735,12 +778,15 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         </div>
       </div>
 
+      </>
+      )}
+
       {/* Video area */}
       <div
-        onClick={handleVideoClick}
-        onTouchStart={handleVideoTouchStart}
-        onTouchEnd={handleVideoTouchEnd}
-        onWheel={handleWheel}
+        onClick={miniMode ? (e) => { e.stopPropagation(); togglePlay(); } : handleVideoClick}
+        onTouchStart={miniMode ? undefined : handleVideoTouchStart}
+        onTouchEnd={miniMode ? undefined : handleVideoTouchEnd}
+        onWheel={miniMode ? undefined : handleWheel}
         style={{
           flex: 1,
           display: "flex",
@@ -819,7 +865,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
           }}
         />
 
-        {!loading && !error && (
+        {!loading && !error && !miniMode && (
           <div
             onClick={(e) => { e.stopPropagation(); togglePlay(); }}
             style={{
@@ -846,6 +892,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         )}
       </div>
 
+      {!miniMode && (
+      <>
       {/* Boundary toast */}
       {boundaryToast && (
         <div style={{
@@ -1123,6 +1171,78 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      </>
+      )}
+
+      {/* Mini-mode toolbar */}
+      {miniMode && !loading && !error && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            padding: "4px 6px",
+            background: "linear-gradient(to top, rgba(0,0,0,0.8) 0%, transparent 100%)",
+            zIndex: 20,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{
+            flex: 1,
+            minWidth: 0,
+            color: "rgba(255,255,255,0.85)",
+            fontSize: "11px",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}>
+            {title || "无标题"}
+          </div>
+          <button
+            onClick={(e) => { e.stopPropagation(); togglePlay(); }}
+            style={{
+              background: "none", border: "none", color: "white",
+              cursor: "pointer", padding: "2px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+            aria-label={isPlaying ? "暂停" : "播放"}
+          >
+            {isPlaying ? (
+              <PauseRegular style={{ fontSize: "16px" }} />
+            ) : (
+              <PlayRegular style={{ fontSize: "16px" }} />
+            )}
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setMiniMode(false); }}
+            style={{
+              background: "none", border: "none", color: "white",
+              cursor: "pointer", padding: "2px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+            aria-label="全屏播放"
+            title="全屏播放"
+          >
+            <PictureInPictureExitRegular style={{ fontSize: "16px" }} />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onClose(); }}
+            style={{
+              background: "none", border: "none", color: "white",
+              cursor: "pointer", padding: "2px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+            aria-label="关闭播放"
+          >
+            <DismissRegular style={{ fontSize: "16px" }} />
+          </button>
         </div>
       )}
 
