@@ -1,14 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { 
-  Button, 
-  Card, 
-  CardHeader, 
-  CardPreview, 
-  Text, 
+import {
+  Button,
+  Card,
+  CardHeader,
+  CardPreview,
+  Text,
   Spinner,
   Toast,
   ToastTitle,
@@ -24,6 +24,7 @@ import {
 } from "@fluentui/react-components";
 import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular, SettingsRegular } from "@fluentui/react-icons";
 import VideoPlayer from "./VideoPlayer";
+import FilterPanel from "./FilterPanel";
 import SettingsPanel from "./SettingsPanel";
 import dayjs from "dayjs";
 import "./App.android.css";
@@ -68,9 +69,12 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [downloadProgresses, setDownloadProgresses] = useState<Record<string, number>>({});
-  const [filterGroup, setFilterGroup] = useState("全部");
-  const [filterType, setFilterType] = useState("全部");
-  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterGroups, setFilterGroups] = useState<string[]>([]);
+  const [filterTypes, setFilterTypes] = useState<string[]>([]);
+  const [filterMembers, setFilterMembers] = useState<string[]>([]);
+  const [filterDateStart, setFilterDateStart] = useState("");
+  const [filterDateEnd, setFilterDateEnd] = useState("");
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
   const [pullDistance, setPullDistance] = useState(0);
   const [pullRefreshing, setPullRefreshing] = useState(false);
   const [swipeTranslation, setSwipeTranslation] = useState(0);
@@ -287,28 +291,58 @@ function App() {
         }
       }
 
-      const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) || 
+      const matchSearch = item.userInfo.nickname.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (item.title && item.title.toLowerCase().includes(searchQuery.toLowerCase()));
 
-      const matchGroup = filterGroup === "全部" || item.userInfo.nickname.toUpperCase().startsWith(filterGroup);
+      // Group filter: empty = all, otherwise match prefix
+      const matchGroup = filterGroups.length === 0 ||
+        filterGroups.some(g => item.userInfo.nickname.toUpperCase().startsWith(g));
 
+      // Type filter: empty = all, otherwise match badge text
       let matchType = true;
-      if (filterType !== "全部") {
-        if (filterType === "连麦") {
-          matchType = !!item.inMicrophoneConnection;
+      if (filterTypes.length > 0) {
+        if (filterTypes.includes("连麦")) {
+          matchType = !!item.inMicrophoneConnection || filterTypes.includes(getLiveTypeBadge(item.liveType).text);
         } else {
-          const badge = getLiveTypeBadge(item.liveType);
-          matchType = badge.text === filterType;
+          matchType = filterTypes.includes(getLiveTypeBadge(item.liveType).text);
         }
       }
 
-      return matchSearch && matchGroup && matchType;
+      // Member filter: empty = all, otherwise exact match
+      const matchMember = filterMembers.length === 0 || filterMembers.includes(item.userInfo.nickname);
+
+      // Date range filter (record only)
+      let matchDate = true;
+      if (isRecordTab && item.ctime) {
+        const ts = Number(item.ctime);
+        if (filterDateStart) {
+          const start = new Date(filterDateStart).setHours(0, 0, 0, 0);
+          if (ts < start) matchDate = false;
+        }
+        if (filterDateEnd) {
+          const end = new Date(filterDateEnd).setHours(23, 59, 59, 999);
+          if (ts > end) matchDate = false;
+        }
+      }
+
+      return matchSearch && matchGroup && matchType && matchMember && matchDate;
     });
   };
 
   const filteredLiveItems = filterList(lives, false);
   const filteredRecordItems = filterList(records, true);
   const filteredItems = activeTab === "live" ? filteredLiveItems : filteredRecordItems;
+
+  // Derive unique nicknames for member filter
+  const allNicknames = useMemo(() => {
+    const source = activeTab === "live" ? lives : records;
+    const set = new Set(source.map((item) => item.userInfo.nickname));
+    return Array.from(set).sort();
+  }, [activeTab, lives, records]);
+
+  // Whether any non-default filter is active
+  const hasActiveFilters = filterGroups.length > 0 || filterTypes.length > 0 ||
+    filterMembers.length > 0 || !!filterDateStart || !!filterDateEnd;
 
   const shouldIgnoreGestureTarget = (target: EventTarget | null) => {
     if (!(target instanceof HTMLElement)) return false;
@@ -773,26 +807,39 @@ function App() {
               />
             </div>
 
-            {/* Mobile filter toggle (hidden on desktop via CSS) */}
-            <Button 
-              id="filter-toggle-btn"
-              icon={<FilterRegular />}
-              appearance="outline"
-              onClick={() => setFilterOpen(prev => !prev)}
-              style={{ marginRight: 6 }}
-            >
-              筛选
-            </Button>
+            {/* Filter toggle button */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <Button
+                id="filter-toggle-btn"
+                icon={<FilterRegular />}
+                appearance="outline"
+                onClick={() => setFilterPanelOpen(true)}
+                style={{ marginRight: 6, position: "relative" }}
+              >
+                筛选
+                {hasActiveFilters && (
+                  <span style={{
+                    position: "absolute",
+                    top: "4px",
+                    right: "4px",
+                    width: "8px",
+                    height: "8px",
+                    borderRadius: "50%",
+                    backgroundColor: "#bb86fc",
+                  }} />
+                )}
+              </Button>
+            </div>
           </div>
 
-          <div id="filter-bar" className={filterOpen ? "open" : ""} style={{ 
-            display: "flex", 
-            gap: "12px", 
+          <div id="filter-bar" style={{
+            display: "flex",
+            gap: "12px",
             flexWrap: "wrap",
             alignItems: "center"
           }}>
-            <TabList 
-              selectedValue={activeTab} 
+            <TabList
+              selectedValue={activeTab}
               onTabSelect={(_, data) => setActiveTab(data.value as any)}
               style={{ flexShrink: 0 }}
             >
@@ -801,10 +848,13 @@ function App() {
             </TabList>
 
             <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap" }}>
-              
-              <Select 
-              value={filterGroup} 
-              onChange={(_, data) => setFilterGroup(data.value)}
+
+            <Select
+              value={filterGroups.length === 0 ? "全部" : filterGroups.length === 1 ? filterGroups[0] : "__multi__"}
+              onChange={(_, data) => {
+                if (data.value === "__multi__") return;
+                setFilterGroups(data.value === "全部" ? [] : [data.value]);
+              }}
               style={{ minWidth: "120px" }}
             >
               <option value="全部">全部团体</option>
@@ -813,22 +863,29 @@ function App() {
               <option value="BEJ48">BEJ48</option>
               <option value="CKG48">CKG48</option>
               <option value="CGT48">CGT48</option>
+              {filterGroups.length > 1 && <option value="__multi__">已选 {filterGroups.length} 个</option>}
             </Select>
 
-            <Select 
-              value={filterType} 
-              onChange={(_, data) => setFilterType(data.value)}
+            <Select
+              value={filterTypes.length === 0 ? "全部" : filterTypes.length === 1 ? filterTypes[0] : "__multi__"}
+              onChange={(_, data) => {
+                if (data.value === "__multi__") return;
+                setFilterTypes(data.value === "全部" ? [] : [data.value]);
+              }}
               style={{ minWidth: "120px" }}
             >
               <option value="全部">全部类型</option>
               <option value="视频">仅视频</option>
               <option value="电台">仅电台</option>
               <option value="连麦">仅连麦</option>
+              <option value="游戏">仅游戏</option>
+              <option value="AI">仅AI</option>
+              {filterTypes.length > 1 && <option value="__multi__">已选 {filterTypes.length} 个</option>}
             </Select>
 
-            <Input 
+            <Input
               contentBefore={<SearchRegular />}
-              placeholder="搜索成员或标题..." 
+              placeholder="搜索成员或标题..."
               value={searchQuery}
               onChange={(_, data) => setSearchQuery(data.value)}
               style={{ maxWidth: "300px", width: "100%" }}
@@ -930,6 +987,23 @@ function App() {
         onUseBuiltInVlcChange={handleUseBuiltInVlcChange}
         vlcPlaying={vlcPlaying}
         onVlcStop={handleVlcStop}
+      />
+
+      <FilterPanel
+        open={filterPanelOpen}
+        onClose={() => setFilterPanelOpen(false)}
+        activeTab={activeTab}
+        filterGroups={filterGroups}
+        filterTypes={filterTypes}
+        filterMembers={filterMembers}
+        filterDateStart={filterDateStart}
+        filterDateEnd={filterDateEnd}
+        onGroupsChange={setFilterGroups}
+        onTypesChange={setFilterTypes}
+        onMembersChange={setFilterMembers}
+        onDateStartChange={setFilterDateStart}
+        onDateEndChange={setFilterDateEnd}
+        allNicknames={allNicknames}
       />
 
       <style>{`
