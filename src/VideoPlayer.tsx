@@ -277,64 +277,50 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
     const initPlayer = async () => {
       try {
         if (streamUrl.includes(".m3u8")) {
-          const canPlayHls = video.canPlayType("application/vnd.apple.mpegurl") !== "";
-
-          if (!canPlayHls) {
-            const Hls = (await import("hls.js")).default;
-            if (Hls.isSupported()) {
-              const hls = new Hls({
-                enableWorker: false,
-                lowLatencyMode: false,
-                maxBufferLength: 30,
-                maxMaxBufferLength: 60,
-                startLevel: -1,
-                capLevelToPlayerSize: true,
-                debug: false,
-              });
-              hls.loadSource(streamUrl);
-              hls.attachMedia(video);
-              hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                if (!cancelled) {
-                  video.play().then(() => {
-                    if (useCanvas) startCanvasLoop();
-                    retryCountRef.current = 0;
-                  }).catch((e) => {
-                    console.error("play failed:", e);
-                    // 尝试恢复
-                    setTimeout(() => {
-                      if (!cancelled) video.play().catch(console.error);
-                    }, 1000);
-                  });
+          // 优先使用 hls.js（兼容性更好），仅在不支持时回退原生
+          const Hls = (await import("hls.js")).default;
+          if (Hls.isSupported()) {
+            const hls = new Hls({
+              enableWorker: false,
+              lowLatencyMode: false,
+              maxBufferLength: 30,
+              maxMaxBufferLength: 60,
+              startLevel: -1,
+              capLevelToPlayerSize: true,
+              debug: false,
+            });
+            hls.loadSource(streamUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              if (!cancelled) {
+                video.play().then(() => {
+                  if (useCanvas) startCanvasLoop();
+                  retryCountRef.current = 0;
+                }).catch((e) => {
+                  console.error("play failed:", e);
+                  setTimeout(() => {
+                    if (!cancelled) video.play().catch(console.error);
+                  }, 1000);
+                });
+              }
+            });
+            hls.on(Hls.Events.ERROR, (_, data) => {
+              if (data.fatal) {
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                  console.log("HLS network error, reloading...");
+                  hls.startLoad();
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                  console.log("HLS media error, recovering...");
+                  hls.recoverMediaError();
+                } else {
+                  console.error("HLS fatal error:", data.type, data.details);
+                  retryPlay();
                 }
-              });
-              hls.on(Hls.Events.ERROR, (_, data) => {
-                if (data.fatal) {
-                  if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                    console.log("HLS network error, reloading...");
-                    hls.startLoad();
-                  } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                    console.log("HLS media error, recovering...");
-                    hls.recoverMediaError();
-                  } else {
-                    console.error("HLS fatal error:", data.type, data.details);
-                    // 尝试重试
-                    retryPlay();
-                  }
-                }
-              });
-              hlsRef.current = hls;
-            } else {
-              // hls.js 不支持，直接设置 src（Android 原生可能支持 HLS）
-              video.src = streamUrl;
-              video.play().then(() => {
-                if (useCanvas) startCanvasLoop();
-              }).catch((e) => {
-                console.error("direct play failed:", e);
-                setError("播放失败");
-              });
-            }
-          } else {
-            // 浏览器原生支持 HLS（如 Safari/macOS）
+              }
+            });
+            hlsRef.current = hls;
+          } else if (video.canPlayType("application/vnd.apple.mpegurl") !== "") {
+            // hls.js 不支持但浏览器原生支持 HLS（如 iOS Safari）
             video.src = streamUrl;
             video.play().then(() => {
               if (useCanvas) startCanvasLoop();
@@ -344,6 +330,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
                 setError("播放失败");
               }
             });
+          } else {
+            setError("当前环境不支持播放该格式");
           }
         } else if (streamUrl.endsWith(".mpegts") || streamUrl.endsWith(".ts")) {
           // MPEG-TS 流，浏览器不支持原生播放，使用 mpegts.js 解码
