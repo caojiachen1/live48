@@ -1,8 +1,8 @@
 use std::ffi::{c_int, c_void, CString};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::io::{Read, Write, Seek, SeekFrom};
 use std::thread;
 use libloading::{Library, Symbol};
 
@@ -452,13 +452,13 @@ impl Libvlc {
         // 第一个参数应为程序名（可以是任意字符串）
         let args = [
             CString::new("vlc").unwrap(),
-            CString::new("--verbose=2").unwrap(),
+            CString::new("--verbose=0").unwrap(),
             CString::new(plugins_arg).unwrap(),
-            // 低延迟选项：减少 VLC 内部缓冲
-            CString::new("--network-caching=300").unwrap(),
-            CString::new("--sout-mux-caching=100").unwrap(),
-            CString::new("--file-caching=300").unwrap(),
-            CString::new("--live-caching=300").unwrap(),
+            // 低延迟选项：最小化 VLC 内部缓冲
+            CString::new("--network-caching=100").unwrap(),
+            CString::new("--sout-mux-caching=50").unwrap(),
+            CString::new("--file-caching=100").unwrap(),
+            CString::new("--live-caching=100").unwrap(),
         ];
         let mut c_args: Vec<*const std::ffi::c_char> = args.iter().map(|s| s.as_ptr()).collect();
         let ptr = unsafe { (self.new)(c_args.len() as c_int, c_args.as_mut_ptr() as *mut *const c_void) };
@@ -630,14 +630,13 @@ unsafe impl Send for VlcPlayerState {}
 unsafe impl Sync for VlcPlayerState {}
 
 /// VLC 后台转码器 —— 通过嵌入式 libVLC API 将 RTMP 流转为本地文件，
-/// 再通过内建极简 HTTP 服务器供浏览器播放。无需 VLC access_output_http 插件。
+/// 再通过内建 HTTP 服务器供浏览器播放（带 CORS 支持）
 pub struct VlcStreamer {
     libvlc: Option<Libvlc>,
     instance: Option<VlcInstancePtr>,
     media: Option<VlcMediaPtr>,
     player: Option<VlcPlayerPtr>,
     port: u16,
-    // 内建 HTTP 服务器
     server_running: Option<Arc<AtomicBool>>,
     server_handle: Option<thread::JoinHandle<()>>,
     temp_file: Option<PathBuf>,
@@ -657,7 +656,7 @@ impl VlcStreamer {
         }
     }
 
-    /// 启动 libVLC 后台转码：RTMP → 本地 TS 文件 → HTTP 服务器 → 返回 URL
+    /// 启动 libVLC 后台转码：RTMP → 本地 TS 文件 → HTTP 服务器（带 CORS）→ 返回 URL
     pub fn start_stream(&mut self, url: &str) -> Result<String, String> {
         self.stop_stream();
 
@@ -688,8 +687,7 @@ impl VlcStreamer {
         let temp_file = std::env::temp_dir().join(format!("live48_{}.ts", std::process::id()));
         let temp_path = temp_file.to_string_lossy().to_string();
 
-        // VLC sout：输出到本地文件（路径反斜杠转正斜杠，libVLC 兼容）
-        // 输入已是 h264+AAC，直接 remux 到 TS 容器即可，无需转码
+        // VLC sout：输出到本地文件，减少 mux 延迟
         let sout = format!(
             ":sout=#std{{access=file,mux=ts,dst={}}}",
             temp_path.replace('\\', "/")
@@ -698,8 +696,9 @@ impl VlcStreamer {
         let media = libvlc.create_media(inst_ptr, url)?;
         libvlc.add_media_option(media.0, &sout)?;
         libvlc.add_media_option(media.0, ":sout-keep")?;
+        // 减少 TS mux 延迟
+        libvlc.add_media_option(media.0, ":sout-ts-dts-delay=40")?;
 
-        // 创建播放器（headless，无窗口）
         let player = libvlc.create_player(inst_ptr)?;
         unsafe {
             (libvlc.player_set_media)(player.0, media.0);
@@ -714,7 +713,6 @@ impl VlcStreamer {
             return Err("VLC 转码启动失败".to_string());
         }
 
-        // ========== 极简 HTTP 服务器（从文件读取并流式输出） ==========
         // 找空闲端口
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -725,7 +723,6 @@ impl VlcStreamer {
         let file_path = temp_file.clone();
 
         let handle = thread::spawn(move || {
-            // 等待 VLC 开始写入文件
             thread::sleep(std::time::Duration::from_millis(200));
             serve_ts_http(listener, file_path, running_copy);
         });
@@ -744,20 +741,17 @@ impl VlcStreamer {
 
     /// 停止 VLC 后台转码 + 停止 HTTP 服务器 + 清理临时文件
     pub fn stop_stream(&mut self) {
-        // 1. 停止 HTTP 服务器
         if let Some(running) = self.server_running.take() {
             running.store(false, Ordering::SeqCst);
         }
         if let Some(handle) = self.server_handle.take() {
             let _ = handle.join();
         }
-        // 2. 删除临时文件
         if let Some(ref path) = self.temp_file {
             let _ = std::fs::remove_file(path);
         }
         self.temp_file = None;
 
-        // 3. 停止 VLC
         if let Some(ref libvlc) = self.libvlc {
             if let Some(ref player) = self.player {
                 unsafe { (libvlc.player_stop)(player.0); }
@@ -788,7 +782,7 @@ impl VlcStreamer {
     }
 }
 
-/// 极简 HTTP 服务器：从 MPEG-TS 文件读取并流式输出给每个连接
+/// HTTP 服务器：从 MPEG-TS 文件读取并流式输出，带 CORS 支持
 fn serve_ts_http(
     listener: std::net::TcpListener,
     file_path: PathBuf,
@@ -801,48 +795,87 @@ fn serve_ts_http(
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                // 直播流可能长时间无新数据（VLC 缓冲），不设置写超时
+                // TCP_NODELAY 减少 Nagle 算法带来的延迟
+                let _ = stream.set_nodelay(true);
                 let _ = stream.set_write_timeout(None);
-                // 发送 HTTP 头
+
+                // 读取请求（简单解析，判断是否 OPTIONS 预检）
+                let mut req_buf = [0u8; 1024];
+                let mut is_options = false;
+                // 非阻塞读取请求头
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+                if let Ok(n) = stream.read(&mut req_buf) {
+                    let req_str = std::str::from_utf8(&req_buf[..n]).unwrap_or("");
+                    if req_str.starts_with("OPTIONS") {
+                        is_options = true;
+                    }
+                }
+                let _ = stream.set_read_timeout(None);
+
+                if is_options {
+                    // CORS 预检响应
+                    let resp = b"HTTP/1.1 204 No Content\r\n\
+                        Access-Control-Allow-Origin: *\r\n\
+                        Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                        Access-Control-Allow-Headers: *\r\n\
+                        Access-Control-Max-Age: 86400\r\n\
+                        Connection: close\r\n\r\n";
+                    let _ = stream.write_all(resp);
+                    continue;
+                }
+
+                // 带 CORS 头的 HTTP 响应
                 let header = b"HTTP/1.1 200 OK\r\n\
                     Content-Type: video/mp2t\r\n\
                     Access-Control-Allow-Origin: *\r\n\
+                    Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                    Access-Control-Allow-Headers: *\r\n\
                     Cache-Control: no-cache\r\n\
                     Connection: close\r\n\r\n";
                 if stream.write_all(header).is_err() {
                     continue;
                 }
 
-                // 等待文件出现（VLC 可能尚未创建）
+                // 等待文件出现
                 while running.load(Ordering::SeqCst) && !file_path.exists() {
-                    thread::sleep(std::time::Duration::from_millis(50));
+                    thread::sleep(std::time::Duration::from_millis(10));
                 }
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // 打开文件并跳到末尾，只输出新数据（避免客户端从文件头追赶导致卡顿）
                 let mut file = match std::fs::File::open(&file_path) {
                     Ok(f) => f,
                     Err(_) => continue,
                 };
+                // 跳到末尾，只输出新数据（直播流不追赶历史）
                 let mut pos = file.seek(SeekFrom::End(0)).unwrap_or(0);
+
+                // 大缓冲区减少系统调用次数
+                let mut buf = [0u8; 262144]; // 256KB
+                let mut idle_count: u32 = 0;
+                // BufWriter 批量写入 TCP，减少小包发送
+                let mut writer = std::io::BufWriter::with_capacity(131072, &stream);
 
                 while running.load(Ordering::SeqCst) {
                     match file.seek(SeekFrom::Start(pos)) {
                         Ok(_) => {}
                         Err(_) => break,
                     }
-                    let mut buf = [0u8; 65536];
                     match file.read(&mut buf) {
                         Ok(0) => {
-                            thread::sleep(std::time::Duration::from_millis(10));
+                            idle_count += 1;
+                            let delay = if idle_count < 50 { 1 } else { 3 };
+                            thread::sleep(std::time::Duration::from_millis(delay));
                             continue;
                         }
                         Ok(n) => {
-                            if stream.write_all(&buf[..n]).is_err() {
+                            idle_count = 0;
+                            if writer.write_all(&buf[..n]).is_err() {
                                 break;
                             }
+                            let _ = writer.flush();
                             pos += n as u64;
                         }
                         Err(_) => break,
@@ -850,11 +883,11 @@ fn serve_ts_http(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(50));
+                thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
             Err(_) => {
-                thread::sleep(std::time::Duration::from_millis(50));
+                thread::sleep(std::time::Duration::from_millis(10));
             }
         }
     }
