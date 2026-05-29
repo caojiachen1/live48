@@ -76,6 +76,49 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const [showPlaylist, setShowPlaylist] = useState(false);
   const playlistRef = useRef<HTMLDivElement>(null);
   const [miniMode, setMiniMode] = useState(false);
+  const [miniSize, setMiniSize] = useState({ w: 320, h: 180 });
+  const [miniPos, setMiniPos] = useState({ x: -1, y: -1 }); // -1 means use default (bottom-right)
+  const miniDragRef = useRef<{ startX: number; startY: number; startW: number; startH: number; startXp: number; startYp: number; mode: "move" | "resize" } | null>(null);
+  const [miniDragging, setMiniDragging] = useState(false);
+
+  const handleMiniMouseDown = useCallback((e: React.MouseEvent, mode: "move" | "resize") => {
+    e.preventDefault();
+    e.stopPropagation();
+    miniDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startW: miniSize.w,
+      startH: miniSize.h,
+      startXp: miniPos.x >= 0 ? miniPos.x : window.innerWidth - miniSize.w - 20,
+      startYp: miniPos.y >= 0 ? miniPos.y : window.innerHeight - miniSize.h - 20,
+      mode,
+    };
+    setMiniDragging(true);
+    const handleMouseMove = (ev: MouseEvent) => {
+      const drag = miniDragRef.current;
+      if (!drag) return;
+      const dx = ev.clientX - drag.startX;
+      const dy = ev.clientY - drag.startY;
+      if (drag.mode === "move") {
+        setMiniPos({ x: drag.startXp + dx, y: drag.startYp + dy });
+      } else {
+        const newW = Math.max(200, Math.min(800, drag.startW - dx));
+        const newH = Math.max(120, Math.min(600, drag.startH - dy));
+        const clampedDw = drag.startW - newW;
+        const clampedDh = drag.startH - newH;
+        setMiniSize({ w: newW, h: newH });
+        setMiniPos({ x: drag.startXp + clampedDw, y: drag.startYp + clampedDh });
+      }
+    };
+    const handleMouseUp = () => {
+      miniDragRef.current = null;
+      setMiniDragging(false);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+  }, [miniSize, miniPos]);
   const boundaryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchStyle, setSwitchStyle] = useState<{
     transform: string;
@@ -631,13 +674,13 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
       style={{
         position: "fixed",
         ...(miniMode ? {
-          bottom: "20px",
-          right: "20px",
-          width: "320px",
-          height: "180px",
+          bottom: miniPos.y < 0 ? "20px" : "auto",
+          right: miniPos.x < 0 ? "20px" : "auto",
+          top: miniPos.y >= 0 ? `${miniPos.y}px` : "auto",
+          left: miniPos.x >= 0 ? `${miniPos.x}px` : "auto",
+          width: `${miniSize.w}px`,
+          height: `${miniSize.h}px`,
           borderRadius: "12px",
-          top: "auto",
-          left: "auto",
         } : {
           top: 0,
           left: 0,
@@ -653,7 +696,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         WebkitUserSelect: "none",
         boxShadow: miniMode ? "0 4px 20px rgba(0,0,0,0.6)" : undefined,
         border: miniMode ? "1px solid rgba(255,255,255,0.15)" : undefined,
-        transition: "all 0.25s ease",
+        transition: miniDragging ? "none" : "all 0.25s ease",
       }}
     >
       {!miniMode && (
@@ -783,7 +826,8 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
 
       {/* Video area */}
       <div
-        onClick={miniMode ? (e) => { e.stopPropagation(); togglePlay(); } : handleVideoClick}
+        onMouseDown={miniMode ? (e) => handleMiniMouseDown(e, "move") : undefined}
+        onClick={miniMode ? undefined : handleVideoClick}
         onTouchStart={miniMode ? undefined : handleVideoTouchStart}
         onTouchEnd={miniMode ? undefined : handleVideoTouchEnd}
         onWheel={miniMode ? undefined : handleWheel}
@@ -798,6 +842,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
           transform: switchStyle.transform,
           opacity: switchStyle.opacity,
           transition: switchStyle.transition,
+          cursor: miniMode ? "move" : "default",
         }}
       >
         {loading && (
@@ -1177,6 +1222,56 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
       </>
       )}
 
+      {/* Mini-mode: resize handle (top-left corner) */}
+      {miniMode && (
+        <div
+          onMouseDown={(e) => handleMiniMouseDown(e, "resize")}
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: "20px",
+            height: "20px",
+            cursor: "nwse-resize",
+            zIndex: 30,
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "flex-start",
+            padding: "3px",
+          }}
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" style={{ opacity: 0.5 }}>
+            <line x1="1" y1="9" x2="9" y2="1" stroke="white" strokeWidth="1.5" />
+            <line x1="1" y1="5" x2="5" y2="1" stroke="white" strokeWidth="1.5" />
+          </svg>
+        </div>
+      )}
+
+      {/* Mini-mode: close button (top-right, bigger) */}
+      {miniMode && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onClose(); }}
+          style={{
+            position: "absolute",
+            top: "4px",
+            right: "4px",
+            zIndex: 30,
+            background: "rgba(0,0,0,0.5)",
+            border: "none",
+            color: "white",
+            cursor: "pointer",
+            padding: "4px",
+            borderRadius: "50%",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          aria-label="关闭播放"
+        >
+          <DismissRegular style={{ fontSize: "18px" }} />
+        </button>
+      )}
+
       {/* Mini-mode toolbar */}
       {miniMode && !loading && !error && (
         <div
@@ -1193,6 +1288,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
             zIndex: 20,
           }}
           onClick={(e) => e.stopPropagation()}
+          onMouseDown={(e) => e.stopPropagation()}
         >
           <div style={{
             flex: 1,
@@ -1231,17 +1327,6 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
             title="全屏播放"
           >
             <PictureInPictureExitRegular style={{ fontSize: "16px" }} />
-          </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); onClose(); }}
-            style={{
-              background: "none", border: "none", color: "white",
-              cursor: "pointer", padding: "2px",
-              display: "flex", alignItems: "center", justifyContent: "center",
-            }}
-            aria-label="关闭播放"
-          >
-            <DismissRegular style={{ fontSize: "16px" }} />
           </button>
         </div>
       )}
