@@ -1,9 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the main window and mini-player window",
   "windows": [
-    "main"
+    "main",
+    "mini-player"
   ],
   "permissions": [
     "core:default",
@@ -12,6 +13,20 @@
     "clipboard-manager:default",
     "clipboard-manager:allow-write-text",
     "dialog:default",
-    "fs:default"
+    "fs:default",
+    "core:window:allow-create",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-set-focus",
+    "core:window:allow-close",
+    "core:window:allow-destroy",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging",
+    "core:webview:allow-create-webview-window",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit"
   ]
 }

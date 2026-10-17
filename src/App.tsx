@@ -24,6 +24,7 @@ import {
 } from "@fluentui/react-components";
 import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular, SettingsRegular } from "@fluentui/react-icons";
 import VideoPlayer from "./VideoPlayer";
+import MiniPlayer from "./MiniPlayer";
 import FilterPanel from "./FilterPanel";
 import SettingsPanel from "./SettingsPanel";
 import type { PlayerMode } from "./SettingsPanel";
@@ -62,6 +63,12 @@ const getLiveTypeBadge = (type: number) => {
 };
 
 function App() {
+  // Mini-player mode: render standalone MiniPlayer instead of full app
+  const isMiniPlayer = new URLSearchParams(window.location.search).get("mini") === "true";
+  if (isMiniPlayer) {
+    return <MiniPlayer />;
+  }
+
   const [activeTab, setActiveTab] = useState<"live" | "record">("live");
   const [lives, setLives] = useState<LiveItem[]>([]);
   const [records, setRecords] = useState<LiveItem[]>([]);

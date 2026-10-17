@@ -783,6 +783,64 @@ impl VlcStreamer {
 }
 
 /// HTTP 服务器：从 MPEG-TS 文件读取并流式输出，带 CORS 支持
+/// 新客户端连上时的起播位置：从文件末尾回看一小段，取窗口内最后一个 H.264 关键帧
+/// （优先 SPS，其次 IDR）所在的 TS 包。
+/// 直接从末尾开始会让播放器干等下一个关键帧，切换小窗/大窗时的黑屏等待就来自这里。
+fn resume_offset(file: &mut std::fs::File) -> u64 {
+    const PKT: u64 = 188;
+    const LOOKBACK: u64 = 2 * 1024 * 1024;
+
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return 0,
+    };
+    if len < PKT * 2 {
+        return 0;
+    }
+    let start = (len - LOOKBACK.min(len)) / PKT * PKT;
+    let window = (len - start) as usize;
+    let mut buf = vec![0u8; window];
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
+        return start;
+    }
+
+    let mut last_sps = None;
+    let mut last_idr = None;
+    let mut off = 0usize;
+    while off + PKT as usize <= window {
+        if buf[off] != 0x47 {
+            off += 1; // 丢步后重新找包边界
+            continue;
+        }
+        let pusi = buf[off + 1] & 0x40 != 0;
+        let afc = buf[off + 3] >> 4;
+        if pusi && afc & 0x02 != 0 {
+            let mut i = off + 4;
+            if afc & 0x01 != 0 {
+                i += 1 + buf[i] as usize; // 跳过 adaptation field
+            }
+            if i + 10 < window
+                && buf[i] == 0
+                && buf[i + 1] == 0
+                && buf[i + 2] == 0
+                && buf[i + 3] == 1
+                && (0xE0..=0xEF).contains(&buf[i + 4])
+            {
+                let nal = i + 9 + buf[i + 8] as usize;
+                if nal + 1 < window {
+                    match buf[nal] & 0x1F {
+                        7 => last_sps = Some(off as u64),
+                        5 => last_idr = Some(off as u64),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        off += PKT as usize;
+    }
+    last_sps.or(last_idr).map(|o| start + o).unwrap_or(start)
+}
+
 fn serve_ts_http(
     listener: std::net::TcpListener,
     file_path: PathBuf,
@@ -849,8 +907,8 @@ fn serve_ts_http(
                     Ok(f) => f,
                     Err(_) => continue,
                 };
-                // 跳到末尾，只输出新数据（直播流不追赶历史）
-                let mut pos = file.seek(SeekFrom::End(0)).unwrap_or(0);
+                // 从最近的关键帧开始，而不是文件末尾
+                let mut pos = resume_offset(&mut file);
 
                 // 大缓冲区减少系统调用次数
                 let mut buf = [0u8; 262144]; // 256KB

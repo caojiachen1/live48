@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
+use tauri::WebviewWindowBuilder;
 use tauri_plugin_fs::FsExt;
 use url::Url;
 
@@ -933,8 +934,129 @@ async fn download_via_std_fs(
     Ok(())
 }
 
+// ===== Mini-Player Window Commands =====
+
+#[derive(Clone, serde::Serialize)]
+struct MiniPlayerConfig {
+    title: String,
+    nickname: String,
+    stream_url: String,
+    is_live: bool,
+}
+
+#[derive(Default)]
+struct MiniPlayerState(Mutex<Option<MiniPlayerConfig>>);
+
+#[tauri::command]
+async fn create_mini_player(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MiniPlayerState>,
+    title: String,
+    nickname: String,
+    stream_url: String,
+    is_live: bool,
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    // Published before the window exists so the page always finds it when it asks.
+    *state.0.lock().map_err(|e| e.to_string())? = Some(MiniPlayerConfig {
+        title,
+        nickname,
+        stream_url,
+        is_live,
+    });
+
+    // `close()` only requests closure and leaves the "mini-player" label owned by the
+    // old window while `build()` below runs, which fails with WebviewLabelAlreadyExists.
+    if let Some(existing) = app.get_webview_window("mini-player") {
+        let _ = existing.destroy();
+    }
+
+    let base_url = if cfg!(debug_assertions) {
+        "http://localhost:1420?mini=true".to_string()
+    } else {
+        "index.html?mini=true".to_string()
+    };
+
+    let (pos_x, pos_y) = if x < 0.0 || y < 0.0 {
+        if let Some(monitor) = app.primary_monitor().ok().flatten() {
+            let area = monitor.work_area();
+            let scale = monitor.scale_factor();
+            let margin = 20.0;
+            (
+                (area.size.width as f64 / scale) - width - margin,
+                (area.size.height as f64 / scale) - height - margin,
+            )
+        } else {
+            (100.0, 100.0)
+        }
+    } else {
+        (x, y)
+    };
+
+    WebviewWindowBuilder::new(
+        &app,
+        "mini-player",
+        tauri::WebviewUrl::App(base_url.into()),
+    )
+    .title("live48 - 小窗播放")
+    .inner_size(width, height)
+    .position(pos_x, pos_y)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .resizable(true)
+    .focused(true)
+    .build()
+    .map_err(|e| format!("创建小窗失败: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_mini_player_config(state: tauri::State<'_, MiniPlayerState>) -> Option<MiniPlayerConfig> {
+    state.0.lock().ok().and_then(|config| config.clone())
+}
+
+#[tauri::command]
+async fn close_mini_player(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("mini-player") {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebView2 requires a user gesture in the frame before it lets a <video> play.
+    // The mini-player window is created from a click that happened in the *main* window,
+    // so its own frame has no gesture and playback would be rejected. Must be set before
+    // the first webview boots the shared browser process.
+    #[cfg(windows)]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--autoplay-policy=no-user-gesture-required",
+    );
+
     // 启动阶段确保 VLC DLL 就绪（如缺失会自动下载，避免后续在持有锁时下载）
     vlc_player::ensure_vlc_downloaded();
 
@@ -945,6 +1067,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage::<CancelMap>(Arc::new(Mutex::new(HashMap::new())))
         .manage(VlcStreamState(Mutex::new(VlcStreamer::new())))
+        .manage(MiniPlayerState::default())
         .invoke_handler(tauri::generate_handler![
             get_live_list,
             get_record_list,
@@ -960,7 +1083,12 @@ pub fn run() {
             download_vlc,
             vlc_stream_running,
             download_video,
-            cancel_download
+            cancel_download,
+            create_mini_player,
+            get_mini_player_config,
+            close_mini_player,
+            hide_main_window,
+            show_main_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
