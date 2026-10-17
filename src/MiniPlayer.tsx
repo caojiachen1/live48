@@ -120,7 +120,7 @@ function MiniPlayer() {
           const Hls = (await import("hls.js")).default;
           if (Hls.isSupported()) {
             const hls = new Hls({
-              enableWorker: false,
+              enableWorker: true,
               lowLatencyMode: false,
               maxBufferLength: 30,
               maxMaxBufferLength: 60,
@@ -155,7 +155,7 @@ function MiniPlayer() {
           if (Mpegts.isSupported()) {
             const player = Mpegts.createPlayer(
               { type: "mpegts", url: resolvedUrl, isLive: true, hasVideo: true, hasAudio: true },
-              { enableStashBuffer: false, liveBufferLatencyChasing: true, liveBufferLatencyMaxLatency: 1.5, liveBufferLatencyMinRemain: 0.2, lazyLoadMaxDuration: 0.5, deferLoadAfterSourceOpen: false }
+              { lazyLoad: false, liveBufferLatencyChasing: true, liveBufferLatencyMaxLatency: 2.5, liveBufferLatencyMinRemain: 0.5, deferLoadAfterSourceOpen: false }
             );
             player.attachMediaElement(video);
             player.load();

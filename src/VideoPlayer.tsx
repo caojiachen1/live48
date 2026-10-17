@@ -319,7 +319,7 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
           const Hls = (await import("hls.js")).default;
           if (Hls.isSupported()) {
             const hls = new Hls({
-              enableWorker: false,
+              enableWorker: !isAndroid, // Android WebView 起不了 hls.js 的 blob worker
               lowLatencyMode: false,
               maxBufferLength: 30,
               maxMaxBufferLength: 60,
@@ -382,11 +382,12 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
               hasVideo: true,
               hasAudio: true,
             }, {
-              enableStashBuffer: false,
+              // 直播下 lazyLoad 必须整体关掉：maxDuration 0.5s 会让 loader 在缓冲刚够时就
+              // pause、下一次 timeupdate 又 resume，表现就是画面定格一下再跳。
+              lazyLoad: false,
               liveBufferLatencyChasing: true,
-              liveBufferLatencyMaxLatency: 1.5,
-              liveBufferLatencyMinRemain: 0.2,
-              lazyLoadMaxDuration: 0.5,
+              liveBufferLatencyMaxLatency: 2.5,
+              liveBufferLatencyMinRemain: 0.5,
               deferLoadAfterSourceOpen: false,
             });
             player.attachMediaElement(video);
