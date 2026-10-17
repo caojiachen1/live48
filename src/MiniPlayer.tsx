@@ -230,11 +230,40 @@ function MiniPlayer() {
     getCurrentWindow().startDragging();
   }, []);
 
+  // During a fast native resize the webview keeps presenting the previous frame stretched
+  // into the new bounds, which makes the bottom-anchored controls strobe visibly. Drop them
+  // for the duration of the drag and bring them back once the size settles.
+  const [resizing, setResizing] = useState(false);
+  const resizingRef = useRef(false);
+  const resizeSettleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const armResizeSettle = useCallback((delayMs: number) => {
+    if (resizeSettleRef.current) clearTimeout(resizeSettleRef.current);
+    resizeSettleRef.current = setTimeout(() => {
+      resizingRef.current = false;
+      setResizing(false);
+    }, delayMs);
+  }, []);
+
+  useEffect(() => {
+    const unlisten = getCurrentWindow().onResized(() => {
+      if (!resizingRef.current) return;
+      armResizeSettle(160);
+    });
+    return () => {
+      if (resizeSettleRef.current) clearTimeout(resizeSettleRef.current);
+      unlisten.then((f) => f());
+    };
+  }, [armResizeSettle]);
+
   // A borderless window has no native resize border above its client area, so the corner
   // handle must ask the OS to run the top-left resize loop itself.
   const handleResizeStart = useCallback(() => {
+    resizingRef.current = true;
+    setResizing(true);
+    armResizeSettle(400); // 万一这次拖拽根本没改变尺寸，靠它把控件放回来
     getCurrentWindow().startResizeDragging("NorthWest");
-  }, []);
+  }, [armResizeSettle]);
 
   const unmute = useCallback(() => {
     const video = videoRef.current;
@@ -263,15 +292,12 @@ function MiniPlayer() {
   return (
     <div
       style={{
-        width: "100vw",
-        height: "100vh",
+        position: "fixed",
+        inset: 0,
         backgroundColor: "#000",
-        borderRadius: "12px",
         overflow: "hidden",
         display: "flex",
         flexDirection: "column",
-        position: "relative",
-        boxShadow: "0 4px 20px rgba(0,0,0,0.6)",
         userSelect: "none",
         WebkitUserSelect: "none",
       }}
@@ -296,7 +322,7 @@ function MiniPlayer() {
           position: "absolute", top: "4px", right: "4px", zIndex: 30,
           background: "rgba(0,0,0,0.5)", border: "none", color: "white",
           cursor: "pointer", padding: "4px", borderRadius: "50%",
-          display: "flex", alignItems: "center", justifyContent: "center",
+          display: resizing ? "none" : "flex", alignItems: "center", justifyContent: "center",
         }}
         aria-label="关闭播放"
       >
@@ -339,13 +365,15 @@ function MiniPlayer() {
           ref={videoRef}
           playsInline
           style={{
-            maxWidth: "100%", maxHeight: "100%", width: "auto", height: "auto",
-            backgroundColor: "#000", objectFit: "contain",
+            // 用 auto + max 时，视频盒本身会在"按宽夹"和"按高夹"之间来回取整，
+            // 缩放窗口时每帧跳一两像素；改成铺满容器，交给 object-fit 做信箱。
+            width: "100%", height: "100%", objectFit: "contain",
+            backgroundColor: "#000",
           }}
         />
       </div>
 
-      {!loading && !error && (
+      {!loading && !error && !resizing && (
         <div
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
@@ -353,7 +381,7 @@ function MiniPlayer() {
             position: "absolute", bottom: 0, left: 0, right: 0,
             display: "flex", alignItems: "center", gap: "4px",
             padding: "4px 6px",
-            background: "linear-gradient(to top, rgba(0,0,0,0.8) 0%, transparent 100%)",
+            background: "linear-gradient(to top, rgba(0,0,0,0.94) 0%, rgba(0,0,0,0.72) 100%)",
             zIndex: 20,
           }}
         >

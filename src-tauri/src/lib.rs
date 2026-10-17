@@ -1008,6 +1008,9 @@ async fn create_mini_player(
     .always_on_top(true)
     .skip_taskbar(true)
     .resizable(true)
+    // 原生 resize 时窗口刚扩出来的那条边还没被 webview 重绘，默认底色会闪出一条
+    // 白边（看起来像边缘重影），先把窗口和 webview 的底色都压成黑色。
+    .background_color(tauri::window::Color(0, 0, 0, 255))
     .focused(true)
     .build()
     .map_err(|e| format!("创建小窗失败: {}", e))?;
