@@ -8,10 +8,10 @@ libVLC, so RTMP / HLS / HTTP-TS streams open directly with no local relay.
 
 ```bash
 pwsh scripts/fetch-vlc.ps1        # libVLC runtime into ./vlc (gitignored)
-cargo run --release --manifest-path src-egui/Cargo.toml
+cargo run --release
 ```
 
-The release binary is `src-egui/target/release/live48-egui.exe`. A debug build is
+The release binary is `target/release/live48-egui.exe`. A debug build is
 several times slower to draw, so use `--release`.
 
 Settings, downloads and the cached engine live in `%APPDATA%/live48-egui/`.

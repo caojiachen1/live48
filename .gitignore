@@ -1,5 +1,5 @@
 # Build output
-src-egui/target/
+target/
 
 # libVLC runtime; fetched with scripts/fetch-vlc.ps1, never committed
 /vlc

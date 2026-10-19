@@ -264,9 +264,9 @@ fn candidate_dirs() -> Vec<PathBuf> {
             v.push(dir.to_path_buf());
         }
     }
-    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vlc"));
-    // Kept so a working tree that still has the Tauri layout works unchanged.
-    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src-tauri/vlc"));
+    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vlc"));
+    // Kept so a working tree that still has the old Tauri layout works unchanged.
+    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src-tauri/vlc"));
     v.push(crate::config::dir().join("vlc"));
     v.push(PathBuf::from(r"C:\Program Files\VideoLAN\VLC"));
     v.push(PathBuf::from(r"C:\Program Files (x86)\VideoLAN\VLC"));

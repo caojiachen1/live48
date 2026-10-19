@@ -3,7 +3,7 @@
 # 用法: 在项目根目录运行  pwsh scripts/fetch-vlc.ps1
 #
 # 效果: 将 libvlc.dll + libvlccore.dll + plugins/ 放入 vlc/
-#       src-egui 的 vlc.rs 会优先在这个目录里找运行时
+#       src/vlc.rs 会优先在这个目录里找运行时
 
 $VlcDir = Join-Path $PSScriptRoot "..\vlc"
 $Version = "3.0.21"
