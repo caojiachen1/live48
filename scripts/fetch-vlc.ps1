@@ -1,11 +1,11 @@
-# fetch-vlc.ps1 — 下载 VLC 3.0.x redistributable DLL 到 src-tauri/vlc/
+# fetch-vlc.ps1 — 下载 VLC 3.0.x redistributable DLL 到 <repo>/vlc/
 #
 # 用法: 在项目根目录运行  pwsh scripts/fetch-vlc.ps1
 #
-# 效果: 将 libvlc.dll + libvlccore.dll + plugins/ 放入 src-tauri/vlc/
-#       之后 Tauri 打包时通过 bundle.resources 自动包含
+# 效果: 将 libvlc.dll + libvlccore.dll + plugins/ 放入 vlc/
+#       src-egui 的 vlc.rs 会优先在这个目录里找运行时
 
-$VlcDir = Join-Path $PSScriptRoot "..\src-tauri\vlc"
+$VlcDir = Join-Path $PSScriptRoot "..\vlc"
 $Version = "3.0.21"
 $Arch = "win64"
 $Url = "https://download.videolan.org/pub/videolan/vlc/$Version/$Arch/vlc-$Version-$Arch.7z"
