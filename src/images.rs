@@ -11,7 +11,11 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 // Cards render ~340 logical points wide; on a 150% display that is ~510 physical
 // pixels, so anything below ~760 looked soft.
+/// Covers are drawn ~490 physical pixels wide on this display and are cropped from the
+/// centre, so they need the headroom.
 const MAX_EDGE: u32 = 760;
+/// Avatars are 34pt circles, so they never needed the cover resolution.
+const AVATAR_EDGE: u32 = 160;
 const PLACEHOLDER: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 
 #[derive(Clone)]
@@ -42,7 +46,7 @@ impl ImageCache {
 
     /// A screenful is 30 covers + 30 avatars; letting all of them open a socket and a
     /// thread at once is what made the first second stutter.
-    fn request(&mut self, url: &str, ctx: &Context, tx: &Sender<Event>) {
+    fn request(&mut self, url: &str, ctx: &Context, tx: &Sender<Event>, cap: u32) {
         if IN_FLIGHT.fetch_add(1, Ordering::Relaxed) >= MAX_IN_FLIGHT {
             IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
             return; // no slot recorded, so the next pass asks again
@@ -55,8 +59,8 @@ impl ImageCache {
             let decoded = Api::fetch_image(&key).ok().and_then(|bytes| {
                 let img = image::load_from_memory(&bytes).ok()?;
                 let longest = img.width().max(img.height());
-                let img = if longest > MAX_EDGE {
-                    let scale = MAX_EDGE as f32 / longest as f32;
+                let img = if longest > cap {
+                    let scale = cap as f32 / longest as f32;
                     img.thumbnail(
                         (img.width() as f32 * scale) as u32,
                         (img.height() as f32 * scale) as u32,
@@ -80,12 +84,12 @@ impl ImageCache {
         });
     }
 
-    fn known(&mut self, url: &str, ctx: &Context, tx: &Sender<Event>) -> Option<TextureHandle> {
+    fn known(&mut self, url: &str, ctx: &Context, tx: &Sender<Event>, cap: u32) -> Option<TextureHandle> {
         if url.is_empty() {
             return None;
         }
         if !self.slots.contains_key(url) {
-            self.request(url, ctx, tx);
+            self.request(url, ctx, tx, cap);
         }
         match self.slots.get(url).cloned() {
             Some(Slot::Ready(t)) => Some(t),
@@ -103,8 +107,20 @@ impl ImageCache {
         radius: u8,
         tx: &Sender<Event>,
     ) {
+        self.draw_cover(ui, url, rect, radius, tx, MAX_EDGE);
+    }
+
+    fn draw_cover(
+        &mut self,
+        ui: &mut Ui,
+        url: &str,
+        rect: Rect,
+        radius: u8,
+        tx: &Sender<Event>,
+        cap: u32,
+    ) {
         ui.painter().rect_filled(rect, radius, PLACEHOLDER);
-        let tex = self.known(url, ui.ctx(), tx);
+        let tex = self.known(url, ui.ctx(), tx, cap);
         if let Some(tex) = tex {
             let [tw, th] = tex.size();
             if tw == 0 || th == 0 {
@@ -129,7 +145,7 @@ impl ImageCache {
         ui.painter()
             .circle_filled(rect.center(), size * 0.5, PLACEHOLDER);
         let radius = (size as u8 / 2).max(1);
-        self.cover(ui, url, rect, radius, tx);
+        self.draw_cover(ui, url, rect, radius, tx, AVATAR_EDGE);
     }
 }
 

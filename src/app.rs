@@ -115,6 +115,11 @@ pub struct App {
     pub fly: Option<Fly>,
     pub fly_t: f32,
     pub fly_prev: f64,
+    /// Measured grid row height, tagged with the column width it was measured at.
+    pub row_height: Option<(f32, f32)>,
+    /// Decoded covers waiting to become textures; uploading them all in one pass is
+    /// what made scrolling stutter while a page of thumbnails arrived.
+    pub img_pending: Vec<(String, Option<(usize, usize, Vec<u8>)>)>,
     pub member_query: String,
     pub preset_name: String,
 
@@ -157,6 +162,8 @@ impl App {
             fly: None,
             fly_t: 0.0,
             fly_prev: 0.0,
+            row_height: None,
+            img_pending: Vec::new(),
             lives: Vec::new(),
             records: Vec::new(),
             record_next: "0".to_owned(),
@@ -541,6 +548,20 @@ impl App {
     // ---------------------------------------------------------------- render
 
     pub fn drain_events(&mut self) {
+        // Upload a few textures per pass at most: a burst of 760px uploads in one
+        // frame is what turned into a visible hitch while scrolling.
+        for _ in 0..3 {
+            if self.img_pending.is_empty() {
+                break;
+            }
+            let (url, result) = self.img_pending.remove(0);
+            self.images.apply_loaded(&url, result, self.req.ctx());
+        }
+        if !self.img_pending.is_empty() {
+            self.req
+                .ctx()
+                .request_repaint_after(std::time::Duration::from_millis(8));
+        }
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Event::LiveList(Ok(items)) => {
@@ -567,7 +588,7 @@ impl App {
                     }
                 },
                 Event::Image { url, result } => {
-                    self.images.apply_loaded(&url, result, self.req.ctx());
+                    self.img_pending.push((url, result));
                 }
                 Event::StreamUrl { result, action } => match result {
                     Err(e) => self.toast(ToastKind::Error, format!("获取播放地址失败：{e}")),

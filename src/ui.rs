@@ -21,6 +21,7 @@ const TYPE_LIST: [&str; 5] = ["视频", "电台", "连麦", "游戏", "AI"];
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let _perf = crate::perf::Guard::new("logic");
         self.drain_events();
         self.tick_toasts();
 
@@ -74,7 +75,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let _perf = crate::perf::Guard::new();
+        let _perf = crate::perf::Guard::new("ui");
 
         if !self.chrome_done {
             self.chrome_done = true;
@@ -539,12 +540,13 @@ impl App {
         let items = self.filtered(tab);
         let next = self.record_next.clone();
         let loading = self.loading_records || self.loading_live;
+        let is_record = tab == Tab::Record;
 
-        egui::ScrollArea::vertical()
-            .id_salt("list")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if items.is_empty() {
+        if items.is_empty() {
+            egui::ScrollArea::vertical()
+                .id_salt("list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(70.0);
                         if loading {
@@ -556,41 +558,62 @@ impl App {
                             ui.label(RichText::new("无匹配内容").color(t::TEXT_3).size(14.0));
                         }
                     });
-                } else {
-                    self.grid(ui, &items, tab == Tab::Record);
-                    if tab == Tab::Record && next != "0" {
-                        ui.add_space(6.0);
-                        ui.vertical_centered(|ui| {
-                            if ui
-                                .add_sized(Vec2::new(180.0, 32.0), t::ghost_button("加载更多录播"))
-                                .clicked()
-                            {
-                                self.load_more();
-                            }
-                        });
-                    }
-                }
-                ui.add_space(10.0);
-            });
-    }
+                });
+            return;
+        }
 
-    /// Masonry columns: covers keep their own aspect ratio, so rows of equal-height
-    /// cards would either crop them or leave gaps.
-    fn grid(&mut self, ui: &mut Ui, items: &[LiveItem], is_record: bool) {
         let gap = 14.0;
         let min_card = 280.0;
         let avail = ui.available_width();
         let cols = (((avail + gap) / (min_card + gap)).floor() as usize).clamp(1, 6);
         let w = (avail - gap * (cols - 1) as f32) / cols as f32;
+        let rows = items.len().div_ceil(cols);
+        // Cards are all the same size, so the rows can be virtualised. The height is
+        // measured from the first real row and re-derived whenever the width changes.
+        let est = match self.row_height {
+            Some((cw, h)) if (cw - w).abs() < 0.5 => h,
+            _ => w + 86.0,
+        };
+        let measured = Cell::new(0.0f32);
+        let last = rows;
 
         ui.spacing_mut().item_spacing.y = gap;
-        for row in items.chunks(cols) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for item in row {
-                    self.card(ui, item, w, is_record);
+        egui::ScrollArea::vertical()
+            .id_salt("list")
+            .auto_shrink([false, false])
+            .show_rows(ui, est, rows, |ui, range| {
+                let first = range.start;
+                let end = range.end;
+                for row in range {
+                    let lo = row * cols;
+                    let hi = (lo + cols).min(items.len());
+                    let resp = ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for item in &items[lo..hi] {
+                            self.card(ui, item, w, is_record);
+                        }
+                    });
+                    if row == first {
+                        measured.set(resp.response.rect.height());
+                    }
+                }
+                if is_record && next != "0" && end >= last {
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_sized(Vec2::new(180.0, 32.0), t::ghost_button("加载更多录播"))
+                            .clicked()
+                        {
+                            self.load_more();
+                        }
+                    });
                 }
             });
+
+        let h = measured.get();
+        if h > 0.0 && (h - est).abs() > 1.0 {
+            self.row_height = Some((w, h));
+            ui.ctx().request_repaint();
         }
     }
 
@@ -711,7 +734,7 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         self.images.avatar(ui, &avatar_url, 34.0, &tx);
                         ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(
                                 RichText::new(util::truncate(&nickname, inner - 60.0, 13.0))
                                     .color(t::TEXT)
