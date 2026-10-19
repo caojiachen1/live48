@@ -1,18 +1,17 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
+# Build output
+src-egui/target/
 
+# libVLC runtime; fetched with scripts/fetch-vlc.ps1, never committed
+/vlc
+
+# The Tauri + React client lives on the `legacy` branch. Ignoring the whole folder
+# keeps a leftover working copy from ever being committed here.
+src-tauri/
 node_modules
 dist
 dist-ssr
-*.local
 
-# Editor directories and files
+# Editor, OS and packaging junk
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -22,28 +21,12 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+logs
+*.log
+*.local
 *.msix
-
-# Development certificate
-devcert.pfx
-
-# Android build outputs
 *.apk
 *.aab
 *.idsig
+devcert.pfx
 android.keystore
-
-# Generated Android files
-src-tauri/gen/android/app/build/
-src-tauri/gen/android/.gradle/
-src-tauri/gen/android/build/
-src-tauri/gen/android/local.properties
-
-# Tauri build cache
-src-tauri/target/
-
-# egui rewrite (native Rust client)
-src-egui/target/
-
-# libVLC runtime copied next to the sources; fetched on demand, never committed
-/vlc
