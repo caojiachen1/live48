@@ -41,3 +41,9 @@ src-tauri/gen/android/local.properties
 
 # Tauri build cache
 src-tauri/target/
+
+# egui rewrite (native Rust client)
+src-egui/target/
+
+# libVLC runtime copied next to the sources; fetched on demand, never committed
+/vlc
