@@ -1,8 +1,33 @@
-use crate::models::{self, LiveItem};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT_LANGUAGE, CONTENT_TYPE, HOST, USER_AGENT,
+};
+
+use crate::models::{self, Danmu, LiveItem, RoomInfo, Source};
 
 const BASE: &str = "https://pocketapi.48.cn/live/api/v1/live";
+/// The CDN in front of the record playlists answers `403` for a generic client on some
+/// hosts, and the app's own engine identity is what it always accepts.
+const ENGINE_UA: &str = "SNH48 ENGINE";
+
+/// `getLiveList` takes a group id, not a group name.
+pub const GROUP_IDS: [(&str, i64); 11] = [
+    ("SNH48", 10),
+    ("BEJ48", 11),
+    ("GNZ48", 12),
+    ("CKG48", 14),
+    ("CGT48", 21),
+    ("IDFT", 15),
+    ("海外练习生", 16),
+    ("THE9", 17),
+    ("硬糖少女303", 18),
+    ("明星殿堂", 19),
+    ("丝芭影视", 20),
+];
+
+pub fn group_id(name: &str) -> Option<i64> {
+    GROUP_IDS.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
+}
 
 fn headers() -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -63,9 +88,38 @@ impl Api {
     }
 
     pub fn record_page(&self, next: &str) -> Result<(Vec<LiveItem>, String), String> {
+        self.record_page_group(next, 0)
+    }
+
+    pub fn record_page_group(
+        &self,
+        next: &str,
+        group_id: i64,
+    ) -> Result<(Vec<LiveItem>, String), String> {
         let json = self.text(
             "getLiveList",
-            &serde_json::json!({ "debug": true, "next": next, "groupId": 0, "record": true }),
+            &serde_json::json!({ "debug": true, "next": next, "groupId": group_id, "record": true }),
+        )?;
+        models::parse_live_list(&json)
+    }
+
+    /// One page of a single member's records. `next` must not be `"0"` here: the server
+    /// silently returns nothing for `userId` + `next=0`, so the caller has to hand it a
+    /// real cursor - which is why [records_for_user] seeds itself from the newest record.
+    pub fn record_page_user(
+        &self,
+        next: &str,
+        user_id: &str,
+    ) -> Result<(Vec<LiveItem>, String), String> {
+        let json = self.text(
+            "getLiveList",
+            &serde_json::json!({
+                "debug": true,
+                "next": next,
+                "groupId": 0,
+                "record": true,
+                "userId": user_id,
+            }),
         )?;
         models::parse_live_list(&json)
     }
@@ -94,8 +148,72 @@ impl Api {
         Ok((acc, next))
     }
 
-    fn get_live_one(&self, live_id: &str) -> Result<String, String> {
-        self.text("getLiveOne", &serde_json::json!({ "liveId": live_id }))
+    pub fn records_for_user(
+        &self,
+        user_id: &str,
+        target_ms: i64,
+    ) -> Result<(Vec<LiveItem>, String), String> {
+        let (seed, cursor) = self.record_page("0")?;
+        let newest_is_target = seed
+            .first()
+            .is_some_and(|i| i.user_id == user_id || i.nickname == user_id);
+        let seed_first = seed.first().cloned();
+        let mut acc: Vec<LiveItem> = Vec::new();
+        if newest_is_target {
+            if let Some(first) = seed_first.clone() {
+                acc.push(first);
+            }
+        }
+        let mut next = if cursor == "0" {
+            seed_first.map(|i| i.live_id).unwrap_or_default()
+        } else {
+            cursor
+        };
+        if next.is_empty() {
+            return Ok((acc, "0".to_owned()));
+        }
+        loop {
+            let (items, cursor) = self.record_page_user(&next, user_id)?;
+            let reached = items.last().and_then(|i| i.ctime).unwrap_or(i64::MAX) < target_ms;
+            acc.extend(items);
+            next = cursor;
+            if reached || next == "0" || next.is_empty() {
+                break;
+            }
+        }
+        Ok((acc, next))
+    }
+
+    /// `getOpenLiveList`: theatre shows. `record=false` is "on air or scheduled",
+    /// `record=true` the archive, and the cursor is a millisecond stamp.
+    pub fn open_live_list(
+        &self,
+        record: bool,
+        next: &str,
+        group: i64,
+    ) -> Result<(Vec<LiveItem>, String), String> {
+        let json = self.text(
+            "getOpenLiveList",
+            &serde_json::json!({
+                "debug": false,
+                "groupId": group,
+                "next": next.parse::<i64>().unwrap_or(0),
+                "record": record,
+            }),
+        )?;
+        models::parse_open_live_list(&json)
+    }
+
+    fn path_for(source: Source) -> &'static str {
+        match source {
+            Source::Member => "getLiveOne",
+            Source::Open => "getOpenLiveOne",
+        }
+    }
+
+    pub fn room_info(&self, live_id: &str, source: Source) -> Result<RoomInfo, String> {
+        let json = self.text(Self::path_for(source), &serde_json::json!({ "liveId": live_id }))?;
+        models::parse_room_info(&json)
     }
 
     fn get_live_stream_v2(&self, live_id: &str) -> Result<String, String> {
@@ -107,26 +225,60 @@ impl Api {
 
     /// Prefer a non-RTMP address; falls back to RTMP, which the built-in libVLC
     /// player can open directly but an external system player may not.
-    pub fn playable_stream_url(&self, live_id: &str) -> Result<String, String> {
-        let one = self.get_live_one(live_id)?;
-        let v2 = self.get_live_stream_v2(live_id).ok();
-        models::parse_stream_urls(&one, v2.as_deref())
+    pub fn playable_stream_url(
+        &self,
+        live_id: &str,
+        source: Source,
+        want_type: Option<i64>,
+    ) -> Result<String, String> {
+        let info = self.room_info(live_id, source)?;
+        if let Some(path) = models::pick_stream(&info, want_type).ok() {
+            return Ok(path);
+        }
+        if source == Source::Member {
+            if let Ok(v2) = self.get_live_stream_v2(live_id) {
+                if let Some(serde_json::Value::String(p)) =
+                    serde_json::from_str::<serde_json::Value>(&v2)
+                        .ok()
+                        .and_then(|v| v.get("content").cloned())
+                {
+                    if !p.is_empty() && !p.starts_with("rtmp") {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        models::pick_stream(&info, None)
+            .or_else(|_| info.play_stream_path.clone().ok_or("未能获取到可用的流地址".to_string()))
     }
 
-    /// The original `get_live_stream_url`: raw `playStreamPath` from getLiveOne.
-    pub fn stream_url(&self, live_id: &str) -> Result<String, String> {
-        let one = self.get_live_one(live_id)?;
-        models::parse_plain_stream(&one)
-            .ok_or_else(|| "playStreamPath 解析失败".to_string())
+    /// The raw `playStreamPath` / best stream, which is what libVLC wants: it demuxes
+    /// RTMP itself, so there is no reason to prefer the weaker HTTPS copy.
+    pub fn stream_url(&self, live_id: &str, source: Source, want_type: Option<i64>) -> Result<String, String> {
+        let info = self.room_info(live_id, source)?;
+        if let Some(t) = want_type {
+            if let Some(s) = info.streams.iter().find(|s| s.stream_type == t) {
+                return Ok(s.path.clone());
+            }
+        }
+        match info.play_stream_path.clone() {
+            Some(p) if !p.is_empty() => Ok(p),
+            _ => models::pick_stream(&info, None),
+        }
     }
 
-    pub fn download_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
-        let res = self
-            .client
+    /// A record's danmaku sits in a plain `.lrc` next to the stream address.
+    pub fn danmaku(&self, url: &str) -> Result<Vec<Danmu>, String> {
+        let text = self.engine_get(url)?.text().map_err(|e| e.to_string())?;
+        Ok(models::parse_danmaku(&text))
+    }
+
+    fn engine_get(&self, url: &str) -> Result<Response, String> {
+        self.client
             .get(url)
+            .header(USER_AGENT, HeaderValue::from_static(ENGINE_UA))
             .send()
-            .map_err(|e| e.to_string())?;
-        res.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())
     }
 
     /// Covers and avatars come in dozens per screen, and building a `Client` costs a
@@ -145,23 +297,19 @@ impl Api {
     }
 
     pub fn download_text(&self, url: &str) -> Result<String, String> {
-        let res = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| e.to_string())?;
+        let res = self.engine_get(url)?;
         res.text().map_err(|e| e.to_string())
     }
 
     pub fn content_length(&self, url: &str) -> u64 {
-        match self.client.head(url).send() {
+        match self.client.get(url).header(USER_AGENT, HeaderValue::from_static(ENGINE_UA)).send() {
             Ok(r) => r.content_length().unwrap_or(0),
             Err(_) => 0,
         }
     }
 
     pub fn get(&self, url: &str) -> Result<Response, String> {
-        self.client.get(url).send().map_err(|e| e.to_string())
+        self.engine_get(url)
     }
 }
 

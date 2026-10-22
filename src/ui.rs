@@ -24,6 +24,7 @@ impl eframe::App for App {
         let _perf = crate::perf::Guard::new("logic");
         self.drain_events();
         self.tick_toasts();
+        self.tick_timers();
 
         if self.player.is_some() {
             // Mirrors the web player's gestures: wheel and arrow keys switch
@@ -157,6 +158,23 @@ impl App {
     fn player_view(&mut self, ui: &mut Ui) {
         let tx = self.req.tx();
         let Some(arc) = self.player.clone() else { return };
+        let mut want_danmu = None;
+        {
+            let mut guard = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.recording = guard
+                .entries
+                .get(guard.index)
+                .is_some_and(|e| self.recordings.contains_key(&e.live_id));
+            if guard.danmu_url.is_some() && !guard.danmu_requested {
+                guard.danmu_requested = true;
+                if let Some(e) = guard.entries.get(guard.index) {
+                    want_danmu = Some((e.live_id.clone(), guard.danmu_url.clone().unwrap()));
+                }
+            }
+        }
+        if let Some((live_id, url)) = want_danmu {
+            self.fetch_danmu(live_id, url);
+        }
         let mut guard = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let pl = &mut *guard;
         pl.pump(ui.ctx(), egui::ViewportId::ROOT);
@@ -210,7 +228,11 @@ impl App {
         }
         pl.fly_prev = ui.ctx().input(|i| i.time);
         if pl.fly_t > 0.001 {
-            let title = format!("播放列表 {}", pl.entries.len());
+            let title = if pl.show_danmu {
+                format!("弹幕 {}", pl.danmu.len())
+            } else {
+                format!("播放列表 {}", pl.entries.len())
+            };
             let (close, rect) = flyout(
                 ui,
                 "playlist_flyout",
@@ -358,7 +380,16 @@ impl App {
                             match self.tab {
                                 Tab::Live => self.refresh_live(),
                                 Tab::Record => self.refresh_records(false),
+                                Tab::Open | Tab::OpenRecord => self.refresh_open(false),
                             }
+                        }
+
+                        if !self.recordings.is_empty() {
+                            ui.label(
+                                RichText::new(format!("● 录制中 {}", self.recordings.len()))
+                                    .size(11.5)
+                                    .color(t::OK),
+                            );
                         }
 
                         let mode_label = match self.mode {
@@ -411,8 +442,9 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    for (value, label) in [(Tab::Live, "直播"), (Tab::Record, "录播")] {
+                    for value in [Tab::Live, Tab::Record, Tab::Open, Tab::OpenRecord] {
                         let selected = self.tab == value;
+                        let label = value.label();
                         let btn = egui::Button::new(
                             RichText::new(label)
                                 .size(13.0)
@@ -425,14 +457,25 @@ impl App {
                             Color32::TRANSPARENT
                         })
                         .corner_radius(7.0);
+                        let wide = label.chars().count() > 2;
                         if ui
-                            .add_sized(Vec2::new(64.0, 26.0), btn)
+                            .add_sized(Vec2::new(if wide { 78.0 } else { 64.0 }, 26.0), btn)
                             .on_hover_text(label)
                             .clicked()
                             && !selected
                         {
                             self.tab = value;
-                            if value == Tab::Record && self.records.is_empty() {
+                            let empty = match value {
+                                Tab::Live => self.lives.is_empty(),
+                                Tab::Record => self.records.is_empty(),
+                                Tab::Open => self.open_lives.is_empty(),
+                                Tab::OpenRecord => self.open_records.is_empty(),
+                            };
+                            if value.is_open() {
+                                if empty {
+                                    self.refresh_open(false);
+                                }
+                            } else if empty {
                                 self.refresh_records(false);
                             }
                         }
@@ -491,18 +534,24 @@ impl App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if self.loading_live || self.loading_records {
+                    if self.loading_live || self.loading_records || self.loading_open {
                         ui.add(egui::Spinner::new().size(13.0));
                         ui.label(RichText::new("加载中…").size(12.0).color(t::TEXT_2));
                     } else {
                         let tab = self.tab;
                         let shown = self.filtered(tab).len();
-                        let total = if tab == Tab::Live {
-                            self.lives.len()
-                        } else {
-                            self.records.len()
+                        let total = match tab {
+                            Tab::Live => self.lives.len(),
+                            Tab::Record => self.records.len(),
+                            Tab::Open => self.open_lives.len(),
+                            Tab::OpenRecord => self.open_records.len(),
                         };
-                        let what = if tab == Tab::Live { "个直播" } else { "个录播" };
+                        let what = match tab {
+                            Tab::Live => "个直播",
+                            Tab::Record => "个录播",
+                            Tab::Open => "场公演",
+                            Tab::OpenRecord => "个公演录播",
+                        };
                         ui.label(
                             RichText::new(format!("{shown} / {total} {what}"))
                                 .size(12.0)
@@ -518,6 +567,17 @@ impl App {
                         );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self.cfg.grab.enabled {
+                            let left = self
+                                .grab_at
+                                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs())
+                                .unwrap_or(0);
+                            ui.label(
+                                RichText::new(format!("自动抓取 {} 秒后", left))
+                                    .size(11.0)
+                                    .color(t::TEXT_3),
+                            );
+                        }
                         let (txt, col) = if !self.vlc.checked {
                             ("libVLC 未检测", t::TEXT_3)
                         } else if self.vlc.installed {
@@ -538,9 +598,15 @@ impl App {
     fn list(&mut self, ui: &mut Ui) {
         let tab = self.tab;
         let items = self.filtered(tab);
-        let next = self.record_next.clone();
-        let loading = self.loading_records || self.loading_live;
-        let is_record = tab == Tab::Record;
+        let next = match tab {
+            Tab::Live => "0".to_owned(),
+            Tab::Record => self.record_next.clone(),
+            Tab::Open => self.open_next.clone(),
+            Tab::OpenRecord => self.open_record_next.clone(),
+        };
+        let loading = self.loading_records || self.loading_live || self.loading_open;
+        let is_record = tab.is_record();
+        let more_open = tab == Tab::OpenRecord;
 
         if items.is_empty() {
             egui::ScrollArea::vertical()
@@ -600,11 +666,16 @@ impl App {
                 if is_record && next != "0" && end >= last {
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
+                        let label = if more_open { "加载更多公演录播" } else { "加载更多录播" };
                         if ui
-                            .add_sized(Vec2::new(180.0, 32.0), t::ghost_button("加载更多录播"))
+                            .add_sized(Vec2::new(180.0, 32.0), t::ghost_button(label))
                             .clicked()
                         {
-                            self.load_more();
+                            if more_open {
+                                self.refresh_open(true);
+                            } else {
+                                self.load_more();
+                            }
                         }
                     });
                 }
@@ -622,7 +693,7 @@ impl App {
     /// a card never grows taller than its neighbours.
     fn card(&mut self, ui: &mut Ui, item: &LiveItem, w: f32, is_record: bool) {
         let tx = self.req.tx();
-        let badge = badge_text(item.live_type, item.in_microphone_connection);
+        let badge = badge_text(item);
         let linked = item.in_microphone_connection;
         let cover_url = api::resolve_image(&item.cover_path);
         let avatar_url = api::resolve_image(&item.avatar);
@@ -632,9 +703,17 @@ impl App {
         } else {
             item.title.clone()
         };
-        let nickname = item.nickname.clone();
+        let nickname = if item.nickname.is_empty() {
+            item.sub_title.clone()
+        } else {
+            item.nickname.clone()
+        };
         let ctime = item.ctime;
         let download = self.downloads.get(&live_id).copied();
+        let recording = self.recordings.contains_key(&live_id);
+        let retryable = !recording && self.jobs.contains_key(&live_id) && download.is_none();
+        // A theatre show that has not started has no stream to ask for yet.
+        let unavailable = item.source == crate::models::Source::Open && item.status == 1;
         let builtin = self.mode == PlayerMode::Builtin;
         let inner = (w - 24.0).max(120.0);
         // Where the button row starts: the card-wide "open" hit area has to stop
@@ -687,7 +766,12 @@ impl App {
                         Color32::from_rgb(0xF6, 0xF6, 0xF6),
                     );
 
-                    let tab_label = if is_record { "录播" } else { "● 直播" };
+                    let tab_label = match (is_record, item.source) {
+                        (true, crate::models::Source::Open) => "公演录播",
+                        (false, crate::models::Source::Open) => "公演",
+                        (true, _) => "录播",
+                        (false, _) => "● 直播",
+                    };
                     util::pill(
                         ui,
                         Pos2::new(crect.min.x + 8.0, crect.min.y + 8.0),
@@ -696,11 +780,23 @@ impl App {
                         t::WHITE,
                         t::alpha(Color32::BLACK, 178),
                     );
+                    let mut pill_x = crect.max.x - 8.0;
+                    if recording {
+                        pill_x -= util::pill_width("● 录制", 11.0) + 6.0;
+                        util::pill(
+                            ui,
+                            Pos2::new(pill_x, crect.min.y + 8.0),
+                            "● 录制",
+                            11.0,
+                            t::WHITE,
+                            t::alpha(t::ERR, 220),
+                        );
+                    }
                     if linked {
                         util::pill(
                             ui,
                             Pos2::new(
-                                crect.max.x - 8.0 - util::pill_width("连麦", 11.0),
+                                pill_x - util::pill_width("连麦", 11.0) - 6.0,
                                 crect.min.y + 8.0,
                             ),
                             "连麦",
@@ -732,7 +828,14 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        self.images.avatar(ui, &avatar_url, 34.0, &tx);
+                        if item.avatar.is_empty() {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(34.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(rect.center(), 17.0, t::alpha(t::WHITE, 22));
+                        } else {
+                            self.images.avatar(ui, &avatar_url, 34.0, &tx);
+                        }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(
@@ -740,10 +843,26 @@ impl App {
                                     .color(t::TEXT)
                                     .font(t::heading(13.0)),
                             );
-                            let second = match (download, ctime) {
-                                (Some(p), _) => format!("下载中 {p:.0}%"),
-                                (None, Some(ms)) => crate::app::fmt_time(ms),
-                                (None, None) => String::new(),
+                            let second = if let Some(p) = download {
+                                format!("下载中 {p:.0}%")
+                            } else if retryable {
+                                "分片有缺失，可重试续传".to_owned()
+                            } else if recording {
+                                let secs = self
+                                    .recordings
+                                    .get(&live_id)
+                                    .map(|r| r.started_at.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                format!("录制中 {}:{}", secs / 60, secs % 60)
+                            } else if let Some(ms) = ctime {
+                                let when = crate::app::fmt_time(ms);
+                                if item.duration.is_empty() {
+                                    when
+                                } else {
+                                    format!("{when} · {}", item.duration)
+                                }
+                            } else {
+                                String::new()
                             };
                             if !second.is_empty() {
                                 ui.label(RichText::new(second).color(t::TEXT_3).size(11.0));
@@ -757,8 +876,9 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // The primary button absorbs the leftover width so the row
                         // is flush with the cover instead of trailing off into slack.
-                        let mut tail = 62.0 + 6.0;
-                        if is_record {
+                        // 播放 + 录制/下载 + 地址, plus 重试 and 取消 when they apply.
+                        let mut tail = 62.0 + 32.0 + 6.0 * 2.0 + 62.0 + 6.0;
+                        if retryable {
                             tail += 62.0 + 6.0;
                         }
                         if download.is_some() {
@@ -769,33 +889,63 @@ impl App {
                             t::accent_button("播放"),
                         );
                         if play
-                            .on_hover_text(if builtin {
+                            .on_hover_text(if unavailable {
+                                "公演还没有开始"
+                            } else if builtin {
                                 "用内置 libVLC 播放"
                             } else {
                                 "用外部播放器打开"
                             })
                             .clicked()
+                            && !unavailable
                         {
                             self.play_by_id(&live_id, !is_record);
                         }
 
-                        if is_record {
+                        if is_record && !unavailable {
                             let dl = ui.add_sized(Vec2::new(62.0, 32.0), t::ghost_button("下载"));
                             if dl.on_hover_text("保存为 TS 文件").clicked() {
                                 self.act(
                                     item,
-                                    Action::Download {
-                                        live_id: live_id.clone(),
-                                        title: title.clone(),
-                                    },
+                                    Action::Download { item: item.clone() },
                                 );
                             }
                         }
 
-                        let cp =
-                            ui.add_sized(Vec2::new(62.0, 32.0), t::ghost_button("地址"));
-                        if cp.on_hover_text("复制推流/录播地址").clicked() {
+                        if !is_record {
+                            let label = if recording { "停止" } else { "录制" };
+                            let btn = if recording {
+                                t::accent_button(label)
+                            } else {
+                                t::ghost_button(label)
+                            };
+                            let rec = ui.add_sized(Vec2::new(62.0, 32.0), btn);
+                            if rec
+                                .on_hover_text(if recording {
+                                    "停止录制，已录内容保留在文件里"
+                                } else {
+                                    "后台录制这条直播，断流会自动续录"
+                                })
+                                .clicked()
+                                && !unavailable
+                            {
+                                self.toggle_recording(&live_id);
+                            }
+                        }
+
+                        let cp = icons::icon_button(ui, Icon::Copy, 32.0);
+                        if cp.on_hover_text("复制推流/录播地址").clicked() && !unavailable {
                             self.act(item, Action::Copy);
+                        }
+
+                        if retryable && download.is_none() {
+                            let rt = ui.add_sized(Vec2::new(62.0, 32.0), t::ghost_button("重试"));
+                            if rt
+                                .on_hover_text("只补下缺失的分片，已下载的会跳过")
+                                .clicked()
+                            {
+                                self.retry_download(&live_id);
+                            }
                         }
 
                         if download.is_some()
@@ -822,20 +972,19 @@ impl App {
                 StrokeKind::Inside,
             );
         }
-        if resp.clicked() {
+        if resp.clicked() && !unavailable {
             self.play_by_id(&live_id, !is_record);
         }
     }
 
     fn play_by_id(&mut self, live_id: &str, live_tab: bool) {
-        let found = if live_tab {
-            &self.lives
-        } else {
-            &self.records
-        }
-        .iter()
-        .find(|i| i.live_id == live_id)
-        .cloned();
+        let source: &Vec<LiveItem> = match (live_tab, self.tab.is_open()) {
+            (true, false) => &self.lives,
+            (false, false) => &self.records,
+            (true, true) => &self.open_lives,
+            (false, true) => &self.open_records,
+        };
+        let found = source.iter().find(|i| i.live_id == live_id).cloned();
 
         if let Some(item) = found {
             match self.mode {
@@ -951,6 +1100,38 @@ impl App {
                             }
                         });
                 });
+
+            let only = self.member_only.clone();
+            util::section(ui, "按成员查询录播（服务端）");
+            if let Some((_, name)) = only {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("当前只看 {name}")).size(12.5).color(t::TEXT));
+                    if ui
+                        .add(egui::Button::new(RichText::new("取消").size(12.0).color(t::TEXT_3)))
+                        .clicked()
+                    {
+                        self.clear_member_only();
+                    }
+                });
+            } else if self.members.len() == 1 {
+                let name = self.members[0].clone();
+                if ui
+                    .add_sized(
+                        Vec2::new(ui.available_width(), 30.0),
+                        t::ghost_button(&format!("只看 {name} 的历史录播")),
+                    )
+                    .on_hover_text("带 userId 向服务器查询，比本地筛选翻得深")
+                    .clicked()
+                {
+                    self.records_of(&name);
+                }
+            } else {
+                ui.label(
+                    RichText::new("在上面的成员列表里勾一个人，再点这里查询")
+                        .size(11.5)
+                        .color(t::TEXT_3),
+                );
+            }
 
             util::section(ui, "日期范围（录播）");
             let mut on = self.date_on;
@@ -1170,6 +1351,92 @@ impl App {
                     RichText::new(crate::util::truncate(&self.vlc.detail, 290.0, 10.5))
                         .size(10.5)
                         .color(t::TEXT_3),
+                );
+            }
+
+            util::section(ui, "下载与录制目录");
+            let dir = self.download_dir();
+            ui.label(
+                RichText::new(crate::util::truncate(&dir, 240.0, 11.5))
+                    .size(11.5)
+                    .color(t::TEXT_3),
+            );
+            ui.horizontal(|ui| {
+                let half = ((ui.available_width() - 6.0) / 2.0).max(60.0);
+                if ui
+                    .add_sized(Vec2::new(half, 30.0), t::ghost_button("选择目录"))
+                    .on_hover_text("录播下载与直播录制都写到这里")
+                    .clicked()
+                {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.cfg.download_dir = Some(p.to_string_lossy().to_string());
+                        config::save(&self.cfg);
+                    }
+                }
+                if !self.recordings.is_empty() {
+                    ui.label(
+                        RichText::new(format!("● 正在录制 {}", self.recordings.len()))
+                            .size(11.5)
+                            .color(t::OK),
+                    );
+                }
+            });
+
+            util::section(ui, "自动抓取（开播即录）");
+            let mut g = self.cfg.grab.clone();
+            if ui.checkbox(&mut g.enabled, "启用自动抓取").changed() {
+                self.cfg.grab = g.clone();
+                config::save(&self.cfg);
+            }
+            ui.label(
+                RichText::new("按名单轮询直播列表，命中且没在录的就开一条后台录制")
+                    .size(11.0)
+                    .color(t::TEXT_3),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("间隔（分）").size(12.0).color(t::TEXT_2));
+                ui.add(egui::DragValue::new(&mut g.minutes).range(1..=720).speed(1));
+                ui.label(RichText::new("同时最多").size(12.0).color(t::TEXT_2));
+                ui.add(egui::DragValue::new(&mut g.max).range(1..=5).speed(1));
+            });
+            ui.label(RichText::new("成员姓名或 ID（逗号分隔）").size(12.0).color(t::TEXT_2));
+            ui.add(
+                egui::TextEdit::multiline(&mut g.users)
+                    .hint_text("SNH48-张三, 123456789")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .frame(field_frame()),
+            );
+            ui.label(RichText::new("保存目录（留空用上面的目录）").size(12.0).color(t::TEXT_2));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(crate::util::truncate(
+                        if g.dir.is_empty() { "（同上）" } else { &g.dir },
+                        220.0,
+                        11.0,
+                    ))
+                    .size(11.0)
+                    .color(t::TEXT_3),
+                );
+                if ui
+                    .add(egui::Button::new(RichText::new("选择").size(11.5).color(t::TEXT_2)))
+                    .clicked()
+                {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        g.dir = p.to_string_lossy().to_string();
+                    }
+                }
+            });
+            if g != self.cfg.grab {
+                self.cfg.grab = g;
+                config::save(&self.cfg);
+            }
+            if self.cfg.grab.enabled && self.engine.is_none() {
+                ui.label(
+                    RichText::new("自动抓取需要 libVLC 引擎，先在上方下载")
+                        .size(11.0)
+                        .color(t::WARN),
                 );
             }
         }).0

@@ -12,6 +12,7 @@ use egui::{
 use crate::events::Event;
 use crate::icons::{self, Icon};
 use crate::images::ImageCache;
+use crate::models::{Danmu, Source, Stream};
 use crate::theme as t;
 use crate::vlc::{Engine, Session};
 
@@ -19,12 +20,16 @@ use crate::vlc::{Engine, Session};
 pub const MAX_W: u32 = 1280;
 pub const MAX_H: u32 = 720;
 
+/// A record's danmaku stays on screen for this long, matching the original client.
+pub const DANMU_WINDOW: f64 = 3.0;
+
 #[derive(Clone)]
 pub struct Entry {
     pub live_id: String,
     pub title: String,
     pub nickname: String,
     pub cover: String,
+    pub source: Source,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -36,6 +41,11 @@ pub enum Cmd {
     Prev,
     Next,
     Goto(usize),
+    /// Switch清晰度: the media (and therefore its sout) is rebuilt from scratch.
+    Quality(i64),
+    /// Start or stop capturing the stream that is on screen.
+    Record,
+    SaveDanmu,
 }
 
 pub struct Player {
@@ -69,6 +79,20 @@ pub struct Player {
     pub playlist_rect: Rect,
     pub cmd: Cmd,
     seek_preview: Option<f32>,
+
+    /// Clearness menu for this item; empty until the room info comes back.
+    pub streams: Vec<Stream>,
+    /// The `streamType` in effect; `0` means the automatic choice.
+    pub quality: i64,
+    pub danmu_url: Option<String>,
+    pub danmu: Vec<Danmu>,
+    /// The `.lrc` is fetched once per item, not once per frame.
+    pub danmu_requested: bool,
+    /// The drawer shows the playlist (false) or the danmaku (true).
+    pub show_danmu: bool,
+    /// Mirrored from the app every pass so the button can show the truth.
+    pub recording: bool,
+    danmu_cur: usize,
 
     /// Counters for the headless `--apitest` harness.
     pub uploads: u64,
@@ -122,6 +146,14 @@ impl Player {
             playlist_rect: Rect::NOTHING,
             cmd: Cmd::None,
             seek_preview: None,
+            streams: Vec::new(),
+            quality: 0,
+            danmu_url: None,
+            danmu: Vec::new(),
+            danmu_requested: false,
+            show_danmu: false,
+            recording: false,
+            danmu_cur: 0,
             uploads: 0,
             upload_micros: 0,
         })
@@ -132,6 +164,11 @@ impl Player {
         let session = engine.open(url, MAX_W, MAX_H)?;
         self.session = session;
         self.index = index;
+        self.streams = Vec::new();
+        self.danmu_url = None;
+        self.danmu = Vec::new();
+        self.danmu_requested = false;
+        self.danmu_cur = 0;
         if let Some(e) = self.entries.get(index) {
             self.title = if e.title.is_empty() {
                 "无标题".into()
@@ -146,6 +183,34 @@ impl Player {
         self.last_seq = 0;
         self.paused = false;
         Ok(())
+    }
+
+    /// `want` is the清晰度 this item already uses, so a reattach does not silently
+    /// drop back to automatic.
+    pub fn set_streams(&mut self, streams: Vec<Stream>, want: Option<i64>) {
+        self.quality = want.unwrap_or_else(|| {
+            for t in [3i64, 1, 2] {
+                if streams.iter().any(|s| s.stream_type == t) {
+                    return t;
+                }
+            }
+            streams.first().map(|s| s.stream_type).unwrap_or(0)
+        });
+        self.streams = streams;
+    }
+
+    pub fn set_danmu(&mut self, items: Vec<Danmu>) {
+        self.danmu_cur = 0;
+        self.danmu = items;
+    }
+
+    /// The last danmaku at or before the play head - what the panel highlights.
+    fn danmu_cursor(&self, now: f64) -> usize {
+        match self.danmu.binary_search_by(|d| d.secs.total_cmp(&now)) {
+            Ok(i) => i,
+            Err(0) => usize::MAX,
+            Err(i) => i - 1,
+        }
     }
 
     /// Uploads the newest decoded frame and keeps repaints flowing at video rate.
@@ -267,11 +332,61 @@ impl Player {
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if self.entries.len() > 1
                     && icons::icon_button(ui, Icon::List, 32.0)
-                        .on_hover_text("播放列表")
+                        .on_hover_text("播放列表 / 弹幕")
                         .clicked()
                 {
                     self.playlist_open = !self.playlist_open;
                     self.wake();
+                }
+                let rec_label = if self.recording { "停止录制" } else { "录制" };
+                let rec_btn = if self.recording {
+                    t::accent_button(rec_label)
+                } else {
+                    t::ghost_button(rec_label)
+                };
+                if ui
+                    .add_sized(
+                        Vec2::new(if self.recording { 76.0 } else { 52.0 }, 32.0),
+                        rec_btn,
+                    )
+                    .on_hover_text(if self.recording {
+                        "停止录制并保留已录内容"
+                    } else {
+                        "边看边录成 TS 文件，断流后会自动续录"
+                    })
+                    .clicked()
+                {
+                    self.cmd = Cmd::Record;
+                }
+                if self.streams.len() > 1 {
+                    let current = self
+                        .streams
+                        .iter()
+                        .find(|s| s.stream_type == self.quality)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "清晰度".to_owned());
+                    let options = self.streams.clone();
+                    egui::ComboBox::from_id_salt("quality_combo")
+                        .width(104.0)
+                        .selected_text(RichText::new(current).size(12.5).color(t::TEXT_2))
+                        .show_ui(ui, |ui| {
+                            for s in options {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.quality,
+                                        s.stream_type,
+                                        if s.vip {
+                                            format!("{}（VIP）", s.name)
+                                        } else {
+                                            s.name.clone()
+                                        },
+                                    )
+                                    .changed()
+                                {
+                                    self.cmd = Cmd::Quality(s.stream_type);
+                                }
+                            }
+                        });
                 }
                 if self.is_live
                     && icons::icon_button(ui, Icon::Refresh, 32.0)
@@ -485,6 +600,49 @@ impl Player {
     /// the slide, so this only paints the rows inside the given width.
     pub fn playlist_body(&mut self, ui: &mut Ui, thumbs: &mut ImageCache, tx: &Sender<Event>) {
         ui.spacing_mut().item_spacing.y = 0.0;
+        let floor = ui.spacing().interact_size.y;
+        ui.spacing_mut().interact_size.y = 26.0;
+        ui.spacing_mut().button_padding.y = 3.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (value, label) in [(false, "列表"), (true, "弹幕")] {
+                let selected = self.show_danmu == value;
+                let btn = egui::Button::new(
+                    RichText::new(label)
+                        .size(12.5)
+                        .color(if selected { t::ON_ACCENT } else { t::TEXT_2 })
+                        .font(t::heading(12.5)),
+                )
+                .fill(if selected { t::WHITE } else { Color32::TRANSPARENT })
+                .corner_radius(7.0);
+                if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
+                    self.show_danmu = value;
+                    self.wake();
+                }
+            }
+            if self.show_danmu && !self.danmu.is_empty() {
+                if ui
+                    .add_sized(Vec2::new(70.0, 26.0), t::ghost_button("保存弹幕"))
+                    .on_hover_text("把这条录播的 .lrc 存到下载目录")
+                    .clicked()
+                {
+                    self.cmd = Cmd::SaveDanmu;
+                }
+            }
+            if self.show_danmu {
+                ui.label(
+                    RichText::new(format!("{} 条", self.danmu.len())).size(11.0).color(t::TEXT_3),
+                );
+            }
+        });
+        ui.spacing_mut().interact_size.y = floor;
+        ui.add_space(6.0);
+
+        if self.show_danmu {
+            self.danmu_body(ui);
+            return;
+        }
+
         egui::ScrollArea::vertical()
             .id_salt("pl")
             .auto_shrink([false, false])
@@ -558,6 +716,107 @@ impl Player {
                     }
                 }
             });
+    }
+
+    /// The record's danmaku as a scrolling list: the line the play head is on stays
+    /// highlighted and the view follows it, and clicking any line jumps the video there.
+    fn danmu_body(&mut self, ui: &mut Ui) {
+        if self.danmu.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(if self.is_live {
+                        "直播没有弹幕文件，只有录播有"
+                    } else {
+                        "这条录播没有弹幕文件"
+                    })
+                    .size(12.5)
+                    .color(t::TEXT_3),
+                );
+            });
+            return;
+        }
+        let row_h = 24.0;
+        let now = self.time_ms as f64 / 1000.0;
+        let cur = self.danmu_cursor(now);
+        let follow = cur != usize::MAX && cur != self.danmu_cur;
+        if cur != usize::MAX {
+            self.danmu_cur = cur;
+        }
+        let mut seek: Option<f64> = None;
+        let jump_to = if follow { Some(self.danmu_cur) } else { None };
+        egui::ScrollArea::vertical()
+            .id_salt("danmu")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, self.danmu.len(), |ui, range| {
+                if let Some(row) = jump_to {
+                    // Virtualised rows still occupy exact-height spacers, so the
+                    // target rect is simply `row * row_height`.
+                    ui.scroll_to_rect(
+                        Rect::from_min_size(
+                            Pos2::new(0.0, row as f32 * row_h),
+                            Vec2::new(1.0, row_h),
+                        ),
+                        Some(Align::Center),
+                    );
+                }
+                for (n, d) in self.danmu[range.clone()].iter().enumerate() {
+                    let row = range.start + n;
+                    let live = d.secs <= now && now - d.secs < DANMU_WINDOW;
+                    let w = ui.available_width();
+                    let frame = Frame::new()
+                        .fill(if live {
+                            t::alpha(t::WHITE, 26)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .inner_margin(Margin {
+                            left: 10,
+                            right: 10,
+                            top: 3,
+                            bottom: 3,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(w - 20.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    RichText::new(&d.time)
+                                        .size(11.0)
+                                        .color(if live { t::WHITE } else { t::TEXT_3 }),
+                                );
+                                ui.label(
+                                    RichText::new(crate::util::truncate(
+                                        &d.nickname,
+                                        96.0,
+                                        12.0,
+                                    ))
+                                    .size(12.0)
+                                    .color(if live { t::WHITE } else { t::TEXT_2 }),
+                                );
+                                ui.label(
+                                    RichText::new(crate::util::truncate(&d.message, 120.0, 12.0))
+                                        .size(12.0)
+                                        .color(t::TEXT),
+                                );
+                            });
+                        });
+                    let resp = ui
+                        .interact(
+                            frame.response.rect,
+                            Id::new(("danmu", row)),
+                            Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        seek = Some(d.secs);
+                    }
+                }
+            });
+        if let Some(secs) = seek {
+            self.session.set_time_ms((secs * 1000.0) as i64);
+            self.wake();
+        }
     }
 }
 

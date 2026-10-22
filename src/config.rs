@@ -25,12 +25,39 @@ impl Default for Preset {
     }
 }
 
+/// Watch-list auto recording: poll the live list every `minutes`, and start a
+/// recording for every on-air member whose name or id matches `users`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Grab {
+    pub enabled: bool,
+    pub minutes: u64,
+    pub users: String,
+    pub dir: String,
+    /// Both a courtesy to the source and a guard against a runaway thread count.
+    pub max: usize,
+}
+
+impl Default for Grab {
+    fn default() -> Self {
+        Grab {
+            enabled: false,
+            minutes: 5,
+            users: String::new(),
+            dir: String::new(),
+            max: 5,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// "system" | "vlc" | "builtin"
     pub player_mode: Option<String>,
     pub presets: Vec<Preset>,
     pub fetch_audio: Option<bool>,
+    pub grab: Grab,
+    pub download_dir: Option<String>,
 }
 
 pub fn dir() -> PathBuf {

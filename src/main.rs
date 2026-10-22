@@ -36,6 +36,24 @@ fn main() -> eframe::Result {
         };
         std::process::exit(selftest(target));
     }
+    if let Some(pos) = args.iter().position(|a| a == "--dltest") {
+        let (Some(live_id), Some(out), secs) = (
+            args.get(pos + 1),
+            args.get(pos + 2),
+            args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()),
+        ) else {
+            eprintln!("用法: live48-egui --dltest <liveId> <输出.ts> [秒]");
+            std::process::exit(2);
+        };
+        std::process::exit(dltest(live_id, out, secs.unwrap_or(20)));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--recordtest") {
+        let (Some(target), Some(out)) = (args.get(pos + 1), args.get(pos + 2)) else {
+            eprintln!("用法: live48-egui --recordtest <视频文件或流地址> <输出.ts>");
+            std::process::exit(2);
+        };
+        std::process::exit(recordtest(target, out));
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -102,6 +120,141 @@ fn selftest(target: &str) -> i32 {
     }
 }
 
+/// Drives the real record downloader for a bounded time so the segment cache, the
+/// byte alignment and the cancel path can be checked from a terminal.
+fn dltest(live_id: &str, out: &str, secs: u64) -> i32 {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, mpsc};
+
+    let api = api::Api::new();
+    let url = match api.playable_stream_url(live_id, models::Source::Member, None) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("stream url FAILED: {e}");
+            return 10;
+        }
+    };
+    println!("url = {}", url.chars().take(90).collect::<String>());
+
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    download::start(url, out.to_string(), live_id.to_string(), tx, cancel.clone());
+
+    let t0 = Instant::now();
+    let mut last = -100.0;
+    let mut outcome = String::from("timeout");
+    while t0.elapsed() < Duration::from_secs(secs) {
+        if let Ok(events::Event::Download { kind, .. }) = rx.try_recv() {
+            match kind {
+                events::DownloadEvent::Progress(p) => {
+                    if p - last >= 10.0 {
+                        println!("progress {p:.1}%");
+                        last = p;
+                    }
+                }
+                events::DownloadEvent::Success => {
+                    outcome = "success".into();
+                    break;
+                }
+                events::DownloadEvent::Cancelled => {
+                    outcome = "cancelled".into();
+                    break;
+                }
+                events::DownloadEvent::Error(e) => {
+                    println!("download ERROR: {e}");
+                    return 11;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if outcome == "timeout" {
+        cancel.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    let cache = format!("{out}.cache");
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut misaligned = 0usize;
+    if let Ok(rd) = std::fs::read_dir(&cache) {
+        for entry in rd.flatten() {
+            if let Ok(m) = entry.metadata() {
+                files += 1;
+                bytes += m.len();
+                if m.len() % 188 != 0 {
+                    misaligned += 1;
+                }
+            }
+        }
+    }
+    let final_len = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "outcome={outcome} cache_files={files} cache_bytes={bytes} misaligned={misaligned} final_bytes={final_len}"
+    );
+    let ok = match outcome.as_str() {
+        "success" => final_len > 188 && files == 0 && misaligned == 0,
+        "cancelled" | "timeout" => files > 0 && misaligned == 0 && final_len == 0,
+        _ => false,
+    };
+    println!(
+        "{}",
+        if ok {
+            "DLTEST PASS"
+        } else {
+            "DLTEST FAIL (用同一命令再跑一次可验证续传：已存在的分片应被跳过)"
+        }
+    );
+    if ok {
+        0
+    } else {
+        12
+    }
+}
+
+/// Headless check of the stream-output recorder: the file has to appear and keep
+/// growing while VLC is running, which is what the record button relies on.
+fn recordtest(target: &str, out: &str) -> i32 {
+    let engine = match vlc::Engine::load() {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("FAIL engine: {e}");
+            return 3;
+        }
+    };
+    let _ = std::fs::remove_file(out);
+    let rec = match engine.record(target, out) {
+        Ok(rec) => rec,
+        Err(e) => {
+            eprintln!("FAIL record: {e}");
+            return 4;
+        }
+    };
+    std::thread::sleep(Duration::from_secs(6));
+    let a = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    std::thread::sleep(Duration::from_secs(4));
+    let b = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    let running = rec.running();
+    drop(rec);
+    println!(
+        "record: running={running} size {a} -> {b} (grew={})",
+        b > a
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    let after = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    println!("after stop: {after} bytes at {out}");
+    // A live source must still be growing while it runs; a short clip ends before the
+    // second sample, which is only acceptable once real packets are on disk.
+    let ok = after > 188 && (b > a || !running);
+    if ok {
+        println!("RECORDTEST PASS");
+        0
+    } else {
+        println!("RECORDTEST FAIL");
+        5
+    }
+}
+
 /// End-to-end check with no window: fetch both lists, resolve a stream address and
 /// let libVLC actually decode it, so the whole data + playback path can be verified
 /// from a terminal.
@@ -132,15 +285,49 @@ fn apitest() -> i32 {
         Ok((items, next)) => println!("record list: {} items, next={next}", items.len()),
         Err(e) => eprintln!("record list FAILED: {e}"),
     }
+    for record in [false, true] {
+        match api.open_live_list(record, "0", 0) {
+            Ok((items, next)) => println!(
+                "open live (record={record}): {} items, next={next}, first={:?}",
+                items.len(),
+                items.first().map(|i| (i.title.clone(), i.status, i.sub_title.clone()))
+            ),
+            Err(e) => eprintln!("open live list (record={record}) FAILED: {e}"),
+        }
+    }
 
     // Prefer a running live stream; fall back to the newest record so the HLS
     // decode path still gets exercised when nobody is live.
     let records = api.records_back_to("0", yesterday).map(|(v, _)| v).unwrap_or_default();
+    if let Some(r) = records.first() {
+        match api.room_info(&r.live_id, r.source) {
+            Ok(info) => {
+                println!(
+                    "room {}: room_id={} streams={} msg_file={}",
+                    r.live_id,
+                    info.room_id,
+                    info.streams.len(),
+                    info.msg_file_path.is_some()
+                );
+                if let Some(u) = info.msg_file_path.clone() {
+                    match api.danmaku(&u) {
+                        Ok(d) => println!(
+                            "danmu: {} lines, first={:?}",
+                            d.len(),
+                            d.first().map(|x| (x.time.clone(), x.nickname.clone(), x.message.chars().take(12).collect::<String>()))
+                        ),
+                        Err(e) => eprintln!("danmu FAILED: {e}"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("room_info FAILED: {e}"),
+        }
+    }
     let Some(item) = live.first().cloned().or_else(|| records.first().cloned()) else {
         println!("nothing to decode");
         return 0;
     };
-    let url = match api.playable_stream_url(&item.live_id) {
+    let url = match api.playable_stream_url(&item.live_id, item.source, None) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("stream url FAILED: {e}");
@@ -167,6 +354,7 @@ fn apitest() -> i32 {
         title: item.title.clone(),
         nickname: item.nickname.clone(),
         cover: api::resolve_image(&item.cover_path),
+        source: item.source,
     }];
     let is_live = !live.is_empty();
     let mut p = match player::Player::open(&engine, &url, entries, 0, is_live, &ctx) {

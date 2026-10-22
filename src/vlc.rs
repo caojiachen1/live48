@@ -12,6 +12,7 @@ use libloading::Library;
 type FnNew = unsafe extern "C" fn(c_int, *mut *const c_void) -> *mut c_void;
 type FnRelease = unsafe extern "C" fn(*mut c_void);
 type FnMediaNewLocation = unsafe extern "C" fn(*mut c_void, *const i8) -> *mut c_void;
+type FnMediaAddOption = unsafe extern "C" fn(*mut c_void, *const i8);
 type FnMediaRelease = unsafe extern "C" fn(*mut c_void);
 type FnPlayerNew = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type FnPlayerSetMedia = unsafe extern "C" fn(*mut c_void, *mut c_void);
@@ -416,6 +417,7 @@ struct Ffi {
     new: FnNew,
     release: FnRelease,
     media_new_location: FnMediaNewLocation,
+    media_add_option: FnMediaAddOption,
     media_release: FnMediaRelease,
     player_new: FnPlayerNew,
     player_set_media: FnPlayerSetMedia,
@@ -476,6 +478,7 @@ macro_rules! bind {
         bind!(new, "libvlc_new", FnNew);
         bind!(release, "libvlc_release", FnRelease);
         bind!(media_new_location, "libvlc_media_new_location", FnMediaNewLocation);
+        bind!(media_add_option, "libvlc_media_add_option", FnMediaAddOption);
         bind!(media_release, "libvlc_media_release", FnMediaRelease);
         bind!(player_new, "libvlc_media_player_new", FnPlayerNew);
         bind!(player_set_media, "libvlc_media_player_set_media", FnPlayerSetMedia);
@@ -496,6 +499,7 @@ macro_rules! bind {
             new,
             release,
             media_new_location,
+            media_add_option,
             media_release,
             player_new,
             player_set_media,
@@ -551,10 +555,9 @@ macro_rules! bind {
     /// Starts playing `url` into memory buffers. RTMP, HLS and HTTP-TS all go
     /// through libVLC's own demuxers, so no transcode round-trip is needed.
     pub fn open(&self, url: &str, max_w: u32, max_h: u32) -> Result<Session, String> {
-        let c_url = CString::new(url).map_err(|_| "URL 含空字节".to_string())?;
-        let media = unsafe { (self.ffi.media_new_location)(self.instance, c_url.as_ptr()) };
-        if media.is_null() {
-            return Err("无法创建媒体对象".to_string());
+        let media = self.new_media(url)?;
+        if url.starts_with("http") {
+            self.add_option(media, ":http-user-agent=SNH48 ENGINE")?;
         }
         let mp = unsafe { (self.ffi.player_new)(self.instance) };
         if mp.is_null() {
@@ -593,6 +596,86 @@ macro_rules! bind {
             state,
             vlc_ref,
         })
+    }
+
+    fn new_media(&self, url: &str) -> Result<*mut c_void, String> {
+        let c_url = CString::new(url).map_err(|_| "URL 含空字节".to_string())?;
+        let media = unsafe { (self.ffi.media_new_location)(self.instance, c_url.as_ptr()) };
+        if media.is_null() {
+            return Err("无法创建媒体对象".to_string());
+        }
+        Ok(media)
+    }
+
+    fn add_option(&self, media: *mut c_void, opt: &str) -> Result<(), String> {
+        let c = CString::new(opt).map_err(|_| "选项含空字节".to_string())?;
+        unsafe { (self.ffi.media_add_option)(media, c.as_ptr()) };
+        Ok(())
+    }
+
+    /// Copies `url` into `out` on its own connection, decoding nothing: the stream
+    /// output chain taps the demuxed elementary streams, and with no video or audio
+    /// output there is no window and almost no CPU cost. Recording therefore never
+    /// disturbs what is on screen.
+    pub fn record(&self, url: &str, out: &str) -> Result<Recorder, String> {
+        let media = self.new_media(url)?;
+        if url.starts_with("http") {
+            self.add_option(media, ":http-user-agent=SNH48 ENGINE")?;
+        }
+        // VLC's MRL parser takes Windows separators out of the picture, and the
+        // quoting keeps the drive colon from being read as an option separator.
+        let dst = out.replace('\\', "/");
+        self.add_option(media, &format!(":sout=#std{{access=file,mux=ts,dst=\"{dst}\"}}"))?;
+        for opt in [":no-video", ":no-audio", ":network-caching=1000"] {
+            self.add_option(media, opt)?;
+        }
+        let mp = unsafe { (self.ffi.player_new)(self.instance) };
+        if mp.is_null() {
+            unsafe { (self.ffi.media_release)(media) };
+            return Err("无法创建录制对象".to_string());
+        }
+        unsafe { (self.ffi.player_set_media)(mp, media) };
+        if unsafe { (self.ffi.player_play)(mp) } != 0 {
+            unsafe {
+                (self.ffi.player_release)(mp);
+                (self.ffi.media_release)(media);
+            }
+            return Err("VLC 录制启动失败".to_string());
+        }
+        Ok(Recorder {
+            ffi: self.ffi.clone(),
+            mp,
+            media,
+            out: out.to_owned(),
+        })
+    }
+}
+
+/// Writes one stream to one file until it ends or is dropped.
+pub struct Recorder {
+    ffi: Arc<Ffi>,
+    mp: *mut c_void,
+    media: *mut c_void,
+    pub out: String,
+}
+
+unsafe impl Send for Recorder {}
+
+impl Recorder {
+    /// True while VLC is still pulling the stream; once the source dies the state
+    /// settles on stopped/ended/error and the caller decides whether to resume.
+    pub fn running(&self) -> bool {
+        matches!(unsafe { (self.ffi.player_get_state)(self.mp) }, 1 | 2 | 3 | 8)
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        unsafe {
+            (self.ffi.player_stop)(self.mp);
+            (self.ffi.player_release)(self.mp);
+            (self.ffi.media_release)(self.media);
+        }
     }
 }
 
