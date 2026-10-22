@@ -12,7 +12,7 @@ use tauri_plugin_fs::FsExt;
 use url::Url;
 
 mod vlc_player;
-use vlc_player::{Libvlc, VlcStreamer, VlcStreamState};
+use vlc_player::{FileRecorder, Libvlc, VlcStreamer, VlcStreamState};
 
 // 构造统一的请求头
 fn get_headers() -> HeaderMap {
@@ -32,6 +32,25 @@ fn get_headers() -> HeaderMap {
         HeaderValue::from_static(r#"{"vendor":"apple","deviceId":"11111111-1111-1111-1111-111111111111","appVersion":"7.0.4","appBuild":"23011601","osVersion":"16.3.1","osType":"ios","deviceName":"iPhone XR","os":"ios"}"#)
     );
     headers
+}
+
+/// 口袋48录播的 m3u8 与 ts 分片要用这个 UA 请求，否则 CDN 直接拒绝。
+/// 不能复用 get_headers()：那里的 Host 是写死的 pocketapi.48.cn，
+/// CDN 请求的 Host 必须由 URL 自动推导。
+const ENGINE_USER_AGENT: &str = "SNH48 ENGINE";
+
+fn cdn_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(ENGINE_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn cdn_blocking_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent(ENGINE_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
 #[tauri::command]
@@ -76,6 +95,145 @@ async fn get_record_list(next: String) -> Result<Value, String> {
 
     let json: Value = res.json().await.map_err(|e| e.to_string())?;
     Ok(json)
+}
+
+/// 按成员查历史录播。
+/// 服务端有个坑：next 传 "0" 时带上 userId 是查不到数据的，要先拉一次不带 userId 的列表，
+/// 用第一条的 liveId 当 next 再查；如果那条正好就是目标成员，还要手动塞回结果头部。
+#[tauri::command]
+async fn get_user_record_list(
+    user_id: String,
+    next: String,
+    record: bool,
+    group_id: Option<i64>,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let post_list = |body: Value| {
+        let client = client.clone();
+        async move {
+            let res = client
+                .post("https://pocketapi.48.cn/live/api/v1/live/getLiveList")
+                .headers(get_headers())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            res.json::<Value>().await.map_err(|e| e.to_string())
+        }
+    };
+
+    let mut real_next = next.clone();
+    let mut first_item: Option<Value> = None;
+
+    if next == "0" || next.is_empty() {
+        let pre = post_list(serde_json::json!({
+            "debug": false,
+            "next": "0",
+            "groupId": group_id.unwrap_or(0),
+            "record": record
+        }))
+        .await?;
+        if let Some(first) = pre["content"]["liveList"].as_array().and_then(|l| l.first()) {
+            if let Some(live_id) = first["liveId"].as_str() {
+                real_next = live_id.to_string();
+            }
+            if first["userInfo"]["userId"].as_str() == Some(user_id.as_str()) {
+                first_item = Some(first.clone());
+            }
+        }
+    }
+
+    // userId 查询时不能同时带 groupId，否则服务端返回空列表
+    let mut body = serde_json::json!({
+        "debug": false,
+        "next": real_next,
+        "record": record
+    });
+    match user_id.parse::<i64>() {
+        Ok(id) => body["userId"] = serde_json::json!(id),
+        Err(_) => body["userId"] = serde_json::json!(user_id),
+    }
+
+    let mut json = post_list(body).await?;
+    if let Some(first) = first_item {
+        // 第一条正好是目标成员时，它被 next 过滤掉了，要补回列表头部
+        if let Some(list) = json["content"]["liveList"].as_array_mut() {
+            let already_there = list.first().and_then(|f| f["liveId"].as_str()) == first["liveId"].as_str();
+            if !already_there {
+                list.insert(0, first);
+            }
+        }
+    }
+
+    Ok(json)
+}
+
+/// 公演（剧场直播）列表：独立于成员直播的一套接口，next 传数字
+#[tauri::command]
+async fn get_open_live_list(next: String, record: bool, group_id: Option<i64>) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "debug": false,
+        "groupId": group_id.unwrap_or(0),
+        "next": next.parse::<i64>().unwrap_or(0),
+        "record": record
+    });
+
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getOpenLiveList")
+        .headers(get_headers())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: Value = res.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenLiveStream {
+    stream_name: String,
+    stream_type: i64,
+    stream_path: String,
+    vip_show: bool,
+}
+
+/// 公演流地址：走 getOpenLiveOne（不是 getLiveOne），返回带清晰度的多个流
+#[tauri::command]
+async fn get_open_live_streams(live_id: String) -> Result<Vec<OpenLiveStream>, String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({ "liveId": live_id });
+
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getOpenLiveOne")
+        .headers(get_headers())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: Value = res.json().await.map_err(|e| e.to_string())?;
+    let streams = json["content"]["playStreams"]
+        .as_array()
+        .ok_or_else(|| "公演没有可用的流地址".to_string())?;
+
+    let list: Vec<OpenLiveStream> = streams
+        .iter()
+        .map(|s| OpenLiveStream {
+            stream_name: s["streamName"].as_str().unwrap_or_default().to_string(),
+            stream_type: s["streamType"].as_i64().unwrap_or(0),
+            stream_path: s["streamPath"].as_str().unwrap_or_default().to_string(),
+            vip_show: s["vipShow"].as_bool().unwrap_or(false),
+        })
+        .filter(|s| !s.stream_path.is_empty())
+        .collect();
+
+    if list.is_empty() {
+        return Err("公演没有可用的流地址".to_string());
+    }
+    Ok(list)
 }
 
 /// 获取直播/录播流地址（从 getLiveOne 接口）
@@ -197,6 +355,118 @@ async fn get_playable_stream_url(live_id: String) -> Result<String, String> {
 
     // 所有接口都返回 RTMP，无法在浏览器中播放
     Err("所有可用流地址均为 RTMP 协议，浏览器无法直接播放".to_string())
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DanmuItem {
+    time: String,
+    current_time: f64,
+    nickname: String,
+    message: String,
+}
+
+/// "[00:05:43.453]" -> 秒
+fn parse_danmu_time(time: &str) -> Option<f64> {
+    let mut hms = time.split(':');
+    let hours = hms.next()?.parse::<f64>().ok()?;
+    let minutes = hms.next()?.parse::<f64>().ok()?;
+    let mut sec_ms = hms.next()?.split('.');
+    let seconds = sec_ms.next()?.parse::<f64>().ok()?;
+    let millis = sec_ms.next().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+    Some(hours * 3600.0 + minutes * 60.0 + seconds + millis / 1000.0)
+}
+
+/// 弹幕文件每行形如 `[HH:MM:SS.mmm]昵称<TAB>弹幕内容`
+fn parse_danmu_text(text: &str) -> Vec<DanmuItem> {
+    let mut list: Vec<DanmuItem> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix('[') else { continue };
+        let Some((time, no_time)) = rest.split_once(']') else { continue };
+        let Some(current_time) = parse_danmu_time(time) else { continue };
+
+        let mut parts = no_time.split('\t');
+        list.push(DanmuItem {
+            time: time.to_string(),
+            current_time,
+            nickname: parts.next().unwrap_or_default().to_string(),
+            message: parts.collect::<Vec<&str>>().join(""),
+        });
+    }
+
+    list.sort_by(|a, b| {
+        a.current_time
+            .partial_cmp(&b.current_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    list
+}
+
+async fn get_msg_file_path(live_id: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveOne")
+        .headers(get_headers())
+        .json(&serde_json::json!({ "liveId": live_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: Value = res.json().await.map_err(|e| e.to_string())?;
+    let path = json["content"]["msgFilePath"].as_str().unwrap_or_default();
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    if path.starts_with("http") {
+        return Ok(path.to_string());
+    }
+    Ok(format!("https://pocketapi.48.cn{}", path))
+}
+
+/// 录播弹幕：msgFilePath 为空或取不到都当作"没有弹幕"，不报错
+#[tauri::command]
+async fn get_record_danmu(live_id: String) -> Result<Vec<DanmuItem>, String> {
+    let file_path = match get_msg_file_path(&live_id).await {
+        Ok(path) => path,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if file_path.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let text = match reqwest::Client::new().get(&file_path).send().await {
+        Ok(res) => match res.text().await {
+            Ok(text) => text,
+            Err(_) => return Ok(Vec::new()),
+        },
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    Ok(parse_danmu_text(&text))
+}
+
+/// 下载弹幕文件到本地（文件很小，同步下完即可，不进下载任务队列）
+#[tauri::command]
+async fn download_danmu_file(live_id: String, save_path: String) -> Result<String, String> {
+    let file_path = get_msg_file_path(&live_id).await?;
+    if file_path.is_empty() {
+        return Err("弹幕文件不存在".to_string());
+    }
+
+    let res = reqwest::Client::new()
+        .get(&file_path)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+
+    std::fs::write(&save_path, &bytes).map_err(|e| e.to_string())?;
+    Ok(save_path)
 }
 
 #[tauri::command]
@@ -630,7 +900,7 @@ async fn download_via_content_resolver(
     live_id: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = cdn_client();
 
     if url.contains(".m3u8") {
         let res = client.get(url).send().await.map_err(|e| e.to_string())?;
@@ -665,7 +935,7 @@ async fn download_via_content_resolver(
             )
             .map_err(|e| e.to_string())?;
 
-            let sync_client = reqwest::blocking::Client::new();
+            let sync_client = cdn_blocking_client();
 
             for (index, line) in lines_data.iter().enumerate() {
                 if cancelled.load(Ordering::SeqCst) {
@@ -743,7 +1013,7 @@ async fn download_via_content_resolver(
             )
             .map_err(|e| e.to_string())?;
 
-            let sync_client = reqwest::blocking::Client::new();
+            let sync_client = cdn_blocking_client();
             let mut res = sync_client.get(&url).send().map_err(|e| e.to_string())?;
             let total_size = res.content_length().unwrap_or(0);
             let mut downloaded: u64 = 0;
@@ -810,77 +1080,183 @@ async fn download_via_std_fs(
     live_id: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = cdn_client();
 
     if url.contains(".m3u8") {
         let res = client.get(url).send().await.map_err(|e| e.to_string())?;
         let text = res.text().await.map_err(|e| e.to_string())?;
         let base_url = Url::parse(url).map_err(|e| e.to_string())?;
 
-        let mut file = std::fs::File::create(save_path).map_err(|e| e.to_string())?;
+        let mut used_names: HashMap<String, usize> = HashMap::new();
+        let mut segments: Vec<(String, String)> = Vec::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let ts_url = base_url.join(t).map_err(|e| e.to_string())?;
+            let raw_name = ts_url
+                .path()
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("segment.ts")
+                .to_string();
+            let counter = used_names.entry(raw_name.clone()).or_insert(0);
+            *counter += 1;
+            let name = if *counter == 1 {
+                raw_name
+            } else {
+                format!("{}_{}", raw_name, counter)
+            };
+            segments.push((name, ts_url.to_string()));
+        }
 
-        let lines: Vec<&str> = text
-            .lines()
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty() && !t.starts_with('#')
-            })
-            .collect();
+        let total_parts = segments.len();
+        if total_parts == 0 {
+            return Err("m3u8 中没有可用的分片".to_string());
+        }
 
-        let total_parts = lines.len();
+        let app_handle = app_handle.clone();
+        let save_path = save_path.to_string();
+        let live_id = live_id.to_string();
+        let cancelled = cancelled.clone();
 
-        for (index, line) in lines.iter().enumerate() {
-            if cancelled.load(Ordering::SeqCst) {
-                drop(file);
-                let _ = std::fs::remove_file(save_path);
+        // 分片下载 + 合并是同步文件操作，放到 blocking 线程里做，重试可以直接 sleep
+        tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            let cache_dir = std::path::PathBuf::from(format!("{}.cache", save_path));
+            std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+
+            let sync_client = cdn_blocking_client();
+
+            let emit_progress = |done: usize, merging: bool| {
+                let progress = if merging {
+                    100.0
+                } else {
+                    (done as f64 / total_parts as f64) * 100.0
+                };
                 let _ = app_handle.emit(
                     "download-status",
                     DownloadEvent {
-                        status: "cancelled".to_string(),
-                        message: save_path.to_string(),
-                        progress: 0.0,
-                        live_id: live_id.to_string(),
+                        status: "progress".to_string(),
+                        message: if merging {
+                            format!("{} (合并分片中)", save_path)
+                        } else {
+                            save_path.clone()
+                        },
+                        progress,
+                        live_id: live_id.clone(),
                     },
                 );
-                return Ok(());
-            }
+            };
 
-            let ts_url = base_url.join(line).map_err(|e| e.to_string())?;
-            let mut chunk_res = client
-                .get(ts_url)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            while let Some(chunk) = chunk_res.chunk().await.map_err(|e| e.to_string())? {
+            let mut done = 0usize;
+            for (name, ts_url) in &segments {
                 if cancelled.load(Ordering::SeqCst) {
-                    drop(file);
-                    let _ = std::fs::remove_file(save_path);
+                    // 保留 .cache，"重试下载"可以从头续传
                     let _ = app_handle.emit(
                         "download-status",
                         DownloadEvent {
                             status: "cancelled".to_string(),
-                            message: save_path.to_string(),
+                            message: save_path.clone(),
                             progress: 0.0,
-                            live_id: live_id.to_string(),
+                            live_id: live_id.clone(),
                         },
                     );
                     return Ok(());
                 }
-                file.write_all(&chunk).map_err(|e| e.to_string())?;
+
+                let local = cache_dir.join(name);
+                let part = cache_dir.join(format!("{}.part", name));
+
+                // 已经下好的分片直接跳过，这就是断点续传；0 字节的坏文件删掉重下
+                match std::fs::metadata(&local) {
+                    Ok(meta) if meta.len() > 0 => {
+                        done += 1;
+                        emit_progress(done, false);
+                        continue;
+                    }
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&local);
+                    }
+                    Err(_) => {}
+                }
+                let _ = std::fs::remove_file(&part);
+
+                let mut last_err = String::new();
+                for attempt in 0..3u64 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1000 << attempt));
+                    }
+                    match sync_client.get(ts_url).send() {
+                        Ok(mut resp) => {
+                            match (|| -> Result<(), String> {
+                                let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+                                std::io::copy(&mut resp, &mut file).map_err(|e| e.to_string())?;
+                                file.flush().map_err(|e| e.to_string())?;
+                                Ok(())
+                            })() {
+                                Ok(_) => {
+                                    last_err.clear();
+                                    break;
+                                }
+                                Err(e) => last_err = e,
+                            }
+                        }
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+
+                if cancelled.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&part);
+                    let _ = app_handle.emit(
+                        "download-status",
+                        DownloadEvent {
+                            status: "cancelled".to_string(),
+                            message: save_path.clone(),
+                            progress: 0.0,
+                            live_id: live_id.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
+
+                if !local_exists(&part) {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(format!("分片 {} 下载失败: {}", name, last_err));
+                }
+                std::fs::rename(&part, &local).map_err(|e| e.to_string())?;
+
+                done += 1;
+                emit_progress(done, false);
             }
 
-            let progress = (index as f64 + 1.0) / (total_parts as f64) * 100.0;
-            let _ = app_handle.emit(
-                "download-status",
-                DownloadEvent {
-                    status: "progress".to_string(),
-                    message: save_path.to_string(),
-                    progress,
-                    live_id: live_id.to_string(),
-                },
-            );
-        }
+            // 全部分片就位后才合并成一个 .ts：MPEG-TS 按字节顺序拼接即可
+            emit_progress(done, true);
+            let mut missing = 0usize;
+            for (name, _) in &segments {
+                if !local_exists(&cache_dir.join(name)) {
+                    missing += 1;
+                }
+            }
+            if missing > 0 {
+                return Err(format!("有 {} 个分片缺失，点击重试继续下载", missing));
+            }
+
+            let out_file = std::fs::File::create(&save_path).map_err(|e| e.to_string())?;
+            let mut writer = std::io::BufWriter::with_capacity(1_048_576, out_file);
+            for (name, _) in &segments {
+                let mut seg = std::fs::File::open(cache_dir.join(name)).map_err(|e| e.to_string())?;
+                std::io::copy(&mut seg, &mut writer).map_err(|e| e.to_string())?;
+            }
+            writer.flush().map_err(|e| e.to_string())?;
+            drop(writer);
+
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     } else {
         let mut res = client.get(url).send().await.map_err(|e| e.to_string())?;
         let mut file = std::fs::File::create(save_path).map_err(|e| e.to_string())?;
@@ -932,6 +1308,272 @@ async fn download_via_std_fs(
     );
 
     Ok(())
+}
+
+fn local_exists(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+// ===== 直播录制（独立 libVLC 会话，只落盘不上屏） =====
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveRecordStatus {
+    live_id: String,
+    status: String,
+    file_path: String,
+    elapsed: f64,
+    message: String,
+}
+
+struct RecordSession {
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<LiveRecordStatus>>,
+}
+
+type LiveRecordMap = Arc<Mutex<HashMap<String, RecordSession>>>;
+
+const MAX_RECORD_SESSIONS: usize = 5;
+
+/// 断流续录后的分段文件名：name(1).ts、name(2).ts
+fn retry_output_path(save_path: &str, index: usize) -> String {
+    let path = std::path::Path::new(save_path);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "record".to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_else(|| ".ts".to_string());
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+    dir.join(format!("{}({}){}", stem, index, ext))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn blocking_get_play_stream_path(live_id: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::new();
+    let res = client
+        .post("https://pocketapi.48.cn/live/api/v1/live/getLiveOne")
+        .headers(get_headers())
+        .json(&serde_json::json!({ "liveId": live_id }))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let json: Value = res.json().map_err(|e| e.to_string())?;
+    Ok(json["content"]["playStreamPath"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// 录制线程：持有自己的 FileRecorder，断流后按 48tools 的策略等 60 秒重新解析流地址续录
+fn run_record_thread(
+    app_handle: tauri::AppHandle,
+    map: LiveRecordMap,
+    live_id: String,
+    url: String,
+    save_path: String,
+    stop: Arc<AtomicBool>,
+    shared: Arc<Mutex<LiveRecordStatus>>,
+) {
+    let publish = |status_str: &str, file_path: &str, message: &str| {
+        if let Ok(mut s) = shared.lock() {
+            s.status = status_str.to_string();
+            s.file_path = file_path.to_string();
+            s.message = message.to_string();
+        }
+        if let Ok(s) = shared.lock() {
+            let _ = app_handle.emit("live-record-status", s.clone());
+        }
+    };
+
+    let mut recorder = match FileRecorder::start(&url, &save_path) {
+        Ok(recorder) => recorder,
+        Err(e) => {
+            publish("error", &save_path, &e);
+            if let Ok(mut sessions) = map.lock() {
+                sessions.remove(&live_id);
+            }
+            return;
+        }
+    };
+
+    let mut segment_start = std::time::Instant::now();
+    let mut current_url = url.clone();
+    let mut current_path = save_path.clone();
+    let mut retry_index = 0usize;
+    let mut final_status = "stopped";
+    let mut final_message = String::new();
+    // libvlc 返回 0 之后还要缓冲才进入 Playing，这段时间不能当成断流
+    let mut ever_playing = false;
+    let mut recorded = std::time::Duration::ZERO;
+
+    publish("recording", &current_path, "");
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if !recorder.is_playing() {
+            if !ever_playing {
+                if segment_start.elapsed().as_secs() < 30 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
+                final_status = "error";
+                final_message = "VLC 未能开始录制".to_string();
+                break;
+            }
+
+            // player_is_playing 归零：流断了（主播下播或掉线）
+            publish("retrying", &current_path, "直播中断，60 秒后尝试续录");
+            let mut stopped_by_user = false;
+            for _ in 0..60 {
+                if stop.load(Ordering::SeqCst) {
+                    stopped_by_user = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if stopped_by_user {
+                break;
+            }
+
+            match blocking_get_play_stream_path(&live_id) {
+                Ok(new_url) if !new_url.is_empty() && new_url != current_url => {
+                    retry_index += 1;
+                    let new_path = retry_output_path(&save_path, retry_index);
+                    match recorder.restart(&new_url, &new_path) {
+                        Ok(()) => {
+                            current_url = new_url;
+                            current_path = new_path.clone();
+                            ever_playing = false;
+                            segment_start = std::time::Instant::now();
+                            publish(
+                                "recording",
+                                &new_path,
+                                &format!("主播重连，续录到第 {} 个文件", retry_index),
+                            );
+                        }
+                        Err(e) => {
+                            final_status = "error";
+                            final_message = e;
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    final_status = "error";
+                    final_message = e;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        ever_playing = true;
+        recorded += std::time::Duration::from_secs(1);
+        if let Ok(mut s) = shared.lock() {
+            s.elapsed = recorded.as_secs_f64();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    if stop.load(Ordering::SeqCst) {
+        final_status = "stopped";
+        final_message = "已手动停止录制".to_string();
+    }
+    publish(final_status, &current_path, &final_message);
+
+    drop(recorder);
+    if let Ok(mut sessions) = map.lock() {
+        sessions.remove(&live_id);
+    }
+}
+
+#[tauri::command]
+async fn start_live_record(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, LiveRecordMap>,
+    live_id: String,
+    url: String,
+    save_path: String,
+) -> Result<LiveRecordStatus, String> {
+    let map = state.inner().clone();
+    let (stop, shared) = {
+        let mut sessions = map.lock().map_err(|e| e.to_string())?;
+        if sessions.contains_key(&live_id) {
+            return Err("该直播已经在录制中".to_string());
+        }
+        if sessions.len() >= MAX_RECORD_SESSIONS {
+            return Err(format!("同时录制数量已达上限（{}）", MAX_RECORD_SESSIONS));
+        }
+        let shared = Arc::new(Mutex::new(LiveRecordStatus {
+            live_id: live_id.clone(),
+            status: "recording".to_string(),
+            file_path: save_path.clone(),
+            elapsed: 0.0,
+            message: String::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        sessions.insert(
+            live_id.clone(),
+            RecordSession {
+                stop: stop.clone(),
+                status: shared.clone(),
+            },
+        );
+        (stop, shared)
+    };
+
+    let initial = shared.lock().map_err(|e| e.to_string())?.clone();
+    std::thread::spawn(move || {
+        run_record_thread(app_handle, map, live_id, url, save_path, stop, shared)
+    });
+
+    Ok(initial)
+}
+
+#[tauri::command]
+async fn stop_live_record(live_id: String, state: tauri::State<'_, LiveRecordMap>) -> Result<(), String> {
+    let sessions = state.inner().lock().map_err(|e| e.to_string())?;
+    match sessions.get(&live_id) {
+        Some(session) => {
+            session.stop.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        None => Err("该直播没有在录制".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_live_record_list(
+    state: tauri::State<'_, LiveRecordMap>,
+) -> Result<Vec<LiveRecordStatus>, String> {
+    let sessions = state.inner().lock().map_err(|e| e.to_string())?;
+    let mut list = Vec::with_capacity(sessions.len());
+    for session in sessions.values() {
+        if let Ok(status) = session.status.lock() {
+            list.push(status.clone());
+        }
+    }
+    Ok(list)
+}
+
+/// 自动抓取日志：往保存目录追加 pocket48_live_log.txt
+#[tauri::command]
+fn append_record_log(dir: String, content: String) -> Result<(), String> {
+    let path = std::path::Path::new(&dir).join("pocket48_live_log.txt");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("写入 {} 失败: {}", path.display(), e))?;
+    writeln!(file, "{}", content).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())
 }
 
 // ===== Mini-Player Window Commands =====
@@ -1069,11 +1711,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .manage::<CancelMap>(Arc::new(Mutex::new(HashMap::new())))
+        .manage::<LiveRecordMap>(Arc::new(Mutex::new(HashMap::new())))
         .manage(VlcStreamState(Mutex::new(VlcStreamer::new())))
         .manage(MiniPlayerState::default())
         .invoke_handler(tauri::generate_handler![
             get_live_list,
             get_record_list,
+            get_user_record_list,
+            get_open_live_list,
+            get_open_live_streams,
+            get_record_danmu,
+            download_danmu_file,
             get_live_stream_url,
             get_live_stream_url_v2,
             get_playable_stream_url,
@@ -1087,6 +1735,10 @@ pub fn run() {
             vlc_stream_running,
             download_video,
             cancel_download,
+            start_live_record,
+            stop_live_record,
+            get_live_record_list,
+            append_record_log,
             create_mini_player,
             get_mini_player_config,
             close_mini_player,

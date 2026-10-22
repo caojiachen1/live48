@@ -2,8 +2,24 @@ import { useState, useMemo } from "react";
 import { Checkbox, Input, Button, Text } from "@fluentui/react-components";
 import { DismissRegular, SearchRegular, FilterRegular, DeleteRegular } from "@fluentui/react-icons";
 
-const GROUPS = ["SNH48", "GNZ48", "BEJ48", "CKG48", "CGT48"];
-const TYPES = ["视频", "电台", "连麦", "游戏", "AI"];
+// 团体 ID 就是口袋48 服务端用的 groupId（公演列表 / 按成员查录播都要它）
+export const GROUPS: { name: string; id: number }[] = [
+  { name: "SNH48", id: 10 },
+  { name: "BEJ48", id: 11 },
+  { name: "GNZ48", id: 12 },
+  { name: "CKG48", id: 14 },
+  { name: "IDFT", id: 15 },
+  { name: "海外练习生", id: 16 },
+  { name: "THE9", id: 17 },
+  { name: "硬糖少女303", id: 18 },
+  { name: "明星殿堂", id: 19 },
+  { name: "丝芭影视", id: 20 },
+  { name: "CGT48", id: 21 },
+];
+
+// 只有带团名的分组能用来按昵称前缀筛选成员直播
+export const TEAM_GROUPS = GROUPS.filter((g) => /48$/.test(g.name));
+const TYPES = ["视频", "电台", "连麦", "录屏", "游戏", "AI"];
 
 interface FilterPreset {
   name: string;
@@ -14,10 +30,15 @@ interface FilterPreset {
   dateEnd: string;
 }
 
+interface MemberInfo {
+  nickname: string;
+  userId?: string;
+}
+
 interface FilterPanelProps {
   open: boolean;
   onClose: () => void;
-  activeTab: "live" | "record";
+  activeTab: "live" | "record" | "open";
   // Current filter state
   filterGroups: string[];
   filterTypes: string[];
@@ -31,7 +52,10 @@ interface FilterPanelProps {
   onDateStartChange: (v: string) => void;
   onDateEndChange: (v: string) => void;
   // Data for member list
-  allNicknames: string[];
+  allMembers: MemberInfo[];
+  // 只看该成员录播（服务端 userId 查询）
+  onlyMember: { nickname: string; userId: string } | null;
+  onOnlyMemberChange: (value: { nickname: string; userId: string } | null) => void;
 }
 
 const STORAGE_KEY = "live48_filter_presets";
@@ -63,7 +87,9 @@ function FilterPanel({
   onMembersChange,
   onDateStartChange,
   onDateEndChange,
-  allNicknames,
+  allMembers,
+  onlyMember,
+  onOnlyMemberChange,
 }: FilterPanelProps) {
   const [memberSearch, setMemberSearch] = useState("");
   const [presetName, setPresetName] = useState("");
@@ -72,11 +98,13 @@ function FilterPanel({
   const allGroupsSelected = filterGroups.length === 0;
   const allTypesSelected = filterTypes.length === 0;
 
-  const filteredNicknames = useMemo(() => {
-    if (!memberSearch) return allNicknames;
+  const filteredMembers = useMemo(() => {
+    if (!memberSearch) return allMembers;
     const q = memberSearch.toLowerCase();
-    return allNicknames.filter((n) => n.toLowerCase().includes(q));
-  }, [allNicknames, memberSearch]);
+    return allMembers.filter(
+      (m) => m.nickname.toLowerCase().includes(q) || (m.userId ?? "").includes(q)
+    );
+  }, [allMembers, memberSearch]);
 
   const toggleGroup = (group: string) => {
     if (filterGroups.includes(group)) {
@@ -108,6 +136,7 @@ function FilterPanel({
     onMembersChange([]);
     onDateStartChange("");
     onDateEndChange("");
+    onOnlyMemberChange(null);
   };
 
   const handleSavePreset = () => {
@@ -214,10 +243,10 @@ function FilterPanel({
             <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 16px" }}>
               {GROUPS.map((g) => (
                 <Checkbox
-                  key={g}
-                  label={g}
-                  checked={allGroupsSelected || filterGroups.includes(g)}
-                  onChange={() => toggleGroup(g)}
+                  key={g.id}
+                  label={g.name}
+                  checked={allGroupsSelected || filterGroups.includes(g.name)}
+                  onChange={() => toggleGroup(g.name)}
                 />
               ))}
             </div>
@@ -256,18 +285,39 @@ function FilterPanel({
                 gap: "4px",
               }}
             >
-              {filteredNicknames.length === 0 ? (
+              {filteredMembers.length === 0 ? (
                 <Text size={200} style={{ color: "rgba(255,255,255,0.3)", padding: "8px 0" }}>
                   无匹配成员
                 </Text>
               ) : (
-                filteredNicknames.map((nick) => (
-                  <Checkbox
-                    key={nick}
-                    label={nick}
-                    checked={filterMembers.length === 0 || filterMembers.includes(nick)}
-                    onChange={() => toggleMember(nick)}
-                  />
+                filteredMembers.map((member) => (
+                  <div
+                    key={member.nickname}
+                    style={{ display: "flex", alignItems: "center", gap: "8px" }}
+                  >
+                    <Checkbox
+                      label={member.nickname}
+                      checked={filterMembers.length === 0 || filterMembers.includes(member.nickname)}
+                      onChange={() => toggleMember(member.nickname)}
+                      style={{ flex: 1, minWidth: 0 }}
+                    />
+                    {member.userId && (
+                      <Button
+                        appearance={onlyMember?.userId === member.userId ? "primary" : "subtle"}
+                        size="small"
+                        title="只看该成员录播"
+                        onClick={() =>
+                          onOnlyMemberChange(
+                            onlyMember?.userId === member.userId
+                              ? null
+                              : { nickname: member.nickname, userId: member.userId as string }
+                          )
+                        }
+                      >
+                        只看TA录播
+                      </Button>
+                    )}
+                  </div>
                 ))
               )}
             </div>
@@ -279,6 +329,16 @@ function FilterPanel({
                 style={{ marginTop: "4px", alignSelf: "flex-start" }}
               >
                 清除成员筛选
+              </Button>
+            )}
+            {onlyMember && (
+              <Button
+                appearance="subtle"
+                size="small"
+                onClick={() => onOnlyMemberChange(null)}
+                style={{ marginTop: "4px", alignSelf: "flex-start" }}
+              >
+                取消“只看 {onlyMember.nickname} 录播”
               </Button>
             )}
           </Section>

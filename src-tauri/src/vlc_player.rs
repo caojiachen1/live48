@@ -782,6 +782,99 @@ impl VlcStreamer {
     }
 }
 
+/// 直播录制会话：独立于 VlcStreamer 的一路 libVLC 播放，只走 sout 输出到文件、不上屏。
+/// Libvlc 句柄整体 living 在这个结构里（由录制线程独占），因此不需要跨线程传裸指针。
+pub struct FileRecorder {
+    libvlc: Libvlc,
+    instance: VlcInstancePtr,
+    media: Option<VlcMediaPtr>,
+    player: Option<VlcPlayerPtr>,
+    pub output_path: String,
+}
+
+impl FileRecorder {
+    pub fn start(url: &str, output_path: &str) -> Result<Self, String> {
+        let libvlc = Libvlc::load()?;
+        let instance = libvlc.create_instance()?;
+        let mut recorder = FileRecorder {
+            libvlc,
+            instance,
+            media: None,
+            player: None,
+            output_path: String::new(),
+        };
+        recorder.play(url, output_path)?;
+        Ok(recorder)
+    }
+
+    fn play(&mut self, url: &str, output_path: &str) -> Result<(), String> {
+        self.stop_media();
+
+        let sout = format!(
+            ":sout=#std{{access=file,mux=ts,dst=\"{}\"}}",
+            output_path.replace('\\', "/")
+        );
+        let media = self.libvlc.create_media(self.instance.0, url)?;
+        self.libvlc.add_media_option(media.0, &sout)?;
+        self.libvlc.add_media_option(media.0, ":sout-keep")?;
+        // 录制这一路不建视频窗口、不开音频，否则每录一条就会弹一个 VLC 窗口并白白解码
+        self.libvlc.add_media_option(media.0, ":no-video")?;
+        self.libvlc.add_media_option(media.0, ":no-audio")?;
+
+        let player = self.libvlc.create_player(self.instance.0)?;
+        unsafe { (self.libvlc.player_set_media)(player.0, media.0) };
+        let ret = unsafe { (self.libvlc.player_play)(player.0) };
+        if ret != 0 {
+            unsafe {
+                (self.libvlc.media_release)(media.0);
+                (self.libvlc.player_release)(player.0);
+            }
+            return Err("VLC 录制启动失败".to_string());
+        }
+
+        self.media = Some(media);
+        self.player = Some(player);
+        self.output_path = output_path.to_string();
+        Ok(())
+    }
+
+    /// 断流后用新地址续录到另一个文件
+    pub fn restart(&mut self, url: &str, output_path: &str) -> Result<(), String> {
+        self.play(url, output_path)
+    }
+
+    pub fn is_playing(&self) -> bool {
+        match self.player.as_ref() {
+            Some(p) => unsafe { (self.libvlc.player_is_playing)(p.0) != 0 },
+            None => false,
+        }
+    }
+
+    fn stop_media(&mut self) {
+        if let Some(ref player) = self.player {
+            unsafe { (self.libvlc.player_stop)(player.0) };
+        }
+        if let Some(ref media) = self.media {
+            unsafe { (self.libvlc.media_release)(media.0) };
+        }
+        if let Some(ref player) = self.player {
+            unsafe { (self.libvlc.player_release)(player.0) };
+        }
+        self.media = None;
+        self.player = None;
+    }
+}
+
+impl Drop for FileRecorder {
+    fn drop(&mut self) {
+        self.stop_media();
+        unsafe { (self.libvlc.release)(self.instance.0) };
+    }
+}
+
+unsafe impl Send for FileRecorder {}
+unsafe impl Sync for FileRecorder {}
+
 /// HTTP 服务器：从 MPEG-TS 文件读取并流式输出，带 CORS 支持
 /// 新客户端连上时的起播位置：从文件末尾回看一小段，取窗口内最后一个 H.264 关键帧
 /// （优先 SPS，其次 IDR）所在的 TS 包。

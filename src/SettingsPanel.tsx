@@ -1,10 +1,41 @@
 import { useCallback, useEffect, useState } from "react";
-import { Radio, RadioGroup, Text, Button, ProgressBar } from "@fluentui/react-components";
-import { DismissRegular, SettingsRegular, ArrowDownloadRegular } from "@fluentui/react-icons";
+import { Checkbox, Input, Radio, RadioGroup, Text, Button, ProgressBar } from "@fluentui/react-components";
+import { DismissRegular, SettingsRegular, ArrowDownloadRegular, FolderOpenRegular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 export type PlayerMode = "system" | "vlc" | "builtin";
+
+export interface AutoGrabConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+  users: string;
+  dir: string;
+}
+
+const AUTO_GRAB_KEY = "autoGrabConfig";
+
+export function loadAutoGrabConfig(): AutoGrabConfig {
+  const fallback: AutoGrabConfig = { enabled: false, intervalMinutes: 10, users: "", dir: "" };
+  try {
+    const raw = localStorage.getItem(AUTO_GRAB_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<AutoGrabConfig>;
+    return {
+      enabled: !!parsed.enabled,
+      intervalMinutes: Number(parsed.intervalMinutes) > 0 ? Number(parsed.intervalMinutes) : 10,
+      users: typeof parsed.users === "string" ? parsed.users : "",
+      dir: typeof parsed.dir === "string" ? parsed.dir : ""
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+export function saveAutoGrabConfig(config: AutoGrabConfig) {
+  localStorage.setItem(AUTO_GRAB_KEY, JSON.stringify(config));
+}
 
 interface SettingsPanelProps {
   open: boolean;
@@ -13,6 +44,9 @@ interface SettingsPanelProps {
   onPlayerModeChange: (mode: PlayerMode) => void;
   vlcPlaying: boolean;
   onVlcStop: () => void;
+  autoGrab: AutoGrabConfig;
+  onAutoGrabChange: (config: AutoGrabConfig) => void;
+  recordingCount: number;
 }
 
 interface VlcDownloadProgress {
@@ -20,7 +54,7 @@ interface VlcDownloadProgress {
   message: string;
 }
 
-function SettingsPanel({ open, onClose, playerMode, onPlayerModeChange, vlcPlaying, onVlcStop }: SettingsPanelProps) {
+function SettingsPanel({ open, onClose, playerMode, onPlayerModeChange, vlcPlaying, onVlcStop, autoGrab, onAutoGrabChange, recordingCount }: SettingsPanelProps) {
   const [vlcAvailable, setVlcAvailable] = useState<boolean | null>(null);
   const [vlcIntegrated, setVlcIntegrated] = useState<boolean | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -323,6 +357,66 @@ function SettingsPanel({ open, onClose, playerMode, onPlayerModeChange, vlcPlayi
                 停止 VLC 播放
               </Button>
             )}
+          </div>
+
+          {/* 自动抓取（挂机录制） */}
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+              padding: "16px",
+              backgroundColor: "rgba(255,255,255,0.04)",
+              borderRadius: "8px",
+            }}
+          >
+            <Text size={300} weight="semibold" style={{ color: "rgba(255,255,255,0.7)" }}>
+              自动抓取（挂机录制）
+            </Text>
+            <Checkbox
+              label="启用定时抓取直播"
+              checked={autoGrab.enabled}
+              onChange={(_, data) => onAutoGrabChange({ ...autoGrab, enabled: !!data.checked })}
+            />
+            <Input
+              contentBefore={<Text size={200} style={{ color: "rgba(255,255,255,0.5)" }}>间隔</Text>}
+              placeholder="刷新间隔（分钟）"
+              type="number"
+              min={1}
+              value={String(autoGrab.intervalMinutes)}
+              onChange={(_, data) => onAutoGrabChange({ ...autoGrab, intervalMinutes: Math.max(1, Number(data.value) || 1) })}
+              disabled={!autoGrab.enabled}
+            />
+            <Input
+              contentBefore={<Text size={200} style={{ color: "rgba(255,255,255,0.5)" }}>成员</Text>}
+              placeholder="监听成员，逗号分隔的姓名或 ID"
+              value={autoGrab.users}
+              onChange={(_, data) => onAutoGrabChange({ ...autoGrab, users: data.value })}
+              disabled={!autoGrab.enabled}
+            />
+            <div style={{ display: "flex", gap: "8px" }}>
+              <Input
+                placeholder="保存目录"
+                value={autoGrab.dir}
+                onChange={(_, data) => onAutoGrabChange({ ...autoGrab, dir: data.value })}
+                disabled={!autoGrab.enabled}
+                style={{ flex: 1 }}
+              />
+              <Button
+                icon={<FolderOpenRegular />}
+                disabled={!autoGrab.enabled}
+                onClick={async () => {
+                  const dir = await openDialog({ directory: true, defaultPath: autoGrab.dir || undefined });
+                  if (typeof dir === "string") onAutoGrabChange({ ...autoGrab, dir });
+                }}
+              >
+                选择
+              </Button>
+            </div>
+            <Text size={200} style={{ color: "var(--colorNeutralForeground3)", lineHeight: 1.5 }}>
+              姓名按正则匹配昵称；命中且当前没在录的成员会自动开录，并在保存目录追加
+              pocket48_live_log.txt。同时录制上限 5 路，当前 {recordingCount} 路。
+            </Text>
           </div>
         </div>
       </div>

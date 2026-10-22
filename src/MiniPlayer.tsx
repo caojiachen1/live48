@@ -126,6 +126,14 @@ function MiniPlayer() {
               maxMaxBufferLength: 60,
               startLevel: -1,
               capLevelToPlayerSize: true,
+              // 录播 m3u8/ts 要 SNH48 ENGINE 的 UA；webview 拒绝设置时由 Rust 下载路径兜底
+              xhrSetup: (xhr) => {
+                try {
+                  xhr.setRequestHeader("User-Agent", "SNH48 ENGINE");
+                } catch {
+                  console.warn("浏览器拒绝设置 User-Agent");
+                }
+              },
             });
             hls.loadSource(resolvedUrl);
             hls.attachMedia(video);

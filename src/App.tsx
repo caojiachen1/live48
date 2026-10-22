@@ -22,12 +22,12 @@ import {
   Tab,
   ProgressBar
 } from "@fluentui/react-components";
-import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular, SettingsRegular } from "@fluentui/react-icons";
+import { PlayRegular, CopyRegular, ArrowClockwiseRegular, SearchRegular, ArrowDownloadRegular, DismissRegular, FilterRegular, SettingsRegular, RecordRegular, StopRegular, NotepadRegular } from "@fluentui/react-icons";
 import VideoPlayer from "./VideoPlayer";
 import MiniPlayer from "./MiniPlayer";
-import FilterPanel from "./FilterPanel";
-import SettingsPanel from "./SettingsPanel";
-import type { PlayerMode } from "./SettingsPanel";
+import FilterPanel, { GROUPS, TEAM_GROUPS } from "./FilterPanel";
+import SettingsPanel, { loadAutoGrabConfig, saveAutoGrabConfig } from "./SettingsPanel";
+import type { PlayerMode, AutoGrabConfig } from "./SettingsPanel";
 import dayjs from "dayjs";
 import "./App.android.css";
 
@@ -37,18 +37,52 @@ interface NativeAndroidPlayerBridge {
   playPlaylist?: (playlistJson: string, startIndex: number, isLive: boolean) => void;
 }
 
+type TabKey = "live" | "record" | "open";
+type ItemKind = "pocket" | "open";
+
 interface LiveItem {
   liveId: string;
   title: string;
   coverPath: string;
   liveType: number;
+  liveMode?: number;
+  roomId?: string;
+  status?: number;
   inMicrophoneConnection?: boolean;
   ctime?: string;
+  kind?: ItemKind;
   userInfo: {
     nickname: string;
     avatar: string;
+    userId?: string;
   };
 }
+
+interface OpenLiveItem {
+  liveId: string;
+  title: string;
+  subTitle?: string;
+  status: number;
+  stime?: string;
+  kind: ItemKind;
+}
+
+interface LiveRecordStatus {
+  liveId: string;
+  status: "recording" | "retrying" | "stopped" | "error" | string;
+  filePath: string;
+  elapsed: number;
+  message: string;
+}
+
+interface OpenLiveStream {
+  streamName: string;
+  streamType: number;
+  streamPath: string;
+  vipShow: boolean;
+}
+
+const TAB_ORDER: TabKey[] = ["live", "record", "open"];
 
 const getLiveTypeBadge = (type: number) => {
   let text = "未知";
@@ -62,6 +96,41 @@ const getLiveTypeBadge = (type: number) => {
   return { text, color };
 };
 
+// liveMode 1 是录屏，优先级高于类型标签
+const getItemBadge = (item: LiveItem) =>
+  item.liveMode === 1 ? { text: "录屏", color: "blue" } : getLiveTypeBadge(item.liveType);
+
+const FILE_TIME_FORMAT = "YYYY-MM-DD~HH.mm.ss";
+const ILLEGAL_FILE_CHARS = /[\\/:*?"<>|]/g;
+
+// [类型]_昵称_标题_开播时间__创建时间.ext
+function buildFileName(
+  typeTitle: string,
+  nickname: string,
+  title: string,
+  openTime: string | number | undefined,
+  ext: string
+): string {
+  const safeNickname = (nickname || "未知").replace(ILLEGAL_FILE_CHARS, "");
+  const safeTitle = (title || "无标题").replace(ILLEGAL_FILE_CHARS, "");
+  const start = openTime ? dayjs(Number(openTime)).format(FILE_TIME_FORMAT) : dayjs().format(FILE_TIME_FORMAT);
+  const created = dayjs().format(FILE_TIME_FORMAT);
+  return `[${typeTitle}]_${safeNickname}_${safeTitle}_${start}__${created}.${ext}`;
+}
+
+function joinPath(dir: string, name: string): string {
+  return `${dir.replace(/[\\/]+$/, "")}/${name}`;
+}
+
+function formatElapsed(seconds: number): string {
+  const total = Math.floor(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
 function App() {
   // Mini-player mode: render standalone MiniPlayer instead of full app
   const isMiniPlayer = new URLSearchParams(window.location.search).get("mini") === "true";
@@ -69,23 +138,31 @@ function App() {
     return <MiniPlayer />;
   }
 
-  const [activeTab, setActiveTab] = useState<"live" | "record">("live");
+  const [activeTab, setActiveTab] = useState<TabKey>("live");
   const [lives, setLives] = useState<LiveItem[]>([]);
   const [records, setRecords] = useState<LiveItem[]>([]);
   const [recordNext, setRecordNext] = useState<string>("0");
+  const [openLives, setOpenLives] = useState<OpenLiveItem[]>([]);
+  const [openRecords, setOpenRecords] = useState<OpenLiveItem[]>([]);
+  const [openRecordNext, setOpenRecordNext] = useState<string>("0");
+  const [openGroupId, setOpenGroupId] = useState<number>(0);
   const [targetLoadTime, setTargetLoadTime] = useState<number>(0);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [downloadProgresses, setDownloadProgresses] = useState<Record<string, number>>({});
+  const [downloadTasks, setDownloadTasks] = useState<Record<string, { url: string; savePath: string }>>({});
+  const [downloadErrors, setDownloadErrors] = useState<Record<string, string>>({});
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
   const [filterTypes, setFilterTypes] = useState<string[]>([]);
   const [filterMembers, setFilterMembers] = useState<string[]>([]);
+  const [onlyMember, setOnlyMember] = useState<{ nickname: string; userId: string } | null>(null);
   const [filterDateStart, setFilterDateStart] = useState("");
   const [filterDateEnd, setFilterDateEnd] = useState("");
   const [filterPanelOpen, setFilterPanelOpen] = useState(false);
   const [pullDistance, setPullDistance] = useState(0);
   const [pullRefreshing, setPullRefreshing] = useState(false);
   const [swipeTranslation, setSwipeTranslation] = useState(0);
+  const [recordings, setRecordings] = useState<Record<string, LiveRecordStatus>>({});
   
   // Settings state
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -97,10 +174,19 @@ function App() {
     return "system";
   });
   const [vlcPlaying, setVlcPlaying] = useState(false);
+  const [autoGrab, setAutoGrab] = useState<AutoGrabConfig>(() => loadAutoGrabConfig());
+  const autoGrabRef = useRef<AutoGrabConfig>(autoGrab);
+  autoGrabRef.current = autoGrab;
+  const autoGrabRanRef = useRef(false);
 
   const handlePlayerModeChange = (mode: PlayerMode) => {
     setPlayerMode(mode);
     localStorage.setItem("playerMode", mode);
+  };
+
+  const handleAutoGrabChange = (config: AutoGrabConfig) => {
+    setAutoGrab(config);
+    saveAutoGrabConfig(config);
   };
 
   const handleVlcStop = async () => {
@@ -116,6 +202,7 @@ function App() {
   const [playingList, setPlayingList] = useState<LiveItem[]>([]);
   const [playingIndex, setPlayingIndex] = useState<number>(-1);
   const [playingUrl, setPlayingUrl] = useState<string>("");
+  const [playingIsLive, setPlayingIsLive] = useState<boolean>(true);
   const rootRef = useRef<HTMLDivElement>(null);
   const gestureRef = useRef({
     startX: 0,
@@ -132,7 +219,7 @@ function App() {
     try {
       const res: any = await invoke("get_live_list");
       if (res.content && res.content.liveList) {
-        setLives(res.content.liveList);
+        setLives((res.content.liveList as LiveItem[]).map((item) => ({ ...item, kind: "pocket" as ItemKind })));
       }
     } catch (e) {
       console.error(e);
@@ -140,7 +227,20 @@ function App() {
     }
   };
 
-  const fetchRecordInfo = async () => {
+  // 只看某位成员时走服务端的 userId 查询，分页 next 沿用返回值
+  const fetchRecordPage = async (
+    next: string,
+    member: { nickname: string; userId: string } | null = onlyMember
+  ): Promise<any> => {
+    if (member) {
+      return await invoke("get_user_record_list", { userId: member.userId, next, record: true });
+    }
+    return await invoke("get_record_list", { next });
+  };
+
+  const fetchRecordInfo = async (
+    member: { nickname: string; userId: string } | null = onlyMember
+  ) => {
     try {
       const initialTargetTime = dayjs().subtract(1, 'day').startOf('day').valueOf();
       setTargetLoadTime(initialTargetTime);
@@ -150,9 +250,10 @@ function App() {
       let done = false;
 
       while (!done) {
-        const res: any = await invoke("get_record_list", { next: currentNext });
+        const res: any = await fetchRecordPage(currentNext, member);
         if (res.content && res.content.liveList) {
-          const newRecords: LiveItem[] = res.content.liveList;
+          const newRecords: LiveItem[] = (res.content.liveList as LiveItem[])
+            .map((item) => ({ ...item, kind: "pocket" as ItemKind }));
           accumRecords = [...accumRecords, ...newRecords];
           currentNext = res.content.next || "0";
 
@@ -181,14 +282,47 @@ function App() {
     }
   };
 
-  const fetchLiveList = async (tab?: "live" | "record") => {
+  const fetchOpenInfo = async (groupId: number = openGroupId) => {
+    try {
+      const [liveRes, recordRes]: any[] = await Promise.all([
+        invoke("get_open_live_list", { next: "0", record: false, groupId }),
+        invoke("get_open_live_list", { next: "0", record: true, groupId })
+      ]);
+      setOpenLives(((liveRes?.content?.liveList ?? []) as OpenLiveItem[]).map((item) => ({ ...item, kind: "open" as ItemKind })));
+      setOpenRecords(((recordRes?.content?.liveList ?? []) as OpenLiveItem[]).map((item) => ({ ...item, kind: "open" as ItemKind })));
+      setOpenRecordNext(recordRes?.content?.next || "0");
+    } catch (e) {
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>获取公演列表失败</ToastTitle></Toast>, { intent: "error" });
+    }
+  };
+
+  const loadMoreOpenRecords = async () => {
+    if (openRecordNext === "0" || loading) return;
+    setLoading(true);
+    try {
+      const res: any = await invoke("get_open_live_list", { next: openRecordNext, record: true, groupId: openGroupId });
+      const list = ((res?.content?.liveList ?? []) as OpenLiveItem[]).map((item) => ({ ...item, kind: "open" as ItemKind }));
+      setOpenRecords((prev) => [...prev, ...list]);
+      setOpenRecordNext(res?.content?.next || "0");
+    } catch (e) {
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>加载更多公演录播失败</ToastTitle></Toast>, { intent: "error" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchLiveList = async (tab?: TabKey) => {
     const target = tab || activeTab;
     setLoading(true);
     try {
       if (target === "live") {
         await fetchLiveInfo();
-      } else {
+      } else if (target === "record") {
         await fetchRecordInfo();
+      } else {
+        await fetchOpenInfo();
       }
     } finally {
       setLoading(false);
@@ -207,9 +341,10 @@ function App() {
       let done = false;
 
       while (!done) {
-        const res: any = await invoke("get_record_list", { next: currentNext });
+        const res: any = await fetchRecordPage(currentNext);
         if (res.content && res.content.liveList) {
-          const newRecords: LiveItem[] = res.content.liveList;
+          const newRecords: LiveItem[] = (res.content.liveList as LiveItem[])
+            .map((item) => ({ ...item, kind: "pocket" as ItemKind }));
           accumRecords = [...accumRecords, ...newRecords];
           currentNext = res.content.next || "0";
 
@@ -247,7 +382,7 @@ function App() {
     // 首次加载时缓存双端数据
     const initFetch = async () => {
       setLoading(true);
-      await Promise.all([fetchLiveInfo(), fetchRecordInfo()]);
+      await Promise.all([fetchLiveInfo(), fetchRecordInfo(), fetchOpenInfo()]);
       setLoading(false);
     };
     initFetch();
@@ -267,6 +402,11 @@ function App() {
           delete next[payload.live_id];
           return next;
         });
+        setDownloadErrors(prev => {
+          const next = { ...prev };
+          delete next[payload.live_id];
+          return next;
+        });
         dispatchToast(<Toast><ToastTitle>下载完成：{payload.message}</ToastTitle></Toast>, { intent: "success" });
       } else if (payload.status === "error") {
         setDownloadProgresses(prev => {
@@ -274,6 +414,7 @@ function App() {
           delete next[payload.live_id];
           return next;
         });
+        setDownloadErrors(prev => ({ ...prev, [payload.live_id]: payload.message }));
         dispatchToast(<Toast><ToastTitle>下载失败：{payload.message}</ToastTitle></Toast>, { intent: "error" });
       } else if (payload.status === "cancelled") {
         setDownloadProgresses(prev => {
@@ -281,6 +422,7 @@ function App() {
           delete next[payload.live_id];
           return next;
         });
+        setDownloadErrors(prev => ({ ...prev, [payload.live_id]: payload.message }));
         dispatchToast(<Toast><ToastTitle>下载已取消：{payload.message}</ToastTitle></Toast>, { intent: "warning" });
       }
     });
@@ -289,6 +431,117 @@ function App() {
       unlisten.then(f => f());
     };
   }, []);
+
+  useEffect(() => {
+    const unlisten = listen("live-record-status", (event: any) => {
+      const payload = event.payload as LiveRecordStatus;
+      setRecordings((prev) => {
+        const next = { ...prev };
+        if (payload.status === "recording" || payload.status === "retrying") {
+          next[payload.liveId] = payload;
+        } else {
+          delete next[payload.liveId];
+        }
+        return next;
+      });
+      if (payload.status === "error") {
+        dispatchToast(<Toast><ToastTitle>录制失败：{payload.message}</ToastTitle></Toast>, { intent: "error" });
+      } else if (payload.status === "stopped") {
+        dispatchToast(<Toast><ToastTitle>录制已结束：{payload.filePath}</ToastTitle></Toast>, { intent: "warning" });
+      }
+    });
+
+    return () => {
+      unlisten.then(f => f());
+    };
+  }, []);
+
+  // 已录时长靠轮询刷新，事件只在状态变化时来
+  useEffect(() => {
+    const syncRecordings = async () => {
+      try {
+        const list = await invoke<LiveRecordStatus[]>("get_live_record_list");
+        const next: Record<string, LiveRecordStatus> = {};
+        for (const item of list) next[item.liveId] = item;
+        setRecordings(next);
+      } catch (e) {
+        console.error(e);
+      }
+    };
+    syncRecordings();
+    const timer = setInterval(syncRecordings, 2000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // 自动抓取（挂机录制）
+  useEffect(() => {
+    if (!autoGrab.enabled || !autoGrab.dir || !autoGrab.users.trim()) return;
+
+    const run = async () => {
+      const config = autoGrabRef.current;
+      const names = config.users.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      if (names.length === 0) return;
+
+      let active: LiveRecordStatus[] = [];
+      try {
+        active = await invoke<LiveRecordStatus[]>("get_live_record_list");
+      } catch {
+        return;
+      }
+      const recordingIds = new Set(active.map((r) => r.liveId));
+      let running = active.length;
+
+      const regexp = new RegExp(`(${names.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "i");
+
+      let res: any;
+      try {
+        res = await invoke("get_live_list");
+      } catch (e) {
+        console.error(e);
+        return;
+      }
+      const list: LiveItem[] = (res?.content?.liveList ?? []) as LiveItem[];
+
+      for (const item of list) {
+        if (running >= 5) break;
+        const matched = regexp.test(item.userInfo.nickname) || names.includes(item.userInfo.userId ?? "");
+        if (!matched || recordingIds.has(item.liveId)) continue;
+
+        try {
+          const url: string = await invoke("get_live_stream_url", { liveId: item.liveId });
+          const fileName = buildFileName("口袋48直播", item.userInfo.nickname, item.title, item.ctime, "ts");
+          const savePath = joinPath(config.dir, fileName);
+          const liveTime = item.ctime ? dayjs(Number(item.ctime)).format("YYYY-MM-DD HH:mm:ss") : "";
+          const logContent = `直播标题：${item.title}
+直播ID：${item.liveId}
+直播人：${item.userInfo.nickname}
+直播时间：${liveTime}
+输出文件：${fileName}
+创建时间：${dayjs().format("YYYY-MM-DD HH:mm:ss")}`;
+
+          await invoke("append_record_log", { dir: config.dir, content: logContent });
+          await invoke("start_live_record", { liveId: item.liveId, url, savePath });
+          recordingIds.add(item.liveId);
+          running += 1;
+          dispatchToast(<Toast><ToastTitle>自动抓取已开录：{item.title}</ToastTitle></Toast>, { intent: "info" });
+        } catch (e) {
+          console.error(e);
+          dispatchToast(<Toast><ToastTitle>自动抓取失败：{String(e)}</ToastTitle></Toast>, { intent: "error" });
+        }
+      }
+    };
+
+    if (autoGrab.enabled && !autoGrabRanRef.current) {
+      autoGrabRanRef.current = true;
+      run();
+    } else if (!autoGrab.enabled) {
+      autoGrabRanRef.current = false;
+    }
+
+    const interval = Math.max(1, autoGrab.intervalMinutes) * 60_000;
+    const timer = setInterval(run, interval);
+    return () => clearInterval(timer);
+  }, [autoGrab.enabled, autoGrab.intervalMinutes, autoGrab.dir, autoGrab.users]);
 
   // Detect if running in a mobile WebView (Android)
   const isAndroid = /Android/i.test(navigator.userAgent);
@@ -313,11 +566,11 @@ function App() {
       // Type filter: empty = all, otherwise match badge text
       let matchType = true;
       if (filterTypes.length > 0) {
-        if (filterTypes.includes("连麦")) {
-          matchType = !!item.inMicrophoneConnection || filterTypes.includes(getLiveTypeBadge(item.liveType).text);
-        } else {
-          matchType = filterTypes.includes(getLiveTypeBadge(item.liveType).text);
-        }
+        const typeText = getLiveTypeBadge(item.liveType).text;
+        const byType = filterTypes.includes("连麦")
+          ? (!!item.inMicrophoneConnection || filterTypes.includes(typeText))
+          : filterTypes.includes(typeText);
+        matchType = byType || (filterTypes.includes("录屏") && item.liveMode === 1);
       }
 
       // Member filter: empty = all, otherwise exact match
@@ -341,20 +594,52 @@ function App() {
     });
   };
 
+  const toLiveItem = (item: OpenLiveItem): LiveItem => ({
+    liveId: item.liveId,
+    title: item.title,
+    coverPath: "",
+    liveType: 1,
+    liveMode: 0,
+    status: item.status,
+    ctime: item.stime,
+    kind: "open",
+    userInfo: { nickname: item.subTitle || "公演", avatar: "" }
+  });
+
+  const filterOpenList = (list: OpenLiveItem[]) => {
+    const q = searchQuery.toLowerCase();
+    return list.filter((item) =>
+      !q ||
+      item.title.toLowerCase().includes(q) ||
+      (item.subTitle ?? "").toLowerCase().includes(q)
+    );
+  };
+
   const filteredLiveItems = filterList(lives, false);
   const filteredRecordItems = filterList(records, true);
-  const filteredItems = activeTab === "live" ? filteredLiveItems : filteredRecordItems;
+  const filteredOpenLiveItems = filterOpenList(openLives).map(toLiveItem);
+  const filteredOpenRecordItems = filterOpenList(openRecords).map(toLiveItem);
+  const filteredItems = activeTab === "live"
+    ? filteredLiveItems
+    : activeTab === "record"
+      ? filteredRecordItems
+      : [...filteredOpenLiveItems, ...filteredOpenRecordItems];
 
-  // Derive unique nicknames for member filter
-  const allNicknames = useMemo(() => {
+  // Derive unique members for the member filter (userId is needed for the server-side query)
+  const allMembers = useMemo(() => {
     const source = activeTab === "live" ? lives : records;
-    const set = new Set(source.map((item) => item.userInfo.nickname));
-    return Array.from(set).sort();
+    const map = new Map<string, string | undefined>();
+    for (const item of source) {
+      if (!map.has(item.userInfo.nickname)) map.set(item.userInfo.nickname, item.userInfo.userId);
+    }
+    return Array.from(map.entries())
+      .map(([nickname, userId]) => ({ nickname, userId }))
+      .sort((a, b) => a.nickname.localeCompare(b.nickname, "zh-Hans-CN"));
   }, [activeTab, lives, records]);
 
   // Whether any non-default filter is active
   const hasActiveFilters = filterGroups.length > 0 || filterTypes.length > 0 ||
-    filterMembers.length > 0 || !!filterDateStart || !!filterDateEnd;
+    filterMembers.length > 0 || !!filterDateStart || !!filterDateEnd || !!onlyMember;
 
   const shouldIgnoreGestureTarget = (target: EventTarget | null) => {
     if (!(target instanceof HTMLElement)) return false;
@@ -388,8 +673,9 @@ function App() {
     const absDy = Math.abs(dy);
 
     if (absDx > absDy && absDx > 10) {
-      if (activeTab === "live" && dx > 0) return; // Cant swipe right from live
-      if (activeTab === "record" && dx < 0) return; // Cant swipe left from record
+      const tabIndex = TAB_ORDER.indexOf(activeTab);
+      if (tabIndex <= 0 && dx > 0) return; // 第一个 tab 不能再往右滑
+      if (tabIndex >= TAB_ORDER.length - 1 && dx < 0) return; // 最后一个 tab 不能再往左滑
       
       setSwipeTranslation(dx);
       if (!("cancelable" in e) || e.cancelable) {
@@ -417,10 +703,11 @@ function App() {
     if (swipeTranslation !== 0) {
       // 极低的触发阈值，只要有超过20像素的水平滑动意图就会直接切换
       const threshold = 10;
-      if (activeTab === "live" && swipeTranslation < -threshold) {
-        setActiveTab("record");
-      } else if (activeTab === "record" && swipeTranslation > threshold) {
-        setActiveTab("live");
+      const tabIndex = TAB_ORDER.indexOf(activeTab);
+      if (swipeTranslation < -threshold && tabIndex < TAB_ORDER.length - 1) {
+        setActiveTab(TAB_ORDER[tabIndex + 1]);
+      } else if (swipeTranslation > threshold && tabIndex > 0) {
+        setActiveTab(TAB_ORDER[tabIndex - 1]);
       }
       setSwipeTranslation(0);
     }
@@ -439,6 +726,16 @@ function App() {
     }
   };
 
+  // 成员直播/录播和公演走的是两套解析流地址的接口，用 kind 区分，不靠 liveId 猜
+  const resolveStreamUrl = async (item: LiveItem): Promise<string> => {
+    if (item.kind === "open") {
+      const streams = await invoke<OpenLiveStream[]>("get_open_live_streams", { liveId: item.liveId });
+      const best = [...streams].reverse().find((s) => !!s.streamPath);
+      return best?.streamPath ?? "";
+    }
+    return await invoke<string>("get_live_stream_url", { liveId: item.liveId });
+  };
+
   const switchWebPlayback = async (direction: "prev" | "next") => {
     if (playingIndex < 0 || playingList.length === 0) return;
     const nextIndex = direction === "next" ? playingIndex + 1 : playingIndex - 1;
@@ -448,7 +745,7 @@ function App() {
 
     const nextItem = playingList[nextIndex];
     try {
-      const nextUrl: string = await invoke("get_live_stream_url", { liveId: nextItem.liveId });
+      const nextUrl: string = await resolveStreamUrl(nextItem);
       setPlayingIndex(nextIndex);
       setPlayingUrl(nextUrl);
     } catch (e) {
@@ -464,7 +761,7 @@ function App() {
     if (index < 0 || index >= playingList.length || index === playingIndex) return;
     const item = playingList[index];
     try {
-      const url: string = await invoke("get_live_stream_url", { liveId: item.liveId });
+      const url: string = await resolveStreamUrl(item);
       setPlayingIndex(index);
       setPlayingUrl(url);
     } catch (e) {
@@ -488,9 +785,17 @@ function App() {
     };
   }, [handleListTouchMove]);
 
-  const handlePlayOrCopy = async (liveId: string, action: "play" | "copy" | "download", item?: LiveItem) => {
+  const typeTitleOf = (kind: ItemKind | undefined, isLiveItem: boolean) =>
+    kind === "open" ? (isLiveItem ? "48公演直播" : "48公演录播") : (isLiveItem ? "口袋48直播" : "口袋48录播");
+
+  const handlePlayOrCopy = async (
+    item: LiveItem,
+    action: "play" | "copy" | "download",
+    isLiveItem: boolean
+  ) => {
+    const liveId = item.liveId;
     try {
-      const url: string = await invoke("get_live_stream_url", { liveId });
+      const url: string = await resolveStreamUrl(item);
       
       if (action === "copy") {
         await writeText(url);
@@ -499,19 +804,29 @@ function App() {
           { intent: "success" }
         );
       } else if (action === "download") {
+        if (!url) throw new Error("接口没有返回可下载的地址");
+        const ext = /\.mp4(\?|$)/i.test(url) ? "mp4" : "ts";
         const filePath = await save({
           filters: [{ name: 'Video File', extensions: ['ts', 'mp4', 'flv'] }],
-          defaultPath: `Live_${liveId}.ts`
+          defaultPath: buildFileName(
+            typeTitleOf(item.kind, isLiveItem),
+            item.userInfo.nickname,
+            item.title,
+            item.ctime,
+            ext
+          )
         });
         if (filePath) {
+          // 记下地址和路径，失败或取消后"重试下载"可以原地续传
+          setDownloadTasks(prev => ({ ...prev, [liveId]: { url, savePath: filePath } }));
           await invoke("download_video", { url, savePath: filePath, liveId });
         }
       } else if (action === "play") {
         const startIndex = filteredItems.findIndex(i => i.liveId === liveId);
-        const orderedItems = startIndex >= 0 ? filteredItems : (item ? [item] : []);
+        const orderedItems = startIndex >= 0 ? filteredItems : [item];
 
         // Android: all streams (live + record) use native player first
-        if (isAndroid && item) {
+        if (isAndroid) {
           const bridge = (window as Window & { Live48NativePlayer?: NativeAndroidPlayerBridge }).Live48NativePlayer;
           if (bridge && typeof bridge.playStream === "function") {
             if (!bridge.isAvailable || bridge.isAvailable()) {
@@ -522,17 +837,19 @@ function App() {
                   nickname: entry.userInfo.nickname,
                   streamUrl: entry.liveId === liveId ? url : "",
                 }));
-                bridge.playPlaylist(JSON.stringify(playlistPayload), Math.max(0, startIndex), activeTab === "live");
+                bridge.playPlaylist(JSON.stringify(playlistPayload), Math.max(0, startIndex), isLiveItem);
               } else {
-                bridge.playStream(url, item.title || "无标题", item.userInfo.nickname, activeTab === "live");
+                bridge.playStream(url, item.title || "无标题", item.userInfo.nickname, isLiveItem);
               }
               return;
             }
           }
         }
 
+        setPlayingIsLive(isLiveItem);
+
         // Non-Android mobile fallback: in-app web player
-        if (isMobile && item) {
+        if (isMobile) {
           setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
           setPlayingIndex(Math.max(0, startIndex));
           setPlayingUrl(url);
@@ -543,11 +860,9 @@ function App() {
               const needsVlc = url.startsWith("rtmp://") || url.startsWith("rtmps://");
               const playUrl: string = needsVlc ? await invoke("vlc_play", { url }) : url;
               setVlcPlaying(needsVlc);
-              if (item) {
-                setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
-                setPlayingIndex(Math.max(0, startIndex));
-                setPlayingUrl(playUrl);
-              }
+              setPlayingList(orderedItems.length > 0 ? orderedItems : [item]);
+              setPlayingIndex(Math.max(0, startIndex));
+              setPlayingUrl(playUrl);
               dispatchToast(
                 <Toast><ToastTitle>已启动内置{needsVlc ? ' VLC 转码' : ' HLS'}播放</ToastTitle></Toast>,
                 { intent: "info" }
@@ -574,6 +889,71 @@ function App() {
         <Toast><ToastTitle>播放失败: {errMsg}</ToastTitle></Toast>,
         { intent: "error" }
       );
+    }
+  };
+
+  const handleRetryDownload = async (liveId: string) => {
+    const task = downloadTasks[liveId];
+    if (!task) {
+      dispatchToast(<Toast><ToastTitle>找不到原来的下载路径，请重新下载</ToastTitle></Toast>, { intent: "warning" });
+      return;
+    }
+    try {
+      await invoke("download_video", { url: task.url, savePath: task.savePath, liveId });
+      dispatchToast(<Toast><ToastTitle>正在续传下载：{task.savePath}</ToastTitle></Toast>, { intent: "info" });
+    } catch (e) {
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>重试下载失败</ToastTitle></Toast>, { intent: "error" });
+    }
+  };
+
+  // 录播卡片上的"下载弹幕"，文件名沿用录播命名规则
+  const handleDownloadDanmu = async (item: LiveItem) => {
+    try {
+      const filePath = await save({
+        filters: [{ name: 'Danmu File', extensions: ['txt'] }],
+        defaultPath: buildFileName("口袋48录播", item.userInfo.nickname, item.title, item.ctime, "txt")
+      });
+      if (!filePath) return;
+      await invoke("download_danmu_file", { liveId: item.liveId, savePath: filePath });
+      dispatchToast(<Toast><ToastTitle>弹幕文件已保存：{filePath}</ToastTitle></Toast>, { intent: "success" });
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>下载弹幕失败：{errMsg}</ToastTitle></Toast>, { intent: "error" });
+    }
+  };
+
+  const handleToggleRecord = async (item: LiveItem) => {
+    const existing = recordings[item.liveId];
+    if (existing) {
+      try {
+        await invoke("stop_live_record", { liveId: item.liveId });
+      } catch (e) {
+        console.error(e);
+        dispatchToast(<Toast><ToastTitle>停止录制失败</ToastTitle></Toast>, { intent: "error" });
+      }
+      return;
+    }
+
+    try {
+      const url: string = await resolveStreamUrl(item);
+      if (!url) throw new Error("接口没有返回可录制的地址");
+      const filePath = await save({
+        filters: [{ name: 'Video File', extensions: ['ts'] }],
+        defaultPath: buildFileName(typeTitleOf(item.kind, true), item.userInfo.nickname, item.title, item.ctime, "ts")
+      });
+      if (!filePath) return;
+      await invoke("start_live_record", { liveId: item.liveId, url, savePath: filePath });
+      dispatchToast(<Toast><ToastTitle>已开始录制：{filePath}</ToastTitle></Toast>, { intent: "info" });
+      const list = await invoke<LiveRecordStatus[]>("get_live_record_list");
+      const next: Record<string, LiveRecordStatus> = {};
+      for (const entry of list) next[entry.liveId] = entry;
+      setRecordings(next);
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error(e);
+      dispatchToast(<Toast><ToastTitle>录制失败：{errMsg}</ToastTitle></Toast>, { intent: "error" });
     }
   };
 
@@ -609,7 +989,7 @@ function App() {
       <div style={{ display: "flex", flexDirection: "column", gap: 20, width: "100%", flexShrink: 0 }}>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
           {items.map((item) => {
-            const badge = getLiveTypeBadge(item.liveType);
+            const badge = getItemBadge(item);
             const isItemLiveTab = !isRecordTab;
             return (
               <div key={item.liveId} style={{ width: "100%", display: "flex", flexDirection: "column", gap: 0 }}>
@@ -692,27 +1072,57 @@ function App() {
                     style={{
                       display: "flex",
                       marginTop: "12px",
+                      flexWrap: "wrap",
                       justifyContent: isItemLiveTab ? "flex-end" : "center",
                       gap: "8px"
                     }}
                   >
                     <Button 
                       icon={<CopyRegular />} 
-                      onClick={() => handlePlayOrCopy(item.liveId, "copy", item)}
+                      onClick={() => handlePlayOrCopy(item, "copy", isItemLiveTab)}
                     >地址</Button>
-                    {isRecordTab && (
-                      <Button 
-                        icon={<ArrowDownloadRegular />} 
-                        onClick={() => handlePlayOrCopy(item.liveId, "download", item)}
-                      >下载</Button>
+                    {isItemLiveTab ? (
+                      !isAndroid && (recordings[item.liveId] ? (
+                        <Button
+                          appearance="primary"
+                          icon={<StopRegular />}
+                          onClick={() => handleToggleRecord(item)}
+                        >停止录制</Button>
+                      ) : (
+                        <Button
+                          icon={<RecordRegular />}
+                          onClick={() => handleToggleRecord(item)}
+                        >录制</Button>
+                      ))
+                    ) : (
+                      <>
+                        <Button 
+                          icon={<ArrowDownloadRegular />} 
+                          onClick={() => handlePlayOrCopy(item, "download", isItemLiveTab)}
+                        >下载</Button>
+                        <Button
+                          icon={<NotepadRegular />}
+                          onClick={() => handleDownloadDanmu(item)}
+                        >弹幕</Button>
+                      </>
                     )}
                     <Button 
                       appearance="primary" 
                       icon={<PlayRegular />} 
-                      onClick={() => handlePlayOrCopy(item.liveId, "play", item)}
+                      onClick={() => handlePlayOrCopy(item, "play", isItemLiveTab)}
                     >播放</Button>
                   </div>
                 </Card>
+                {recordings[item.liveId] && (
+                  <div style={{ width: "100%", marginTop: "4px", padding: "4px 8px", backgroundColor: "rgba(191,54,54,0.15)", borderRadius: "4px" }}>
+                    <Text size={200} style={{ display: "block", color: "#d13438" }}>
+                      {recordings[item.liveId].status === "retrying" ? "录制中断，等待续录…" : "正在录制"} · {formatElapsed(recordings[item.liveId].elapsed)}
+                    </Text>
+                    <Text size={200} style={{ display: "block", color: "var(--colorNeutralForeground3)", wordBreak: "break-all" }}>
+                      {recordings[item.liveId].filePath}
+                    </Text>
+                  </div>
+                )}
                 {downloadProgresses[item.liveId] !== undefined && (
                   <div style={{ width: "100%", marginTop: "4px" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -732,6 +1142,19 @@ function App() {
                     </Text>
                   </div>
                 )}
+                {downloadErrors[item.liveId] !== undefined && downloadProgresses[item.liveId] === undefined && (
+                  <div style={{ width: "100%", marginTop: "4px", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <Text size={200} style={{ flex: 1, color: "#d13438", wordBreak: "break-all" }}>
+                      {downloadErrors[item.liveId]}
+                    </Text>
+                    <Button
+                      size="small"
+                      icon={<ArrowClockwiseRegular />}
+                      onClick={() => handleRetryDownload(item.liveId)}
+                      title="重试下载"
+                    >重试</Button>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -743,6 +1166,93 @@ function App() {
             </Button>
           </div>
         )}
+      </div>
+    );
+  };
+
+  const renderOpenGrid = (items: LiveItem[], isLiveSection: boolean) => {
+    if (items.length === 0) {
+      return <div style={{ textAlign: "center", marginTop: "20px", color: "var(--colorNeutralForeground3)" }}>无匹配内容</div>;
+    }
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
+        {items.map((item) => {
+          const notStarted = item.status === 1;
+          return (
+            <Card key={item.liveId} style={{ width: "100%" }}>
+              <CardPreview>
+                <div style={{ position: "relative", width: "100%", lineHeight: 0, aspectRatio: "1 / 1", background: "linear-gradient(135deg, #2b2b2b 0%, #1a1a1a 100%)", display: "flex", alignItems: "center", justifyContent: "center", padding: "12px" }}>
+                  <Text weight="bold" style={{ color: "rgba(255,255,255,0.85)", textAlign: "center", wordBreak: "break-all" }}>
+                    {item.title || "公演"}
+                  </Text>
+                  <div style={{
+                    position: "absolute",
+                    top: "12px",
+                    left: "12px",
+                    backgroundColor: isLiveSection ? "var(--colorPaletteRedBackground3)" : "#107c10",
+                    color: "white",
+                    padding: "4px 8px",
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    borderRadius: "4px",
+                    lineHeight: "normal"
+                  }}>
+                    {isLiveSection ? "公演直播" : "公演录播"}
+                  </div>
+                  {notStarted && (
+                    <div style={{
+                      position: "absolute",
+                      top: "12px",
+                      right: "12px",
+                      backgroundColor: "gray",
+                      color: "white",
+                      padding: "2px 6px",
+                      fontSize: "12px",
+                      fontWeight: "bold",
+                      borderRadius: "4px",
+                      lineHeight: "normal"
+                    }}>
+                      未开始
+                    </div>
+                  )}
+                </div>
+              </CardPreview>
+
+              <CardHeader
+                header={<Text size={300} weight="semibold">{item.userInfo.nickname}</Text>}
+                description={item.ctime ? <Text size={200} style={{ color: "var(--colorNeutralForeground3)" }}>{dayjs(Number(item.ctime)).format("YYYY-MM-DD HH:mm:ss")}</Text> : undefined}
+              />
+
+              <div style={{ display: "flex", marginTop: "12px", justifyContent: "center", gap: "8px", flexWrap: "wrap" }}>
+                <Button
+                  appearance="primary"
+                  icon={<PlayRegular />}
+                  disabled={notStarted}
+                  onClick={() => handlePlayOrCopy(item, "play", isLiveSection)}
+                >播放</Button>
+                {!isLiveSection && (
+                  <Button
+                    icon={<ArrowDownloadRegular />}
+                    disabled={notStarted}
+                    onClick={() => handlePlayOrCopy(item, "download", isLiveSection)}
+                  >下载</Button>
+                )}
+              </div>
+              {downloadProgresses[item.liveId] !== undefined && (
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
+                  <ProgressBar value={downloadProgresses[item.liveId] / 100} style={{ flex: 1 }} />
+                  <Button size="small" icon={<DismissRegular />} onClick={() => handleCancelDownload(item.liveId)} title="取消下载" />
+                </div>
+              )}
+              {downloadErrors[item.liveId] !== undefined && downloadProgresses[item.liveId] === undefined && (
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
+                  <Text size={200} style={{ flex: 1, color: "#d13438" }}>{downloadErrors[item.liveId]}</Text>
+                  <Button size="small" icon={<ArrowClockwiseRegular />} onClick={() => handleRetryDownload(item.liveId)}>重试</Button>
+                </div>
+              )}
+            </Card>
+          );
+        })}
       </div>
     );
   };
@@ -857,15 +1367,30 @@ function App() {
           }}>
             <TabList
               selectedValue={activeTab}
-              onTabSelect={(_, data) => setActiveTab(data.value as any)}
+              onTabSelect={(_, data) => setActiveTab(data.value as TabKey)}
               style={{ flexShrink: 0 }}
             >
               <Tab value="live">直播</Tab>
               <Tab value="record">录播</Tab>
+              <Tab value="open">公演</Tab>
             </TabList>
 
             <div style={{ display: "flex", gap: "12px", flex: 1, justifyContent: "flex-end", alignItems: "center", flexWrap: "wrap" }}>
 
+            {activeTab === "open" ? (
+              <Select
+                value={String(openGroupId)}
+                onChange={(_, data) => {
+                  const id = Number(data.value);
+                  setOpenGroupId(id);
+                  fetchOpenInfo(id);
+                }}
+                style={{ minWidth: "120px" }}
+              >
+                <option value="0">全部团体</option>
+                {GROUPS.map((g) => <option key={g.id} value={String(g.id)}>{g.name}</option>)}
+              </Select>
+            ) : (
             <Select
               value={filterGroups.length === 0 ? "全部" : filterGroups.length === 1 ? filterGroups[0] : "__multi__"}
               onChange={(_, data) => {
@@ -875,13 +1400,10 @@ function App() {
               style={{ minWidth: "120px" }}
             >
               <option value="全部">全部团体</option>
-              <option value="SNH48">SNH48</option>
-              <option value="GNZ48">GNZ48</option>
-              <option value="BEJ48">BEJ48</option>
-              <option value="CKG48">CKG48</option>
-              <option value="CGT48">CGT48</option>
+              {TEAM_GROUPS.map((g) => <option key={g.id} value={g.name}>{g.name}</option>)}
               {filterGroups.length > 1 && <option value="__multi__">已选 {filterGroups.length} 个</option>}
             </Select>
+            )}
 
             <Select
               value={filterTypes.length === 0 ? "全部" : filterTypes.length === 1 ? filterTypes[0] : "__multi__"}
@@ -895,6 +1417,7 @@ function App() {
               <option value="视频">仅视频</option>
               <option value="电台">仅电台</option>
               <option value="连麦">仅连麦</option>
+              <option value="录屏">仅录屏</option>
               <option value="游戏">仅游戏</option>
               <option value="AI">仅AI</option>
               {filterTypes.length > 1 && <option value="__multi__">已选 {filterTypes.length} 个</option>}
@@ -934,18 +1457,27 @@ function App() {
             </svg>
             <span className="bottom-nav-label">录播</span>
           </button>
+          <button 
+            className={`bottom-nav-item ${activeTab === "open" ? "active" : ""}`}
+            onClick={() => setActiveTab("open")}
+          >
+            <svg className="bottom-nav-icon" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2l3 5h5l-4 4 1.5 6L12 14l-5.5 3L8 7 4 3h5l3-1z"/>
+            </svg>
+            <span className="bottom-nav-label">公演</span>
+          </button>
         </nav>
 
       <div style={{ overflow: "hidden", width: "100%" }}>
         <div style={{
           display: "flex",
           alignItems: "flex-start",
-          width: "200%",
-          transform: `translateX(calc(${activeTab === "live" ? 0 : -50}% + ${swipeTranslation}px))`,
+          width: "300%",
+          transform: `translateX(calc(${-TAB_ORDER.indexOf(activeTab) * 33.3333}% + ${swipeTranslation}px))`,
           transition: gestureRef.current.tracking ? "none" : "transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1)",
         }}>
           <div style={{ 
-            width: "50%", 
+            width: "33.3333%", 
             paddingRight: "10px", 
             boxSizing: "border-box",
             height: activeTab === "live" ? "auto" : 0
@@ -959,8 +1491,9 @@ function App() {
             )}
           </div>
           <div style={{ 
-            width: "50%", 
+            width: "33.3333%", 
             paddingLeft: "10px", 
+            paddingRight: "10px", 
             boxSizing: "border-box",
             height: activeTab === "record" ? "auto" : 0
           }}>
@@ -972,6 +1505,32 @@ function App() {
               renderGrid(filteredRecordItems, true)
             )}
           </div>
+          <div style={{ 
+            width: "33.3333%", 
+            paddingLeft: "10px", 
+            boxSizing: "border-box",
+            height: activeTab === "open" ? "auto" : 0
+          }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 20, width: "100%" }}>
+              {loading && openLives.length === 0 ? (
+                <Spinner label="加载列表中..." />
+              ) : (
+                <>
+                  <Text size={400} weight="semibold">公演直播</Text>
+                  {renderOpenGrid(filteredOpenLiveItems, true)}
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <Text size={400} weight="semibold">公演录播</Text>
+                    {openRecordNext !== "0" && (
+                      <Button size="small" onClick={loadMoreOpenRecords} disabled={loading}>
+                        {loading ? "加载中..." : "加载更多公演录播"}
+                      </Button>
+                    )}
+                  </div>
+                  {renderOpenGrid(filteredOpenRecordItems, false)}
+                </>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -982,7 +1541,10 @@ function App() {
           title={playingItem.title || "无标题"}
           nickname={playingItem.userInfo.nickname}
           streamUrl={playingUrl}
-          isLive={activeTab === "live"}
+          kind={playingItem.kind ?? "pocket"}
+          isLive={playingIsLive}
+          isRecording={!!recordings[playingItem.liveId]}
+          onToggleRecord={playingItem.kind === "open" ? undefined : () => handleToggleRecord(playingItem)}
           canSwitchPrev={playingIndex > 0}
           canSwitchNext={playingIndex < playingList.length - 1}
           onSwitch={switchWebPlayback}
@@ -1004,6 +1566,9 @@ function App() {
         onPlayerModeChange={handlePlayerModeChange}
         vlcPlaying={vlcPlaying}
         onVlcStop={handleVlcStop}
+        autoGrab={autoGrab}
+        onAutoGrabChange={handleAutoGrabChange}
+        recordingCount={Object.keys(recordings).length}
       />
 
       <FilterPanel
@@ -1020,7 +1585,12 @@ function App() {
         onMembersChange={setFilterMembers}
         onDateStartChange={setFilterDateStart}
         onDateEndChange={setFilterDateEnd}
-        allNicknames={allNicknames}
+        allMembers={allMembers}
+        onlyMember={onlyMember}
+        onOnlyMemberChange={(value) => {
+          setOnlyMember(value);
+          fetchRecordInfo(value);
+        }}
       />
 
       <style>{`

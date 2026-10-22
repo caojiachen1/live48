@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular, ListRegular, PictureInPictureEnterRegular } from "@fluentui/react-icons";
+import { DismissRegular, PlayRegular, PauseRegular, ArrowClockwiseRegular, ListRegular, PictureInPictureEnterRegular, NotepadRegular, RecordRegular } from "@fluentui/react-icons";
 
 interface PlaylistItem {
   liveId: string;
@@ -11,12 +11,29 @@ interface PlaylistItem {
   userInfo?: { nickname: string };
 }
 
+interface OpenLiveStream {
+  streamName: string;
+  streamType: number;
+  streamPath: string;
+  vipShow: boolean;
+}
+
+interface DanmuItem {
+  time: string;
+  currentTime: number;
+  nickname: string;
+  message: string;
+}
+
 interface VideoPlayerProps {
   liveId: string;
   title: string;
   nickname: string;
   streamUrl?: string;
+  kind?: "pocket" | "open";
   isLive?: boolean;
+  isRecording?: boolean;
+  onToggleRecord?: () => void;
   canSwitchPrev?: boolean;
   canSwitchNext?: boolean;
   onSwitch?: (direction: "prev" | "next") => string | void | Promise<string | void>;
@@ -47,7 +64,7 @@ function formatTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSwitchPrev, canSwitchNext, onSwitch, playlist, currentIndex, onSelect, onClose }: VideoPlayerProps) {
+function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, kind = "pocket", isLive, isRecording, onToggleRecord, canSwitchPrev, canSwitchNext, onSwitch, playlist, currentIndex, onSelect, onClose }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -63,6 +80,15 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const hlsRef = useRef<any>(null);
   const mpegtsRef = useRef<any>(null);
   const vlcUsedRef = useRef(false);
+
+  // 公演有多路清晰度，选完要重新解析流地址
+  const [streams, setStreams] = useState<OpenLiveStream[]>([]);
+  const [streamName, setStreamName] = useState<string>("");
+
+  // 录播弹幕
+  const [danmuList, setDanmuList] = useState<DanmuItem[]>([]);
+  const [showDanmu, setShowDanmu] = useState(false);
+  const danmuItemRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
   // Timeline state
   const [currentTime, setCurrentTime] = useState(0);
@@ -218,7 +244,17 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         }
 
         let url: string;
-        if (preUrl) {
+        if (kind === "open") {
+          // 公演走 getOpenLiveOne，清晰度由 streamName 决定
+          const list = await invoke<OpenLiveStream[]>("get_open_live_streams", { liveId });
+          setStreams(list);
+          const chosen =
+            (streamName ? list.find((s) => s.streamName === streamName) : undefined) ??
+            list.find((s) => s.streamName === "高清") ??
+            list[list.length - 1];
+          if (!chosen) throw new Error("公演没有可用的流地址");
+          url = chosen.streamPath;
+        } else if (preUrl) {
           if (preUrl.startsWith("rtmp://") || preUrl.startsWith("rtmps://")) {
             try {
               url = await invoke("get_playable_stream_url", { liveId }) as string;
@@ -280,7 +316,27 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         invoke("vlc_stop").catch(() => {});
       }
     };
-  }, [liveId, preUrl, isLive, onClose, tryOpenNativeAndroidPlayer]);
+  }, [liveId, preUrl, isLive, kind, streamName, onClose, tryOpenNativeAndroidPlayer]);
+
+  // 录播弹幕：直播和公演没有 msgFilePath，不拉取
+  useEffect(() => {
+    if (isLive || kind === "open") {
+      setDanmuList([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<DanmuItem[]>("get_record_danmu", { liveId })
+      .then((list) => {
+        if (!cancelled) setDanmuList(list ?? []);
+      })
+      .catch((e) => {
+        console.error(e);
+        if (!cancelled) setDanmuList([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [liveId, isLive, kind]);
 
   // Initialize player
   useEffect(() => {
@@ -326,6 +382,14 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
               startLevel: -1,
               capLevelToPlayerSize: true,
               debug: false,
+              // 录播 m3u8/ts 要求 UA 是 SNH48 ENGINE；webview 若拒绝该请求头则靠 Rust 下载路径兜底
+              xhrSetup: (xhr) => {
+                try {
+                  xhr.setRequestHeader("User-Agent", "SNH48 ENGINE");
+                } catch {
+                  console.warn("浏览器拒绝设置 User-Agent，录播可能只能走下载路径");
+                }
+              },
             });
             hls.loadSource(streamUrl);
             hls.attachMedia(video);
@@ -532,6 +596,26 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
   const handleMouseUp = useCallback((e: React.MouseEvent) => {
     if (isSeeking) handleSeekEnd(e.clientX);
   }, [isSeeking, handleSeekEnd]);
+
+  // 弹幕面板：定位到当前播放时刻（±3 秒内高亮），点一条就跳过去
+  const danmuFocusIndex = useMemo(() => {
+    for (let i = danmuList.length - 1; i >= 0; i--) {
+      if (danmuList[i].currentTime <= currentTime + 0.5) return i;
+    }
+    return -1;
+  }, [danmuList, currentTime]);
+
+  useEffect(() => {
+    if (!showDanmu || danmuFocusIndex < 0) return;
+    danmuItemRefs.current[danmuFocusIndex]?.scrollIntoView({ block: "center" });
+  }, [showDanmu, danmuFocusIndex]);
+
+  const handleDanmuSeek = (item: DanmuItem) => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = item.currentTime;
+    setCurrentTime(item.currentTime);
+  };
 
   // Toggle controls on video area click, auto-hide after 3s when shown
   const handleVideoClick = useCallback((e: React.MouseEvent) => {
@@ -748,9 +832,34 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         </button>
       )}
 
+      {!isLive && danmuList.length > 0 && (
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowDanmu(v => !v); setShowPlaylist(false); }}
+          style={{
+            position: "absolute",
+            top: "24px",
+            right: playlist && playlist.length > 1 ? "56px" : "16px",
+            zIndex: 30,
+            background: showDanmu ? "rgba(187,134,252,0.5)" : "rgba(0,0,0,0.35)",
+            border: "none",
+            color: "white",
+            cursor: "pointer",
+            padding: "6px",
+            borderRadius: "999px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+          aria-label="弹幕列表"
+          title="弹幕列表"
+        >
+          <NotepadRegular style={{ fontSize: "20px" }} />
+        </button>
+      )}
+
       {playlist && playlist.length > 1 && (
         <button
-          onClick={(e) => { e.stopPropagation(); setShowPlaylist(v => !v); }}
+          onClick={(e) => { e.stopPropagation(); setShowPlaylist(v => !v); setShowDanmu(false); }}
           style={{
             position: "absolute",
             top: "24px",
@@ -796,6 +905,30 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
             {nickname}
           </div>
         </div>
+
+        {kind === "open" && streams.length > 1 && (
+          <select
+            value={streams.find((s) => s.streamName === (streamName || "高清"))?.streamName ?? streams[streams.length - 1].streamName}
+            onChange={(e) => setStreamName(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              backgroundColor: "rgba(0,0,0,0.5)",
+              color: "white",
+              border: "1px solid rgba(255,255,255,0.25)",
+              borderRadius: "6px",
+              padding: "4px 8px",
+              fontSize: "12px",
+              flexShrink: 0,
+            }}
+            aria-label="清晰度"
+          >
+            {streams.map((s) => (
+              <option key={s.streamName + s.streamType} value={s.streamName}>
+                {s.streamName}{s.vipShow ? "（VIP）" : ""}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       </>
@@ -1080,6 +1213,95 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
         </>
       )}
 
+      {/* Danmu panel */}
+      {showDanmu && danmuList.length > 0 && (
+        <>
+          <div
+            onClick={(e) => { e.stopPropagation(); setShowDanmu(false); }}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 25,
+              background: "rgba(0,0,0,0.3)",
+            }}
+          />
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "absolute",
+              top: 0,
+              right: 0,
+              bottom: 0,
+              width: "280px",
+              maxWidth: "80vw",
+              zIndex: 30,
+              background: "rgba(20,20,20,0.95)",
+              borderLeft: "1px solid rgba(255,255,255,0.1)",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              animation: "playlist-slide-in 0.2s ease-out",
+            }}
+          >
+            <div style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              padding: "16px",
+              borderBottom: "1px solid rgba(255,255,255,0.1)",
+              flexShrink: 0,
+            }}>
+              <span style={{ color: "rgba(255,255,255,0.9)", fontSize: "14px", fontWeight: 600 }}>
+                录播弹幕 ({danmuList.length})
+              </span>
+              <button
+                onClick={() => setShowDanmu(false)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "rgba(255,255,255,0.6)",
+                  cursor: "pointer",
+                  padding: "4px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <DismissRegular style={{ fontSize: "16px" }} />
+              </button>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden" }}>
+              {danmuList.map((item, idx) => {
+                const inWindow = Math.abs(item.currentTime - currentTime) <= 3;
+                return (
+                  <div
+                    key={`${idx}-${item.currentTime}`}
+                    ref={(el) => { danmuItemRefs.current[idx] = el; }}
+                    onClick={() => handleDanmuSeek(item)}
+                    style={{
+                      padding: "6px 16px",
+                      cursor: "pointer",
+                      fontSize: "12px",
+                      lineHeight: "18px",
+                      color: inWindow ? "#bb86fc" : "rgba(255,255,255,0.75)",
+                      background: idx === danmuFocusIndex ? "rgba(187,134,252,0.15)" : inWindow ? "rgba(255,255,255,0.05)" : "transparent",
+                      borderLeft: idx === danmuFocusIndex ? "3px solid #bb86fc" : "3px solid transparent",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    <span style={{ color: "rgba(255,255,255,0.4)", marginRight: "6px" }}>[{item.time}]</span>
+                    {item.nickname}：{item.message}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+
       {/* Bottom controls */}
       {!loading && !error && (
         <div
@@ -1158,21 +1380,45 @@ function VideoPlayer({ liveId, title, nickname, streamUrl: preUrl, isLive, canSw
             justifyContent: "space-between",
             marginTop: "2px",
           }}>
-            <button
-              onClick={togglePlay}
-              style={{
-                background: "none", border: "none", color: "white",
-                cursor: "pointer", padding: "4px",
-                display: "flex", alignItems: "center", justifyContent: "center",
-              }}
-              aria-label={isPlaying ? "暂停" : "播放"}
-            >
-              {isPlaying ? (
-                <PauseRegular style={{ fontSize: "22px" }} />
-              ) : (
-                <PlayRegular style={{ fontSize: "22px" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <button
+                onClick={togglePlay}
+                style={{
+                  background: "none", border: "none", color: "white",
+                  cursor: "pointer", padding: "4px",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+                aria-label={isPlaying ? "暂停" : "播放"}
+              >
+                {isPlaying ? (
+                  <PauseRegular style={{ fontSize: "22px" }} />
+                ) : (
+                  <PlayRegular style={{ fontSize: "22px" }} />
+                )}
+              </button>
+
+              {isLive && onToggleRecord && (
+                <button
+                  onClick={onToggleRecord}
+                  title={isRecording ? "停止录制" : "开始录制"}
+                  aria-label={isRecording ? "停止录制" : "开始录制"}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: isRecording ? "#ff4444" : "white",
+                    cursor: "pointer",
+                    padding: "4px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    fontSize: "12px",
+                  }}
+                >
+                  <RecordRegular style={{ fontSize: "20px" }} />
+                  {isRecording ? "录制中" : "录制"}
+                </button>
               )}
-            </button>
+            </div>
 
             <div style={{
               color: "rgba(255,255,255,0.75)", fontSize: "12px",
