@@ -188,24 +188,23 @@ impl App {
             .show(ui, |ui| pl.top_bar(ui));
 
         let visible = pl.controls_visible();
+        // The margins stay put while the chrome is hidden and the bar's own height is
+        // reserved as a spacer: the panel keeps a constant height, so the picture below
+        // no longer grows when the controls fade (that was the maximise/restore jump).
         Panel::bottom("player_bottom")
             .frame(
-                Frame::new()
-                    .fill(t::BG)
-                    .inner_margin(if visible {
-                        Margin {
-                            left: 14,
-                            right: 14,
-                            top: 6,
-                            bottom: 10,
-                        }
-                    } else {
-                        Margin::ZERO
-                    }),
+                Frame::new().fill(t::BG).inner_margin(Margin {
+                    left: 14,
+                    right: 14,
+                    top: 6,
+                    bottom: 10,
+                }),
             )
             .show(ui, |ui| {
                 if visible {
                     pl.bottom_bar(ui);
+                } else {
+                    ui.add_space(pl.bar_height());
                 }
             });
 

@@ -71,6 +71,10 @@ pub struct Player {
 
     controls: bool,
     hide_at: Instant,
+    /// Height the control bar had the last time it was visible. The bottom panel
+    /// reserves this even while the chrome is hidden, so fading the controls never
+    /// resizes the picture (which used to make it jump on maximise/restore).
+    bar_h: f32,
     pub playlist_open: bool,
     /// Slide progress of the playlist drawer, and the window it occupies so the wheel
     /// can scroll the list instead of jumping tracks.
@@ -140,6 +144,7 @@ impl Player {
             len_ms: 0,
             controls: true,
             hide_at: Instant::now() + Duration::from_secs(3),
+            bar_h: 54.0,
             playlist_open: false,
             fly_t: 0.0,
             fly_prev: 0.0,
@@ -264,6 +269,11 @@ impl Player {
 
     pub fn controls_visible(&self) -> bool {
         self.controls
+    }
+
+    /// Space the bottom panel keeps for the chrome even while it is faded out.
+    pub fn bar_height(&self) -> f32 {
+        self.bar_h
     }
 
     pub fn aspect(&self) -> f32 {
@@ -466,6 +476,9 @@ impl Player {
                 );
             });
         });
+        // Fed back into the panel so hiding the bar does not hand its height to the
+        // video surface.
+        self.bar_h = ui.min_rect().height();
     }
 
     fn seek_row(&mut self, ui: &mut Ui) {
