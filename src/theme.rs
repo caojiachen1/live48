@@ -4,15 +4,15 @@ use egui::{
 };
 use std::sync::Arc;
 
-// Monochrome Fluent dark ramp.
-pub const BG: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1B);
-pub const SURFACE: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
-pub const CARD: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
-pub const HOVER: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x2E);
-pub const ACTIVE: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
-pub const FIELD: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
-pub const LINE: Color32 = Color32::from_rgb(0x3F, 0x3F, 0x3F);
-pub const LINE_SOFT: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
+// Monochrome Fluent dark ramp, anchored on the #202020 window background.
+pub const BG: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
+pub const SURFACE: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+pub const CARD: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+pub const HOVER: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
+pub const ACTIVE: Color32 = Color32::from_rgb(0x3B, 0x3B, 0x3B);
+pub const FIELD: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2C);
+pub const LINE: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
+pub const LINE_SOFT: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
 pub const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF2, 0xF2);
 pub const TEXT_2: Color32 = Color32::from_rgb(0xBE, 0xBE, 0xBE);
 pub const TEXT_3: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
@@ -159,7 +159,7 @@ pub fn visuals() -> Visuals {
     v.override_text_color = Some(TEXT);
     v.weak_text_color = Some(TEXT_3);
     v.faint_bg_color = SURFACE;
-    v.extreme_bg_color = Color32::from_rgb(0x12, 0x12, 0x12);
+    v.extreme_bg_color = Color32::from_rgb(0x1A, 0x1A, 0x1A);
     v.panel_fill = BG;
     v.window_fill = SURFACE;
     v.window_stroke = Stroke::new(1.0, LINE);

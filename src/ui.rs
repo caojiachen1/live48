@@ -304,6 +304,10 @@ impl App {
                     ui.label(RichText::new("EGUI · NATIVE").size(10.0).color(t::TEXT_3));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // The player hint moved up here, to the right of the settings
+                        // gear; the toolbar row now carries the filter dropdowns and
+                        // the search field.
+                        self.player_chip(ui);
                         if icons::icon_button(ui, Icon::Settings, 32.0)
                             .on_hover_text("播放设置")
                             .clicked()
@@ -335,42 +339,6 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     self.tabs(ui);
 
-                    let group_text = if self.groups.is_empty() {
-                        "全部团体"
-                    } else if self.groups.len() == 1 {
-                        self.groups[0].as_str()
-                    } else {
-                        "已选多个团体"
-                    };                    egui::ComboBox::from_id_salt("group_combo")
-                        .width(112.0)
-                        .selected_text(RichText::new(group_text).size(13.0).color(t::TEXT_2))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.groups, vec![], "全部团体");
-                            for g in GROUPS_LIST {
-                                ui.selectable_value(&mut self.groups, vec![g.to_owned()], g);
-                            }
-                        });
-
-                    let type_text = if self.types.is_empty() {
-                        "全部类型"
-                    } else if self.types.len() == 1 {
-                        self.types[0].as_str()
-                    } else {
-                        "已选多个类型"
-                    };
-                    egui::ComboBox::from_id_salt("type_combo")
-                        .width(100.0)
-                        .selected_text(RichText::new(type_text).size(13.0).color(t::TEXT_2))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.types, vec![], "全部类型");
-                            for ty in TYPE_LIST {
-                                ui.selectable_value(&mut self.types, vec![ty.to_owned()], ty);
-                            }
-                        });
-
-                    ui.add_space(4.0);
-                    self.search_box(ui);
-
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(t::ghost_button("刷新").min_size(Vec2::new(66.0, 32.0)))
@@ -392,28 +360,6 @@ impl App {
                             );
                         }
 
-                        let mode_label = match self.mode {
-                            PlayerMode::System => "系统播放器",
-                            PlayerMode::Vlc => "VLC 播放器",
-                            PlayerMode::Builtin => "内置 libVLC",
-                        };
-                        let mode_resp = ui.add(
-                            egui::Button::new(
-                                RichText::new(mode_label).size(11.5).color(t::TEXT_2),
-                            )
-                            .fill(t::alpha(t::WHITE, 14))
-                            .stroke(Stroke::new(1.0, t::LINE_SOFT))
-                            .corner_radius(16.0)
-                            .min_size(Vec2::new(58.0, 32.0)),
-                        );
-                        if mode_resp
-                            .on_hover_text("当前播放器，点击可切换")
-                            .clicked()
-                        {
-                            self.settings_open = true;
-                            self.filter_open = false;
-                        }
-
                         if !self.downloads.is_empty() {
                             ui.label(
                                 RichText::new(format!("下载中 {}", self.downloads.len()))
@@ -421,9 +367,74 @@ impl App {
                                     .color(t::TEXT_3),
                             );
                         }
+
+                        // The two filter dropdowns and the search field now fill the
+                        // slot the player chip used to occupy.
+                        self.search_box(ui, 240.0);
+                        self.type_combo(ui);
+                        self.group_combo(ui);
                     });
                 });
             });
+    }
+
+    fn group_combo(&mut self, ui: &mut Ui) {
+        let group_text = if self.groups.is_empty() {
+            "全部团体"
+        } else if self.groups.len() == 1 {
+            self.groups[0].as_str()
+        } else {
+            "已选多个团体"
+        };
+        egui::ComboBox::from_id_salt("group_combo")
+            .width(112.0)
+            .selected_text(RichText::new(group_text).size(13.0).color(t::TEXT_2))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.groups, vec![], "全部团体");
+                for g in GROUPS_LIST {
+                    ui.selectable_value(&mut self.groups, vec![g.to_owned()], g);
+                }
+            });
+    }
+
+    fn type_combo(&mut self, ui: &mut Ui) {
+        let type_text = if self.types.is_empty() {
+            "全部类型"
+        } else if self.types.len() == 1 {
+            self.types[0].as_str()
+        } else {
+            "已选多个类型"
+        };
+        egui::ComboBox::from_id_salt("type_combo")
+            .width(100.0)
+            .selected_text(RichText::new(type_text).size(13.0).color(t::TEXT_2))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.types, vec![], "全部类型");
+                for ty in TYPE_LIST {
+                    ui.selectable_value(&mut self.types, vec![ty.to_owned()], ty);
+                }
+            });
+    }
+
+    /// Current player, shown as a chip at the right of the settings gear.
+    fn player_chip(&mut self, ui: &mut Ui) {
+        let mode_label = match self.mode {
+            PlayerMode::System => "系统播放器",
+            PlayerMode::Vlc => "VLC 播放器",
+            PlayerMode::Builtin => "内置 libVLC",
+        };
+        let resp = ui.add(
+            egui::Button::new(RichText::new(mode_label).size(11.5).color(t::TEXT_2))
+                .fill(t::alpha(t::WHITE, 14))
+                .stroke(Stroke::new(1.0, t::LINE_SOFT))
+                .corner_radius(16.0)
+                .min_size(Vec2::new(58.0, 32.0)),
+        );
+        let resp = resp.on_hover_text("当前播放器，点击可切换");
+        if resp.clicked() {
+            self.settings_open = true;
+            self.filter_open = false;
+        }
     }
 
     fn tabs(&mut self, ui: &mut Ui) {
@@ -485,7 +496,7 @@ impl App {
         ui.spacing_mut().interact_size.y = floor;
     }
 
-    fn search_box(&mut self, ui: &mut Ui) {
+    fn search_box(&mut self, ui: &mut Ui, width: f32) {
         // TextEdit floors its height at `interact_size.y` and only paints its frame
         // around the text, so the box has to be drawn at an explicit 32pt rect or it
         // ends up shorter than the buttons next to it.
@@ -499,7 +510,7 @@ impl App {
                 bottom: 0,
             })
             .stroke(Stroke::new(1.0, t::LINE_SOFT));
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(300.0, 32.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::hover());
         let inset = frame.total_margin();
         let content = rect - inset;
         ui.painter().add(frame.paint(content));

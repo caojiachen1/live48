@@ -59,7 +59,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 760.0])
             .with_min_inner_size([640.0, 520.0])
-            .with_title("live48"),
+            .with_title("live48")
+            .with_icon(window_icon()),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -68,6 +69,22 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+/// The window/taskbar icon, decoded from the same PNG the Tauri build shipped. winit
+/// pushes it to Windows as both ICON_BIG and ICON_SMALL, which is what the taskbar
+/// button and Alt-Tab pick up when the exe resource is not what Explorer cached.
+fn window_icon() -> egui::IconData {
+    let bytes = include_bytes!("../assets/icon.png");
+    let img = image::load_from_memory(bytes)
+        .expect("bundled icon.png")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
 }
 
 /// Headless check of decode -> libVLC RGBA callback -> frame copy, so the memory
