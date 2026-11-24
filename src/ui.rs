@@ -187,10 +187,8 @@ impl App {
             )
             .show(ui, |ui| pl.top_bar(ui));
 
-        let visible = pl.controls_visible();
-        // The margins stay put while the chrome is hidden and the bar's own height is
-        // reserved as a spacer: the panel keeps a constant height, so the picture below
-        // no longer grows when the controls fade (that was the maximise/restore jump).
+        // The chrome is part of the fixed layout: the bar always occupies the same
+        // strip, so the picture below never resizes when the pointer comes and goes.
         Panel::bottom("player_bottom")
             .frame(
                 Frame::new().fill(t::BG).inner_margin(Margin {
@@ -200,13 +198,7 @@ impl App {
                     bottom: 10,
                 }),
             )
-            .show(ui, |ui| {
-                if visible {
-                    pl.bottom_bar(ui);
-                } else {
-                    ui.add_space(pl.bar_height());
-                }
-            });
+            .show(ui, |ui| pl.bottom_bar(ui));
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(Color32::BLACK).inner_margin(0))
@@ -249,7 +241,6 @@ impl App {
             pl.playlist_rect = Rect::NOTHING;
         }
 
-        pl.settle();
         let cmd = pl.cmd;
         pl.cmd = Cmd::None;
         drop(guard);

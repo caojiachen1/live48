@@ -69,12 +69,6 @@ pub struct Player {
     time_ms: i64,
     len_ms: i64,
 
-    controls: bool,
-    hide_at: Instant,
-    /// Height the control bar had the last time it was visible. The bottom panel
-    /// reserves this even while the chrome is hidden, so fading the controls never
-    /// resizes the picture (which used to make it jump on maximise/restore).
-    bar_h: f32,
     pub playlist_open: bool,
     /// Slide progress of the playlist drawer, and the window it occupies so the wheel
     /// can scroll the list instead of jumping tracks.
@@ -142,9 +136,6 @@ impl Player {
             error: None,
             time_ms: 0,
             len_ms: 0,
-            controls: true,
-            hide_at: Instant::now() + Duration::from_secs(3),
-            bar_h: 54.0,
             playlist_open: false,
             fly_t: 0.0,
             fly_prev: 0.0,
@@ -267,15 +258,6 @@ impl Player {
         ctx.request_repaint_after_for(Duration::from_millis(every), viewport);
     }
 
-    pub fn controls_visible(&self) -> bool {
-        self.controls
-    }
-
-    /// Space the bottom panel keeps for the chrome even while it is faded out.
-    pub fn bar_height(&self) -> f32 {
-        self.bar_h
-    }
-
     pub fn aspect(&self) -> f32 {
         (self.frame_size.0 as f32 / self.frame_size.1 as f32).max(0.2)
     }
@@ -296,21 +278,6 @@ impl Player {
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
         self.session.set_muted(self.muted);
-    }
-
-    fn wake(&mut self) {
-        self.controls = true;
-        self.hide_at = Instant::now() + Duration::from_secs(3);
-    }
-
-    pub fn settle(&mut self) {
-        if self.controls && Instant::now() >= self.hide_after_now() && !self.playlist_open {
-            self.controls = false;
-        }
-    }
-
-    fn hide_after_now(&self) -> Instant {
-        self.hide_at
     }
 
     // ------------------------------------------------------------------ bars
@@ -346,7 +313,6 @@ impl Player {
                         .clicked()
                 {
                     self.playlist_open = !self.playlist_open;
-                    self.wake();
                 }
                 let rec_label = if self.recording { "停止录制" } else { "录制" };
                 let rec_btn = if self.recording {
@@ -476,9 +442,6 @@ impl Player {
                 );
             });
         });
-        // Fed back into the panel so hiding the bar does not hand its height to the
-        // video surface.
-        self.bar_h = ui.min_rect().height();
     }
 
     fn seek_row(&mut self, ui: &mut Ui) {
@@ -505,9 +468,6 @@ impl Player {
         if let Some(f) = jump {
             self.session.set_time_ms((f as f64 * self.len_ms as f64) as i64);
         }
-        if resp.hovered() {
-            self.wake();
-        }
 
         let rail = Rect::from_min_size(Pos2::new(rect.min.x, rect.center().y - 2.0), Vec2::new(rect.width(), 4.0));
         ui.painter().rect_filled(rail, 2.0, t::LINE_SOFT);
@@ -528,9 +488,6 @@ impl Player {
 
     pub fn video(&mut self, ui: &mut Ui) {
         let rect = ui.available_rect_before_wrap();
-        let resp = ui
-            .interact(rect, Id::new("video-surface"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
         let ar = self.aspect();
@@ -541,18 +498,7 @@ impl Player {
             }
         }
 
-        if resp.clicked() {
-            if self.controls {
-                self.controls = false;
-            } else {
-                self.wake();
-            }
-        }
-        if resp.hovered() {
-            self.wake();
-        }
-
-        if self.controls && self.started && self.error.is_none() {
+        if self.started && self.error.is_none() {
             let hot = Rect::from_center_size(rect.center(), Vec2::splat(72.0));
             // Only under the pointer - a permanent disc in the middle of the picture
             // hides what is actually happening on screen.
@@ -630,7 +576,6 @@ impl Player {
                 .corner_radius(7.0);
                 if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
                     self.show_danmu = value;
-                    self.wake();
                 }
             }
             if self.show_danmu && !self.danmu.is_empty() {
@@ -828,7 +773,6 @@ impl Player {
             });
         if let Some(secs) = seek {
             self.session.set_time_ms((secs * 1000.0) as i64);
-            self.wake();
         }
     }
 }
