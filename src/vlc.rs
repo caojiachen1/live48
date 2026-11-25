@@ -24,6 +24,8 @@ type FnPlayerGetTime = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnPlayerSetTime = unsafe extern "C" fn(*mut c_void, i64) -> c_int;
 type FnPlayerGetLength = unsafe extern "C" fn(*mut c_void) -> i64;
 type FnAudioSetMute = unsafe extern "C" fn(*mut c_void, c_int);
+type FnAudioSetVolume = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+type FnAudioGetVolume = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnPlayerGetState = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnVideoSetCallbacks = unsafe extern "C" fn(
     *mut c_void,
@@ -71,7 +73,10 @@ impl FrameState {
         Arc::new(FrameState {
             want: AtomicU64::new(((max_w as u64) << 32) | max_h as u64),
             dims: Mutex::new(None),
-            buffers: [AtomicPtr::new(ptr::null_mut()), AtomicPtr::new(ptr::null_mut())],
+            buffers: [
+                AtomicPtr::new(ptr::null_mut()),
+                AtomicPtr::new(ptr::null_mut()),
+            ],
             bytes: AtomicUsize::new(0),
             busy: [AtomicBool::new(false), AtomicBool::new(false)],
             pick: AtomicUsize::new(0),
@@ -189,7 +194,11 @@ unsafe extern "C" fn cb_lock(opaque: *mut c_void, planes: *mut *mut c_void) -> *
     ptr::null_mut()
 }
 
-unsafe extern "C" fn cb_unlock(opaque: *mut c_void, picture: *mut c_void, _planes: *const *mut c_void) {
+unsafe extern "C" fn cb_unlock(
+    opaque: *mut c_void,
+    picture: *mut c_void,
+    _planes: *const *mut c_void,
+) {
     let st = unsafe { &*(opaque as *const FrameState) };
     if picture.is_null() {
         return;
@@ -338,7 +347,10 @@ pub fn spawn_download(req: crate::app::Requester) {
                 .map_err(|e| e.to_string())?;
 
             send(crate::events::DownloadEvent::Progress(4.0));
-            let mut resp = client.get(URL).send().map_err(|e| format!("下载失败: {e}"))?;
+            let mut resp = client
+                .get(URL)
+                .send()
+                .map_err(|e| format!("下载失败: {e}"))?;
             let total = resp.content_length().unwrap_or(0);
             let mut got = 0u64;
             let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
@@ -429,6 +441,8 @@ struct Ffi {
     player_set_time: FnPlayerSetTime,
     player_get_length: FnPlayerGetLength,
     audio_set_mute: FnAudioSetMute,
+    audio_set_volume: FnAudioSetVolume,
+    audio_get_volume: FnAudioGetVolume,
     player_get_state: FnPlayerGetState,
     video_set_callbacks: FnVideoSetCallbacks,
     video_set_format_callbacks: FnVideoSetFormatCallbacks,
@@ -463,10 +477,10 @@ impl Engine {
             std::env::set_var("VLC_PLUGIN_PATH", &plugins);
         }
 
-        let lib =
-            unsafe { Library::new(&dll) }.map_err(|e| format!("加载 {} 失败: {e}", dll.display()))?;
+        let lib = unsafe { Library::new(&dll) }
+            .map_err(|e| format!("加载 {} 失败: {e}", dll.display()))?;
 
-macro_rules! bind {
+        macro_rules! bind {
             ($field:ident, $name:expr, $ty:ty) => {
                 let $field: $ty = unsafe {
                     *lib.get($name.as_bytes())
@@ -477,22 +491,76 @@ macro_rules! bind {
 
         bind!(new, "libvlc_new", FnNew);
         bind!(release, "libvlc_release", FnRelease);
-        bind!(media_new_location, "libvlc_media_new_location", FnMediaNewLocation);
-        bind!(media_add_option, "libvlc_media_add_option", FnMediaAddOption);
+        bind!(
+            media_new_location,
+            "libvlc_media_new_location",
+            FnMediaNewLocation
+        );
+        bind!(
+            media_add_option,
+            "libvlc_media_add_option",
+            FnMediaAddOption
+        );
         bind!(media_release, "libvlc_media_release", FnMediaRelease);
         bind!(player_new, "libvlc_media_player_new", FnPlayerNew);
-        bind!(player_set_media, "libvlc_media_player_set_media", FnPlayerSetMedia);
+        bind!(
+            player_set_media,
+            "libvlc_media_player_set_media",
+            FnPlayerSetMedia
+        );
         bind!(player_play, "libvlc_media_player_play", FnPlayerPlay);
         bind!(player_stop, "libvlc_media_player_stop", FnPlayerStop);
-        bind!(player_release, "libvlc_media_player_release", FnPlayerRelease);
-        bind!(player_set_pause, "libvlc_media_player_set_pause", FnPlayerSetPause);
-        bind!(player_get_time, "libvlc_media_player_get_time", FnPlayerGetTime);
-        bind!(player_set_time, "libvlc_media_player_set_time", FnPlayerSetTime);
-        bind!(player_get_length, "libvlc_media_player_get_length", FnPlayerGetLength);
-        bind!(player_get_state, "libvlc_media_player_get_state", FnPlayerGetState);
+        bind!(
+            player_release,
+            "libvlc_media_player_release",
+            FnPlayerRelease
+        );
+        bind!(
+            player_set_pause,
+            "libvlc_media_player_set_pause",
+            FnPlayerSetPause
+        );
+        bind!(
+            player_get_time,
+            "libvlc_media_player_get_time",
+            FnPlayerGetTime
+        );
+        bind!(
+            player_set_time,
+            "libvlc_media_player_set_time",
+            FnPlayerSetTime
+        );
+        bind!(
+            player_get_length,
+            "libvlc_media_player_get_length",
+            FnPlayerGetLength
+        );
+        bind!(
+            player_get_state,
+            "libvlc_media_player_get_state",
+            FnPlayerGetState
+        );
         bind!(audio_set_mute, "libvlc_audio_set_mute", FnAudioSetMute);
-        bind!(video_set_callbacks, "libvlc_video_set_callbacks", FnVideoSetCallbacks);
-        bind!(video_set_format_callbacks, "libvlc_video_set_format_callbacks", FnVideoSetFormatCallbacks);
+        bind!(
+            audio_set_volume,
+            "libvlc_audio_set_volume",
+            FnAudioSetVolume
+        );
+        bind!(
+            audio_get_volume,
+            "libvlc_audio_get_volume",
+            FnAudioGetVolume
+        );
+        bind!(
+            video_set_callbacks,
+            "libvlc_video_set_callbacks",
+            FnVideoSetCallbacks
+        );
+        bind!(
+            video_set_format_callbacks,
+            "libvlc_video_set_format_callbacks",
+            FnVideoSetFormatCallbacks
+        );
 
         let ffi = Arc::new(Ffi {
             _lib: lib,
@@ -512,6 +580,8 @@ macro_rules! bind {
             player_get_length,
             player_get_state,
             audio_set_mute,
+            audio_set_volume,
+            audio_get_volume,
             video_set_callbacks,
             video_set_format_callbacks,
         });
@@ -546,10 +616,7 @@ macro_rules! bind {
             ));
         }
 
-        Ok(Engine {
-            ffi,
-            instance,
-        })
+        Ok(Engine { ffi, instance })
     }
 
     /// Starts playing `url` into memory buffers. RTMP, HLS and HTTP-TS all go
@@ -625,7 +692,10 @@ macro_rules! bind {
         // VLC's MRL parser takes Windows separators out of the picture, and the
         // quoting keeps the drive colon from being read as an option separator.
         let dst = out.replace('\\', "/");
-        self.add_option(media, &format!(":sout=#std{{access=file,mux=ts,dst=\"{dst}\"}}"))?;
+        self.add_option(
+            media,
+            &format!(":sout=#std{{access=file,mux=ts,dst=\"{dst}\"}}"),
+        )?;
         for opt in [":no-video", ":no-audio", ":network-caching=1000"] {
             self.add_option(media, opt)?;
         }
@@ -665,7 +735,10 @@ impl Recorder {
     /// True while VLC is still pulling the stream; once the source dies the state
     /// settles on stopped/ended/error and the caller decides whether to resume.
     pub fn running(&self) -> bool {
-        matches!(unsafe { (self.ffi.player_get_state)(self.mp) }, 1 | 2 | 3 | 8)
+        matches!(
+            unsafe { (self.ffi.player_get_state)(self.mp) },
+            1 | 2 | 3 | 8
+        )
     }
 }
 
@@ -722,8 +795,17 @@ impl Session {
         unsafe { (self.ffi.audio_set_mute)(self.mp, muted as c_int) };
     }
 
-    pub fn muted(&self) -> bool {
-        false
+    /// libVLC's scale is 0..100 for normal output; 100 is full volume.
+    pub fn set_volume(&self, volume: i32) {
+        unsafe {
+            (self.ffi.audio_set_volume)(self.mp, volume.clamp(0, 100));
+        }
+    }
+
+    /// The current output volume, or -1 until libVLC has an audio output.
+    /// Callers use this to tell a failed early set from an active output.
+    pub fn volume(&self) -> i32 {
+        unsafe { (self.ffi.audio_get_volume)(self.mp) }
     }
 
     /// libVLC state: 1 opening, 2 buffering, 3 playing, 4 paused, 5 stopped,

@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "live48 native egui client"
 edition = "2021"
 
+[[bin]]
+name = "live48"
+path = "src/main.rs"
+
 [dependencies]
 eframe = "0.35"
 egui = "0.35"

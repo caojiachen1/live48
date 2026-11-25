@@ -110,6 +110,8 @@ impl ImageCache {
         self.draw_cover(ui, url, rect, radius, tx, MAX_EDGE);
     }
 
+    /// Draws a cover into a rect the caller already owns. Returns whether a
+    /// texture was ready, so callers can keep a text fallback until it arrives.
     fn draw_cover(
         &mut self,
         ui: &mut Ui,
@@ -118,34 +120,39 @@ impl ImageCache {
         radius: u8,
         tx: &Sender<Event>,
         cap: u32,
-    ) {
+    ) -> bool {
         ui.painter().rect_filled(rect, radius, PLACEHOLDER);
-        let tex = self.known(url, ui.ctx(), tx, cap);
-        if let Some(tex) = tex {
-            let [tw, th] = tex.size();
-            if tw == 0 || th == 0 {
-                return;
-            }
-            let img_ar = tw as f32 / th as f32;
-            let box_ar = (rect.width() / rect.height()).max(0.01);
-            let uv = if img_ar > box_ar {
-                let inset = (1.0 - box_ar / img_ar) * 0.5;
-                Rect::from_min_max(pos2(inset, 0.0), pos2(1.0 - inset, 1.0))
-            } else {
-                let inset = (1.0 - img_ar / box_ar) * 0.5;
-                Rect::from_min_max(pos2(0.0, inset), pos2(1.0, 1.0 - inset))
-            };
-            paint(ui, &tex, rect, radius, uv);
+        let Some(tex) = self.known(url, ui.ctx(), tx, cap) else {
+            return false;
+        };
+        let [tw, th] = tex.size();
+        if tw == 0 || th == 0 {
+            return false;
         }
+        let img_ar = tw as f32 / th as f32;
+        let box_ar = (rect.width() / rect.height()).max(0.01);
+        let uv = if img_ar > box_ar {
+            let inset = (1.0 - box_ar / img_ar) * 0.5;
+            Rect::from_min_max(pos2(inset, 0.0), pos2(1.0 - inset, 1.0))
+        } else {
+            let inset = (1.0 - img_ar / box_ar) * 0.5;
+            Rect::from_min_max(pos2(0.0, inset), pos2(1.0 - inset, 1.0))
+        };
+        paint(ui, &tex, rect, radius, uv);
+        true
     }
 
     /// Circle-cropped avatar.
     pub fn avatar(&mut self, ui: &mut Ui, url: &str, size: f32, tx: &Sender<Event>) {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(rect.center(), size * 0.5, PLACEHOLDER);
-        let radius = (size as u8 / 2).max(1);
-        self.draw_cover(ui, url, rect, radius, tx, AVATAR_EDGE);
+        self.avatar_at(ui, url, rect, tx);
+    }
+
+    /// Circle-cropped avatar in a rect the caller already owns. Returns whether
+    /// the real image was painted; while loading, callers can draw an initial.
+    pub fn avatar_at(&mut self, ui: &mut Ui, url: &str, rect: Rect, tx: &Sender<Event>) -> bool {
+        let radius = (rect.width().min(rect.height()) as u8 / 2).max(1);
+        self.draw_cover(ui, url, rect, radius, tx, AVATAR_EDGE)
     }
 }
 

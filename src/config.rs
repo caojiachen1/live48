@@ -61,6 +61,13 @@ pub struct MultiMember {
     pub nickname: String,
     /// Theatre shows use a different room endpoint.
     pub open: bool,
+    /// Per-tile audio level, 0.0 to 1.0. Each room starts at full volume.
+    #[serde(default = "full_volume")]
+    pub volume: f32,
+}
+
+fn full_volume() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

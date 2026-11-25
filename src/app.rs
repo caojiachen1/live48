@@ -13,7 +13,7 @@ use crate::config::{self, Config};
 use crate::events::{Action, DownloadEvent, Event, ToastKind};
 use crate::images::ImageCache;
 use crate::models::{badge_text, LiveItem, MemberRank, RoomInfo, Source};
-use crate::multiview::{AddOutcome, MultiAction, MultiView};
+use crate::multiview::{AddOutcome, MultiAction, MultiView, MAX_SLOTS};
 use crate::player::{Entry, Player};
 use crate::theme as t;
 use crate::vlc::{Engine, Recorder};
@@ -818,14 +818,8 @@ impl App {
                         cover: String::new(),
                         source: info.source,
                     }];
-                    Player::open_sized(&engine, &url, entries, 0, true, &ctx, max_w, max_h).map(
-                        |mut p| {
-                            // Every tile starts silent; the accepted focus tile is
-                            // unmuted once the player is installed in the grid.
-                            p.set_muted_exact(true);
-                            Arc::new(Mutex::new(p))
-                        },
-                    )
+                    Player::open_sized(&engine, &url, entries, 0, true, &ctx, max_w, max_h)
+                        .map(|p| Arc::new(Mutex::new(p)))
                 });
             r.send(Event::MultiPlayer { token, result });
         });
@@ -844,7 +838,10 @@ impl App {
                 self.toast(ToastKind::Info, "这个成员已经在多画面里");
             }
             AddOutcome::Full => {
-                self.toast(ToastKind::Info, "多画面最多同时显示 9 路");
+                self.toast(
+                    ToastKind::Info,
+                    format!("多画面最多同时显示 {MAX_SLOTS} 路"),
+                );
             }
         }
     }
@@ -879,7 +876,13 @@ impl App {
             let Some(multi) = self.multi.as_mut() else {
                 return;
             };
-            multi.show(ui, &candidates, loading)
+            multi.show(
+                ui,
+                &candidates,
+                loading,
+                &mut self.images,
+                &self.req.tx,
+            )
         };
 
         let mut close = false;

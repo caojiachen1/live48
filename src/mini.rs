@@ -173,13 +173,13 @@ fn control_bar(state: &Arc<MiniState>, ctx: &Context, ui: &mut Ui, bar: Rect) {
             bottom: 3,
         })
         .show(&mut child, |ui| {
-            let (title, nickname, paused, muted, err) = {
+            let (title, nickname, paused, volume, err) = {
                 let p = lock(&state.player);
                 (
                     p.title.clone(),
                     p.nickname.clone(),
                     p.paused,
-                    p.muted,
+                    p.volume,
                     p.error.clone(),
                 )
             };
@@ -206,13 +206,7 @@ fn control_bar(state: &Arc<MiniState>, ctx: &Context, ui: &mut Ui, bar: Rect) {
                     let close = icons::icon_button(ui, Icon::Close, 26.0).on_hover_text("关闭小窗");
                     let restore = icons::icon_button(ui, Icon::PipExit, 26.0)
                         .on_hover_text("回到主窗口播放");
-                    let sound = if muted {
-                        Icon::SpeakerMute
-                    } else {
-                        Icon::Speaker
-                    };
-                    let mute = icons::icon_button(ui, sound, 26.0)
-                        .on_hover_text(if muted { "取消静音" } else { "静音" });
+                    let sound = crate::volume::button(ui, "mini_volume", volume, 26.0);
                     let play = icons::icon_button(
                         ui,
                         if paused { Icon::Play } else { Icon::Pause },
@@ -226,8 +220,12 @@ fn control_bar(state: &Arc<MiniState>, ctx: &Context, ui: &mut Ui, bar: Rect) {
                     if restore.clicked() {
                         act(state, ctx, ACTION_RESTORE);
                     }
-                    if mute.clicked() {
+                    if sound.clicked {
                         lock(&state.player).toggle_mute();
+                        ctx.request_repaint();
+                    }
+                    if let Some(new_volume) = sound.volume {
+                        lock(&state.player).set_volume(new_volume);
                         ctx.request_repaint();
                     }
                     if play.clicked() {

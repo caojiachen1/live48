@@ -2,6 +2,7 @@
 //! grid, draggable tiles and draggable gutters. There is deliberately no second
 //! window here - every tile is painted inside the app's own viewport.
 
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,13 +12,15 @@ use egui::{
 };
 
 use crate::config::{Config, MultiMember};
+use crate::events::Event;
 use crate::icons::{self, Icon};
+use crate::images::ImageCache;
 use crate::models::{LiveItem, Source};
-use crate::player::{fit, Player};
+use crate::player::Player;
 use crate::theme as t;
 use crate::util;
 
-const MAX_SLOTS: usize = 9;
+pub const MAX_SLOTS: usize = 12;
 const GAP: f32 = 5.0;
 const MIN_SHARE: f32 = 0.08;
 const RETRY_DELAY: Duration = Duration::from_secs(6);
@@ -114,6 +117,7 @@ impl SlotLive {
             title: self.title.clone(),
             nickname: self.nickname.clone(),
             open: self.source == Source::Open,
+            volume: 1.0,
         }
     }
 
@@ -129,6 +133,10 @@ impl SlotLive {
 pub struct MultiSlot {
     pub info: SlotLive,
     pub player: Option<Arc<Mutex<Player>>>,
+    /// Per-tile level, independent of every other room.
+    pub volume: f32,
+    /// The level to restore when the speaker is clicked while muted.
+    last_volume: f32,
     texture: Option<(TextureId, Vec2)>,
     aspect: f32,
     started: bool,
@@ -137,21 +145,49 @@ pub struct MultiSlot {
     retries: u8,
     token: u64,
     retry_at: Option<Instant>,
+    volume_applied: bool,
 }
 
 impl MultiSlot {
-    fn new(info: SlotLive) -> Self {
+    fn new(info: SlotLive, volume: f32) -> Self {
+        let volume = if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let last_volume = if volume > 0.001 { volume } else { 1.0 };
         MultiSlot {
             info,
             player: None,
+            volume,
+            last_volume,
             texture: None,
-            aspect: 16.0 / 9.0,
+            aspect: 9.0 / 16.0,
             started: false,
             error: None,
             loading: false,
             retries: 0,
             token: 0,
             retry_at: None,
+            volume_applied: false,
+        }
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        if volume > 0.001 {
+            self.last_volume = volume;
+        }
+        self.volume = volume;
+    }
+
+    /// One click on the speaker flips between the current level and silence.
+    /// The previous level survives both a click and a dragged slider down to zero.
+    fn toggle_mute(&mut self) {
+        if self.volume > 0.001 {
+            self.set_volume(0.0);
+        } else {
+            self.set_volume(self.last_volume.max(0.01));
         }
     }
 }
@@ -167,7 +203,6 @@ impl Drop for MultiSlot {
 pub struct MultiView {
     pub slots: Vec<MultiSlot>,
     pub layout: Layout,
-    pub focus_id: Option<String>,
     pub picker_open: bool,
     pub picker_query: String,
     pub dirty: bool,
@@ -187,19 +222,17 @@ impl MultiView {
             if m.live_id.is_empty() || slots.iter().any(|s| s.info.live_id == m.live_id) {
                 continue;
             }
-            slots.push(MultiSlot::new(SlotLive::from_config(m)));
+            slots.push(MultiSlot::new(SlotLive::from_config(m), m.volume));
             if slots.len() == MAX_SLOTS {
                 break;
             }
         }
-        let focus_id = slots.first().map(|s| s.info.live_id.clone());
         let picker_open = slots.is_empty();
         let layout = Layout::from_str(&cfg.multi_layout);
         let saved_weights = cfg.multi_weights_layout == layout.as_str();
         MultiView {
             slots,
             layout,
-            focus_id,
             picker_open,
             picker_query: String::new(),
             dirty: false,
@@ -221,7 +254,15 @@ impl MultiView {
     }
 
     pub fn sync_config(&self, cfg: &mut Config) {
-        cfg.multi_members = self.slots.iter().map(|s| s.info.to_config()).collect();
+        cfg.multi_members = self
+            .slots
+            .iter()
+            .map(|s| {
+                let mut m = s.info.to_config();
+                m.volume = s.volume;
+                m
+            })
+            .collect();
         cfg.multi_layout = self.layout.as_str().to_owned();
         cfg.multi_col_w = self.col_w.clone();
         cfg.multi_row_w = self.row_w.clone();
@@ -247,18 +288,13 @@ impl MultiView {
 
     pub fn add_live(&mut self, item: &LiveItem) -> AddOutcome {
         if self.slots.iter().any(|s| s.info.live_id == item.live_id) {
-            self.focus_id = Some(item.live_id.clone());
-            self.apply_audio();
             return AddOutcome::Duplicate;
         }
         if self.slots.len() >= MAX_SLOTS {
             return AddOutcome::Full;
         }
         let info = SlotLive::from_item(item);
-        if self.focus_id.is_none() {
-            self.focus_id = Some(info.live_id.clone());
-        }
-        self.slots.push(MultiSlot::new(info));
+        self.slots.push(MultiSlot::new(info, 1.0));
         self.dirty = true;
         AddOutcome::Added(self.slots.len() - 1)
     }
@@ -267,11 +303,22 @@ impl MultiView {
         if index >= self.slots.len() {
             return;
         }
-        let removed = self.slots.remove(index);
-        if self.focus_id.as_deref() == Some(removed.info.live_id.as_str()) {
-            self.focus_id = self.slots.first().map(|s| s.info.live_id.clone());
-            self.apply_audio();
+        self.slots.remove(index);
+        self.dirty = true;
+    }
+
+    /// Drops every tile in one go. Each dropped slot retires its libVLC session;
+    /// the layout stays as chosen, but the per-layout gutters no longer apply.
+    pub fn clear(&mut self) {
+        if self.slots.is_empty() {
+            return;
         }
+        self.slots.clear();
+        self.drag_from = None;
+        self.drop_target = None;
+        self.col_w.clear();
+        self.row_w.clear();
+        self.weights_for = None;
         self.dirty = true;
     }
 
@@ -301,6 +348,7 @@ impl MultiView {
         slot.started = false;
         slot.texture = None;
         slot.retry_at = None;
+        slot.volume_applied = false;
         slot.retries = slot.retries.saturating_add(1);
         Some((token, slot.info.clone()))
     }
@@ -326,15 +374,6 @@ impl MultiView {
             crate::player::retire_player(player);
             return false;
         };
-        let id = self.slots[index].info.live_id.clone();
-        let focus_ok = self
-            .focus_id
-            .as_ref()
-            .and_then(|f| self.slots.iter().find(|s| &s.info.live_id == f))
-            .is_some_and(|s| s.player.is_some() || (s.loading && s.error.is_none()));
-        if !focus_ok {
-            self.focus_id = Some(id);
-        }
         let slot = &mut self.slots[index];
         if let Some(old) = slot.player.replace(player) {
             crate::player::retire_player(old);
@@ -342,7 +381,7 @@ impl MultiView {
         slot.loading = false;
         slot.error = None;
         slot.retry_at = None;
-        self.apply_audio();
+        slot.volume_applied = false;
         true
     }
 
@@ -369,6 +408,8 @@ impl MultiView {
         ui: &mut Ui,
         candidates: &[LiveItem],
         candidates_loading: bool,
+        images: &mut ImageCache,
+        tx: &Sender<Event>,
     ) -> Vec<MultiAction> {
         let mut actions = Vec::new();
 
@@ -400,7 +441,7 @@ impl MultiView {
                         .inner_margin(Margin::symmetric(14, 14)),
                 )
                 .show(ui, |ui| {
-                    self.picker_body(ui, candidates, candidates_loading, &mut actions)
+                    self.picker_body(ui, candidates, candidates_loading, images, tx, &mut actions)
                 });
         }
 
@@ -435,24 +476,14 @@ impl MultiView {
                 RichText::new(format!("{} / {} 路", self.slots.len(), MAX_SLOTS))
                     .size(11.5)
                     .color(t::TEXT_3),
-            );
+            )
+            .on_hover_text(format!("最多 {MAX_SLOTS} 路，满时上下各六路"));
 
             ui.add_space(12.0);
-            let focus_name = self
-                .focus_id
-                .as_ref()
-                .and_then(|id| self.slots.iter().find(|s| &s.info.live_id == id))
-                .map(|s| s.info.display_name().to_owned())
-                .unwrap_or_else(|| "未选声音".to_owned());
-            ui.label(
-                RichText::new(format!(
-                    "声音：{}",
-                    util::truncate(&focus_name, 150.0, 11.5)
-                ))
-                .size(11.5)
-                .color(t::TEXT_3),
-            )
-            .on_hover_text("点击任意画面切换声音，其余画面静音");
+            ui.label(RichText::new("声音：全部播放").size(11.5).color(t::TEXT_3))
+                .on_hover_text(
+                    "每格右下角喇叭悬停后拖动滑块，或按住喇叭上下拖动，单独调整这一路音量",
+                );
 
             ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
                 self.picker_open = if ui
@@ -488,6 +519,17 @@ impl MultiView {
                 if chosen != self.layout {
                     self.set_layout(chosen);
                 }
+
+                let clear = ui.add_enabled(
+                    !self.slots.is_empty(),
+                    t::ghost_button("清空").min_size(Vec2::new(64.0, 30.0)),
+                );
+                if clear
+                    .on_hover_text("关闭全部画面，回到空的多画面")
+                    .clicked()
+                {
+                    self.clear();
+                }
             });
         });
     }
@@ -497,6 +539,8 @@ impl MultiView {
         ui: &mut Ui,
         candidates: &[LiveItem],
         loading: bool,
+        images: &mut ImageCache,
+        tx: &Sender<Event>,
         actions: &mut Vec<MultiAction>,
     ) {
         ui.horizontal(|ui| {
@@ -599,19 +643,21 @@ impl MultiView {
                             ui.horizontal(|ui| {
                                 let (avatar, _) =
                                     ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                                ui.painter().circle_filled(
-                                    avatar.center(),
-                                    14.0,
-                                    t::alpha(t::WHITE, 18),
-                                );
-                                let initial = name.chars().next().unwrap_or('?').to_string();
-                                ui.painter().text(
-                                    avatar.center(),
-                                    Align2::CENTER_CENTER,
-                                    initial,
-                                    t::heading(13.0),
-                                    t::TEXT,
-                                );
+                                let avatar_url = if item.avatar.is_empty() {
+                                    String::new()
+                                } else {
+                                    crate::api::resolve_image(&item.avatar)
+                                };
+                                if !images.avatar_at(ui, &avatar_url, avatar, tx) {
+                                    let initial = name.chars().next().unwrap_or('?').to_string();
+                                    ui.painter().text(
+                                        avatar.center(),
+                                        Align2::CENTER_CENTER,
+                                        initial,
+                                        t::heading(13.0),
+                                        t::TEXT,
+                                    );
+                                }
                                 ui.add_space(2.0);
                                 ui.vertical(|ui| {
                                     ui.label(
@@ -643,6 +689,10 @@ impl MultiView {
                                     if added {
                                         ui.label(
                                             RichText::new("已加入").size(11.0).color(t::TEXT_3),
+                                        );
+                                    } else if self.slots.len() >= MAX_SLOTS {
+                                        ui.label(
+                                            RichText::new("已满").size(11.0).color(t::TEXT_3),
                                         );
                                     } else if ui
                                         .add_sized(Vec2::new(52.0, 26.0), t::ghost_button("加入"))
@@ -686,7 +736,7 @@ impl MultiView {
     fn grid(&mut self, ui: &mut Ui, actions: &mut Vec<MultiAction>) {
         let rect = ui.available_rect_before_wrap();
         ui.allocate_rect(rect, Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+        ui.painter().rect_filled(rect, 0.0, t::BG);
 
         if self.slots.is_empty() {
             let hit = ui.interact(rect, Id::new("multi_empty_first"), Sense::click());
@@ -725,11 +775,11 @@ impl MultiView {
         // Keep the drop highlight one frame current while a drag is live.
         self.update_drop_target(&geo, ui.ctx());
 
-        let mut focus_req = None;
         let mut remove_req = None;
         let mut retry_req = None;
         let mut drag_started = false;
         let mut drag_stopped = false;
+        let mut volume_active = false;
 
         for cell in &geo.cells {
             let index = cell.index;
@@ -740,19 +790,13 @@ impl MultiView {
                     Sense::click_and_drag(),
                 )
                 .on_hover_cursor(CursorIcon::PointingHand);
-            let focused = self
-                .focus_id
-                .as_deref()
-                .is_some_and(|id| id == self.slots[index].info.live_id);
             let drop_target = self.drop_target == Some(index);
-            let slot = &self.slots[index];
             let result = paint_tile(
                 ui,
-                slot,
+                &self.slots[index],
                 index,
                 cell.rect,
                 &hit,
-                focused,
                 drop_target,
                 self.drag_from == Some(index),
             );
@@ -760,9 +804,23 @@ impl MultiView {
                 remove_req = Some(index);
             } else if result.retry {
                 retry_req = Some(index);
-            } else if result.focus {
-                focus_req = Some(index);
             }
+            if result.toggle_mute {
+                self.slots[index].toggle_mute();
+                self.apply_volume(index);
+                self.dirty = true;
+            }
+            if let Some(volume) = result.volume {
+                let changed = (self.slots[index].volume - volume).abs() > 0.002;
+                if changed {
+                    self.slots[index].set_volume(volume);
+                    self.apply_volume(index);
+                }
+            }
+            if result.volume_commit {
+                self.dirty = true;
+            }
+            volume_active |= result.volume_active;
             drag_started |= hit.drag_started();
             drag_stopped |= hit.drag_stopped();
         }
@@ -783,7 +841,7 @@ impl MultiView {
 
         self.draw_splits(ui, &geo.splits);
 
-        if drag_started {
+        if drag_started && !volume_active {
             if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
                 if let Some(cell) = geo.cells.iter().find(|c| c.rect.contains(pos)) {
                     self.drag_from = Some(cell.index);
@@ -830,12 +888,6 @@ impl MultiView {
                 slot.retry_at = None;
             }
             actions.push(MultiAction::Retry(index));
-        } else if let Some(index) = focus_req {
-            if let Some(slot) = self.slots.get(index) {
-                let id = slot.info.live_id.clone();
-                self.focus_id = Some(id);
-                self.apply_audio();
-            }
         }
     }
 
@@ -864,9 +916,14 @@ impl MultiView {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             p.pump(ctx, ViewportId::ROOT);
+            let started = p.is_started();
+            if started && !slot.volume_applied {
+                p.set_volume(slot.volume);
+                slot.volume_applied = true;
+            }
             slot.texture = p.texture_id();
             slot.aspect = p.aspect();
-            slot.started = p.is_started();
+            slot.started = started;
             let error = p.error.clone();
             drop(p);
             slot.error = error;
@@ -885,19 +942,90 @@ impl MultiView {
         }
     }
 
-    fn apply_audio(&self) {
-        for slot in &self.slots {
-            if let Some(player) = &slot.player {
-                let mute = self.focus_id.as_deref() != Some(slot.info.live_id.as_str());
-                let mut p = player
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                p.set_muted_exact(mute);
-            }
+    fn apply_volume(&self, index: usize) {
+        let Some(slot) = self.slots.get(index) else {
+            return;
+        };
+        if !slot.started {
+            return;
+        }
+        let Some(player) = &slot.player else {
+            return;
+        };
+        let mut p = player
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        p.set_volume(slot.volume);
+    }
+
+    /// The aspect a member wall should use. Member rooms are almost always
+    /// portrait, so the auto layout keeps the tiles portrait too instead of
+    /// leaving wide letterbox bars around every face.
+    fn auto_aspect(&self) -> f32 {
+        let mut aspects: Vec<f32> = self
+            .slots
+            .iter()
+            .filter(|slot| {
+                slot.started && slot.aspect.is_finite() && slot.aspect > 0.1 && slot.aspect < 10.0
+            })
+            .map(|slot| slot.aspect)
+            .collect();
+        if aspects.is_empty() {
+            return 9.0 / 16.0;
+        }
+        aspects.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        aspects[aspects.len() / 2]
+    }
+
+    /// Auto keeps the live aspect. Up to four rooms share one row; from five
+    /// rooms on it always uses a two-row wall with at most six columns, so
+    /// twelve rooms land as six on top and six below.
+    fn auto_geometry(&self, rect: Rect) -> Geometry {
+        let count = self.slots.len().max(1);
+        let ar = self.auto_aspect().max(0.1);
+        let (rows, cols) = if count <= 4 {
+            (1, count)
+        } else {
+            (2, count.div_ceil(2).min(MAX_SLOTS))
+        };
+        let cell_w = ((rect.width() - GAP * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+        let cell_h = ((rect.height() - GAP * (rows as f32 - 1.0)) / rows as f32).max(1.0);
+        let tile_w = cell_w.min(cell_h * ar).max(1.0);
+        let tile_h = tile_w / ar;
+
+        let group_h = tile_h * rows as f32 + GAP * (rows as f32 - 1.0);
+        let y0 = rect.center().y - group_h * 0.5;
+
+        let mut cells = Vec::with_capacity(self.slots.len());
+        for i in 0..self.slots.len() {
+            let row = i / cols;
+            let col = i % cols;
+            let count_in_row = (self.slots.len() - row * cols).min(cols);
+            let row_w = tile_w * count_in_row as f32 + GAP * (count_in_row as f32 - 1.0);
+            let row_x0 = rect.center().x - row_w * 0.5;
+            cells.push(SlotCell {
+                index: i,
+                rect: Rect::from_min_size(
+                    Pos2::new(
+                        row_x0 + (tile_w + GAP) * col as f32,
+                        y0 + (tile_h + GAP) * row as f32,
+                    ),
+                    Vec2::new(tile_w, tile_h),
+                ),
+            });
+        }
+
+        Geometry {
+            cells,
+            empty: Vec::new(),
+            splits: Vec::new(),
         }
     }
 
     fn geometry(&mut self, rect: Rect) -> Geometry {
+        if self.layout == Layout::Auto {
+            return self.auto_geometry(rect);
+        }
         let (cols, rows, focus_layout) = self.shape();
         self.ensure_weights(cols, rows, focus_layout);
 
@@ -1152,9 +1280,12 @@ struct Split {
 }
 
 struct TileHit {
-    focus: bool,
     remove: bool,
     retry: bool,
+    volume: Option<f32>,
+    toggle_mute: bool,
+    volume_active: bool,
+    volume_commit: bool,
 }
 
 fn paint_tile(
@@ -1163,17 +1294,25 @@ fn paint_tile(
     index: usize,
     rect: Rect,
     hit: &Response,
-    focused: bool,
     drop_target: bool,
     dragging: bool,
 ) -> TileHit {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 6.0, Color32::BLACK);
+    let mut volume = slot.volume;
+    let mut volume_change = None;
+    let mut volume_active = false;
+    let mut volume_commit = false;
+    let mut toggle_mute = false;
 
     if slot.started {
-        if let Some((texture, size)) = slot.texture {
-            let dest = Rect::from_center_size(rect.center(), fit(rect.size(), slot.aspect));
-            egui::Image::from_texture((texture, size)).paint_at(ui, dest);
+        if let Some((texture, _)) = slot.texture {
+            ui.painter().image(
+                texture,
+                rect,
+                cover_uv(slot.aspect, rect.size()),
+                Color32::WHITE,
+            );
         }
     }
 
@@ -1281,29 +1420,101 @@ fn paint_tile(
             egui::FontId::proportional(10.5),
             t::TEXT_3,
         );
+
+        let vol_rect = Rect::from_center_size(
+            Pos2::new(rect.max.x - 18.0, strip.center().y),
+            Vec2::splat(24.0),
+        );
+        let vol_hit = ui
+            .interact(
+                vol_rect,
+                Id::new(("multi_vol", index)),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+
+        let pop_w = 146.0f32.min(rect.width() - 16.0).max(96.0);
+        let pop_h = 28.0;
+        let pop = Rect::from_min_size(
+            Pos2::new(
+                (rect.max.x - 8.0 - pop_w).max(rect.min.x + 8.0),
+                (strip.min.y - 8.0 - pop_h).max(rect.min.y + 8.0),
+            ),
+            Vec2::new(pop_w, pop_h),
+        );
+        // The gap between the popover and the speaker is part of its hover area,
+        // so moving the pointer up from the icon keeps the slider open.
+        let pop_hot =
+            Rect::from_min_max(pop.min, Pos2::new(pop.max.x, vol_rect.min.y.max(pop.max.y)));
+        let pop_hit = ui.interact(
+            pop_hot,
+            Id::new(("multi_vol_pop", index)),
+            Sense::click_and_drag(),
+        );
+        let open = vol_hit.hovered() || vol_hit.dragged() || pop_hit.hovered() || pop_hit.dragged();
+        volume_active = open;
+        if open {
+            let track = Rect::from_min_size(
+                Pos2::new(pop.min.x + 10.0, pop.center().y - 1.5),
+                Vec2::new((pop_w - 54.0).max(40.0), 3.0),
+            );
+            if vol_hit.dragged() {
+                let dy = ui.ctx().input(|i| i.pointer.delta().y);
+                volume = ((volume - dy * 0.006).clamp(0.0, 1.0) * 100.0).round() / 100.0;
+                volume_change = Some(volume);
+                volume_commit = vol_hit.drag_stopped();
+            } else if pop_hit.dragged() || pop_hit.clicked() {
+                if let Some(pos) = pop_hit.interact_pointer_pos() {
+                    volume = ((pos.x - track.min.x) / track.width()).clamp(0.0, 1.0);
+                    volume = (volume * 100.0).round() / 100.0;
+                    volume_change = Some(volume);
+                    volume_commit = pop_hit.drag_stopped() || pop_hit.clicked();
+                }
+            }
+            ui.painter()
+                .rect_filled(pop, 8.0, t::alpha(Color32::from_rgb(8, 8, 8), 225));
+            ui.painter().rect_filled(track, 1.5, t::alpha(t::WHITE, 38));
+            ui.painter().rect_filled(
+                Rect::from_min_size(track.min, Vec2::new(track.width() * volume, track.height())),
+                1.5,
+                t::WHITE,
+            );
+            ui.painter().circle_filled(
+                Pos2::new(track.min.x + track.width() * volume, track.center().y),
+                4.5,
+                t::WHITE,
+            );
+            ui.painter().text(
+                Pos2::new(pop.max.x - 10.0, pop.center().y),
+                Align2::RIGHT_CENTER,
+                format!("{}%", (volume * 100.0).round() as i32),
+                egui::FontId::proportional(10.5),
+                t::TEXT_3,
+            );
+        }
+
+        let muted = volume <= 0.001;
         icons::draw(
             ui,
-            if focused {
-                Icon::Speaker
-            } else {
+            if muted {
                 Icon::SpeakerMute
+            } else {
+                Icon::Speaker
             },
-            Rect::from_center_size(
-                Pos2::new(rect.max.x - 18.0, strip.center().y),
-                Vec2::splat(13.0),
-            ),
-            if focused { t::WHITE } else { t::TEXT_3 },
+            vol_rect.shrink(4.0),
+            if open || vol_hit.hovered() {
+                t::WHITE
+            } else {
+                t::TEXT_3
+            },
         );
+        if vol_hit.drag_stopped() || pop_hit.drag_stopped() {
+            volume_commit = true;
+        }
+        toggle_mute = vol_hit.clicked();
     }
 
-    if focused {
-        painter.rect_stroke(
-            rect.shrink(1.0),
-            6.0,
-            Stroke::new(2.0, t::WHITE),
-            StrokeKind::Inside,
-        );
-    } else if drop_target {
+    if drop_target {
         painter.rect_stroke(
             rect.shrink(1.0),
             6.0,
@@ -1320,11 +1531,14 @@ fn paint_tile(
     }
 
     let remove = close.clicked();
-    let clicked = hit.clicked() && !remove;
+    let clicked = hit.clicked() && !remove && !volume_active;
     TileHit {
-        focus: clicked && slot.error.is_none() && slot.started,
         remove,
         retry: clicked && slot.error.is_some(),
+        volume: volume_change,
+        toggle_mute,
+        volume_active,
+        volume_commit,
     }
 }
 
@@ -1355,6 +1569,23 @@ fn paint_empty_tile(ui: &mut Ui, rect: Rect, hit: &Response) {
 fn schedule_retry(slot: &mut MultiSlot) {
     if slot.retries < MAX_AUTO_RETRIES {
         slot.retry_at = Some(Instant::now() + RETRY_DELAY);
+    }
+}
+
+fn cover_uv(ar: f32, dest: Vec2) -> Rect {
+    let full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    if !ar.is_finite() || ar <= 0.0 || dest.x <= 0.0 || dest.y <= 0.0 {
+        return full;
+    }
+    let dest_ar = dest.x / dest.y;
+    if ar > dest_ar {
+        let keep = dest_ar / ar;
+        let side = (1.0 - keep) * 0.5;
+        Rect::from_min_max(Pos2::new(side, 0.0), Pos2::new(1.0 - side, 1.0))
+    } else {
+        let keep = ar / dest_ar;
+        let top = (1.0 - keep) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, top), Pos2::new(1.0, 1.0 - top))
     }
 }
 

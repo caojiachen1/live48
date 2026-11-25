@@ -17,6 +17,7 @@ mod theme;
 mod ui;
 mod util;
 mod vlc;
+mod volume;
 #[cfg(windows)]
 mod win;
 
@@ -33,7 +34,7 @@ fn main() -> eframe::Result {
     }
     if let Some(pos) = args.iter().position(|a| a == "--closetest") {
         let (Some(live_id), kind) = (args.get(pos + 1), args.get(pos + 2)) else {
-            eprintln!("用法: live48-egui --closetest <liveId> [open|member] [秒]");
+            eprintln!("用法: live48 --closetest <liveId> [open|member] [秒]");
             std::process::exit(2);
         };
         let source = match kind.map(|s| s.as_str()) {
@@ -48,14 +49,14 @@ fn main() -> eframe::Result {
             args.get(pos + 1),
             args.get(pos + 2).and_then(|s| s.parse::<u64>().ok()),
         ) else {
-            eprintln!("用法: live48-egui --cachetest <m3u8> [秒]");
+            eprintln!("用法: live48 --cachetest <m3u8> [秒]");
             std::process::exit(2);
         };
         std::process::exit(cachetest(m3u8, secs.unwrap_or(8)));
     }
     if let Some(pos) = args.iter().position(|a| a == "--selftest") {
         let Some(target) = args.get(pos + 1) else {
-            eprintln!("用法: live48-egui --selftest <视频文件或流地址>");
+            eprintln!("用法: live48 --selftest <视频文件或流地址>");
             std::process::exit(2);
         };
         std::process::exit(selftest(target));
@@ -66,14 +67,14 @@ fn main() -> eframe::Result {
             args.get(pos + 2),
             args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()),
         ) else {
-            eprintln!("用法: live48-egui --dltest <liveId> <输出.ts> [秒]");
+            eprintln!("用法: live48 --dltest <liveId> <输出.ts> [秒]");
             std::process::exit(2);
         };
         std::process::exit(dltest(live_id, out, secs.unwrap_or(20)));
     }
     if let Some(pos) = args.iter().position(|a| a == "--recordtest") {
         let (Some(target), Some(out)) = (args.get(pos + 1), args.get(pos + 2)) else {
-            eprintln!("用法: live48-egui --recordtest <视频文件或流地址> <输出.ts>");
+            eprintln!("用法: live48 --recordtest <视频文件或流地址> <输出.ts>");
             std::process::exit(2);
         };
         std::process::exit(recordtest(target, out));

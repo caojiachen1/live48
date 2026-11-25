@@ -5,8 +5,8 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align, Align2, Color32, ColorImage, Context, Direction, Frame, Id, Margin, Pos2, Rect, RichText,
-    Sense, Stroke, TextureId, Ui, UiBuilder, Vec2, ViewportId,
+    Align, Align2, Color32, ColorImage, Context, Direction, Frame, Id, Margin, Pos2, Rect,
+    RichText, Sense, Stroke, TextureId, Ui, UiBuilder, Vec2, ViewportId,
 };
 
 use crate::events::Event;
@@ -101,6 +101,14 @@ pub struct Player {
 
     pub paused: bool,
     pub muted: bool,
+    pub volume: f32,
+    last_volume: f32,
+    /// libVLC can reject the first volume call before its audio output exists.
+    /// Retry until `libvlc_audio_get_volume` reports a real level.
+    audio_synced: bool,
+    /// Also keep pushing the level for a short warm-up even if the first
+    /// get_volume() already looks valid; some outputs come up a beat late.
+    audio_retry_until: Instant,
     started: bool,
     buffering: bool,
     pub error: Option<String>,
@@ -132,6 +140,9 @@ pub struct Player {
     /// Room data the app shows next to the picture.
     pub online_num: i64,
     pub announcement: String,
+    /// The side rail can be dismissed without losing the text; the top bar
+    /// offers a 显示公告 button while it is hidden.
+    pub announcement_open: bool,
     pub play_num: i64,
     pub praise_num: i64,
     /// `pictureOrientation == 1` means landscape; everything else is a portrait room.
@@ -180,13 +191,20 @@ impl Player {
             .get(index)
             .map(|e| e.title.clone())
             .unwrap_or_default();
-        let nickname = entries.get(index).map(|e| e.nickname.clone()).unwrap_or_default();
+        let nickname = entries
+            .get(index)
+            .map(|e| e.nickname.clone())
+            .unwrap_or_default();
         Ok(Player {
             session,
             entries,
             index,
             is_live,
-            title: if title.is_empty() { "无标题".into() } else { title },
+            title: if title.is_empty() {
+                "无标题".into()
+            } else {
+                title
+            },
             nickname,
             texture: Some(ctx.load_texture(
                 "video-frame",
@@ -198,6 +216,10 @@ impl Player {
             frame_size: (16, 9),
             paused: false,
             muted: false,
+            volume: 1.0,
+            last_volume: 1.0,
+            audio_synced: false,
+            audio_retry_until: Instant::now(),
             started: false,
             buffering: true,
             error: None,
@@ -219,6 +241,7 @@ impl Player {
             drawer_tab: 0,
             online_num: 0,
             announcement: String::new(),
+            announcement_open: true,
             play_num: 0,
             praise_num: 0,
             portrait: false,
@@ -232,7 +255,12 @@ impl Player {
 
     /// Swaps in a new stream while keeping the playlist and chrome state. The old
     /// session comes back so the caller can drop it off the UI thread.
-    pub fn reattach(&mut self, engine: &Engine, url: &str, index: usize) -> Result<Session, String> {
+    pub fn reattach(
+        &mut self,
+        engine: &Engine,
+        url: &str,
+        index: usize,
+    ) -> Result<Session, String> {
         let session = engine.open(url, MAX_W, MAX_H)?;
         let old = std::mem::replace(&mut self.session, session);
         self.index = index;
@@ -259,6 +287,8 @@ impl Player {
         }
         self.started = false;
         self.buffering = true;
+        self.audio_synced = false;
+        self.audio_retry_until = Instant::now();
         self.error = None;
         self.last_seq = 0;
         self.paused = false;
@@ -340,13 +370,15 @@ impl Player {
                     let img = ColorImage::from_rgba_unmultiplied([w, h], &self.staging);
                     match self.texture.as_mut() {
                         Some(tex) => tex.set(img, LINEAR),
-                        None => {
-                            self.texture = Some(ctx.load_texture("video-frame", img, LINEAR))
-                        }
+                        None => self.texture = Some(ctx.load_texture("video-frame", img, LINEAR)),
                     }
                     if !self.started {
                         self.started = true;
                         self.buffering = false;
+                        self.audio_synced = false;
+                        self.audio_retry_until = Instant::now() + Duration::from_secs(2);
+                        let level = self.volume;
+                        self.set_volume(level);
                     }
                 }
             }
@@ -365,6 +397,15 @@ impl Player {
             6 => self.error = Some("流已结束".to_owned()),
             7 => self.error = Some("VLC 无法播放该地址（解码或网络错误）".to_owned()),
             _ => {}
+        }
+
+        // The video frame can arrive before libVLC has created its audio
+        // output. Keep retrying the level until get_volume() reports one, and
+        // keep the first seconds warm even if the first reply was optimistic.
+        if self.started
+            && (!self.audio_synced || Instant::now() < self.audio_retry_until)
+        {
+            self.push_audio();
         }
 
         self.time_ms = self.session.time_ms().max(0);
@@ -393,7 +434,11 @@ impl Player {
         if !self.started {
             // Before the first frame arrives, the room's own orientation decides
             // whether the black box is a wide or a tall one.
-            return if self.portrait { 9.0 / 16.0 } else { 16.0 / 9.0 };
+            return if self.portrait {
+                9.0 / 16.0
+            } else {
+                16.0 / 9.0
+            };
         }
         (self.frame_size.0 as f32 / self.frame_size.1 as f32).max(0.2)
     }
@@ -412,16 +457,35 @@ impl Player {
     }
 
     pub fn toggle_mute(&mut self) {
-        self.muted = !self.muted;
-        self.session.set_muted(self.muted);
+        if self.volume > 0.001 {
+            self.last_volume = self.volume;
+            self.set_volume(0.0);
+        } else {
+            self.set_volume(self.last_volume.max(0.01));
+        }
     }
 
-    /// Sets the mute flag explicitly; the grid keeps exactly one tile audible.
-    pub fn set_muted_exact(&mut self, muted: bool) {
-        if self.muted != muted {
-            self.muted = muted;
-            self.session.set_muted(muted);
+    /// Pushes the desired level to libVLC. It is deliberately unconditional:
+    /// a fresh session may still be muted even though our flag says otherwise,
+    /// and the first set can fail before the audio output exists.
+    fn push_audio(&mut self) {
+        let percent = (self.volume.clamp(0.0, 1.0) * 100.0).round() as i32;
+        self.session.set_muted(percent == 0);
+        self.session.set_volume(percent);
+        self.muted = percent == 0;
+        let actual = self.session.volume();
+        self.audio_synced =
+            actual >= 0 && (percent == 0 || (actual - percent).abs() <= 1);
+    }
+
+    /// Per-player level, used by the multi-view wall and the local controls.
+    pub fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        self.volume = volume;
+        if volume > 0.001 {
+            self.last_volume = volume;
         }
+        self.push_audio();
     }
 
     // ------------------------------------------------------------------ bars
@@ -453,14 +517,26 @@ impl Player {
                     ui.label(RichText::new(&self.nickname).size(11.5).color(t::TEXT_3));
                     if self.online_num > 0 {
                         ui.label(
-                            RichText::new(format!("人气 {}", crate::util::fmt_count(self.online_num)))
-                                .size(11.5)
-                                .color(t::TEXT_2),
+                            RichText::new(format!(
+                                "人气 {}",
+                                crate::util::fmt_count(self.online_num)
+                            ))
+                            .size(11.5)
+                            .color(t::TEXT_2),
                         );
                     }
                 });
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if !self.announcement_open && !self.announcement.trim().is_empty() {
+                    if ui
+                        .add_sized(Vec2::new(76.0, 32.0), t::ghost_button("显示公告"))
+                        .on_hover_text("重新在画面侧边显示直播公告")
+                        .clicked()
+                    {
+                        self.announcement_open = true;
+                    }
+                }
                 if self.entries.len() > 1
                     && icons::icon_button(ui, Icon::List, 32.0)
                         .on_hover_text("播放列表 / 弹幕")
@@ -468,7 +544,11 @@ impl Player {
                 {
                     self.playlist_open = !self.playlist_open;
                 }
-                let rec_label = if self.recording { "停止录制" } else { "录制" };
+                let rec_label = if self.recording {
+                    "停止录制"
+                } else {
+                    "录制"
+                };
                 let rec_btn = if self.recording {
                     t::accent_button(rec_label)
                 } else {
@@ -535,23 +615,27 @@ impl Player {
             self.seek_row(ui);
         } else {
             ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::centered_and_justified(Direction::TopDown), |ui| {
-                    let pulse = (ui.ctx().input(|i| i.time).fract() * 2.0).sin();
-                    let a = (150.0 + pulse * 105.0).clamp(0.0, 255.0) as u8;
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(64.0, 18.0), Sense::hover());
-                    ui.painter().circle_filled(
-                        Pos2::new(rect.min.x + 6.0, rect.center().y),
-                        4.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, a),
-                    );
-                    ui.painter().text(
-                        Pos2::new(rect.min.x + 17.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        "LIVE",
-                        t::heading(11.5),
-                        t::TEXT_2,
-                    );
-                });
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(Direction::TopDown),
+                    |ui| {
+                        let pulse = (ui.ctx().input(|i| i.time).fract() * 2.0).sin();
+                        let a = (150.0 + pulse * 105.0).clamp(0.0, 255.0) as u8;
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(64.0, 18.0), Sense::hover());
+                        ui.painter().circle_filled(
+                            Pos2::new(rect.min.x + 6.0, rect.center().y),
+                            4.0,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, a),
+                        );
+                        ui.painter().text(
+                            Pos2::new(rect.min.x + 17.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            "LIVE",
+                            t::heading(11.5),
+                            t::TEXT_2,
+                        );
+                    },
+                );
             });
         }
 
@@ -564,15 +648,11 @@ impl Player {
             {
                 self.toggle_pause();
             }
-            let sound = if self.muted {
-                Icon::SpeakerMute
-            } else {
-                Icon::Speaker
-            };
-            if icons::icon_button(ui, sound, 32.0)
-                .on_hover_text(if self.muted { "取消静音" } else { "静音" })
-                .clicked()
-            {
+            let sound = crate::volume::button(ui, "player_volume", self.volume, 32.0);
+            if let Some(volume) = sound.volume {
+                self.set_volume(volume);
+            }
+            if sound.clicked {
                 self.toggle_mute();
             }
             ui.label(
@@ -641,7 +721,8 @@ impl Player {
         };
         if let Some(f) = jump {
             let t0 = Instant::now();
-            self.session.set_time_ms((f as f64 * self.len_ms as f64) as i64);
+            self.session
+                .set_time_ms((f as f64 * self.len_ms as f64) as i64);
             if crate::perf::on() {
                 eprintln!("PROBE seek {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -690,39 +771,52 @@ impl Player {
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
         let ar = self.aspect();
-        let dest = Rect::from_center_size(rect.center(), fit(rect.size(), ar));
+        let natural = Rect::from_center_size(rect.center(), fit(rect.size(), ar));
+        let notice = self.announcement.trim();
+        let show_notice = self.announcement_open && !notice.is_empty();
+
+        // Give the announcement its own rail in the black side bar instead of
+        // covering the live picture. A landscape stream that already fills the
+        // width gets a narrow rail carved out on the right; portrait streams
+        // simply use the wide bar they already have.
+        let (video_area, notice_bar) = if !show_notice {
+            (rect, None)
+        } else {
+            let left = (natural.min.x - rect.min.x).max(0.0);
+            let right = (rect.max.x - natural.max.x).max(0.0);
+            if left.max(right) >= 210.0 {
+                let bar = if left >= right {
+                    Rect::from_min_max(rect.min, Pos2::new(natural.min.x, rect.max.y))
+                } else {
+                    Rect::from_min_max(Pos2::new(natural.max.x, rect.min.y), rect.max)
+                };
+                (rect, Some(bar))
+            } else {
+                let rail_w = (rect.width() * 0.28).clamp(210.0, 300.0);
+                let area = Rect::from_min_max(
+                    rect.min,
+                    Pos2::new((rect.max.x - rail_w).max(rect.min.x + 1.0), rect.max.y),
+                );
+                let bar = Rect::from_min_max(Pos2::new(area.max.x, rect.min.y), rect.max);
+                (area, Some(bar))
+            }
+        };
+        let dest = Rect::from_center_size(video_area.center(), fit(video_area.size(), ar));
         if self.started {
             if let Some(tex) = &self.texture {
                 egui::Image::from_texture((tex.id(), tex.size_vec2())).paint_at(ui, dest);
             }
         }
 
-        // The room announcement, painted over the picture so the bars never shift.
-        if !self.announcement.is_empty() {
-            let size = 11.5;
-            let w = (rect.width() - 24.0).clamp(80.0, 560.0);
-            let strip = Rect::from_min_size(
-                Pos2::new(rect.center().x - w / 2.0, rect.min.y + 10.0),
-                Vec2::new(w, 24.0),
-            );
-            ui.painter()
-                .rect_filled(strip, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
-            let text = format!(
-                "公告  {}",
-                crate::util::truncate(&self.announcement, w - 24.0, size)
-            );
-            ui.painter().text(
-                strip.center(),
-                Align2::CENTER_CENTER,
-                text,
-                egui::FontId::new(size, t::bold()),
-                t::TEXT_2,
-            );
+        if let Some(bar) = notice_bar {
+            if paint_announcement(ui, bar, dest, notice) {
+                self.announcement_open = false;
+            }
         }
 
         if self.started && self.error.is_none() {
-            let hot = Rect::from_center_size(rect.center(), Vec2::splat(72.0));            // Only under the pointer - a permanent disc in the middle of the picture
-            // hides what is actually happening on screen.
+            let hot = Rect::from_center_size(rect.center(), Vec2::splat(72.0)); // Only under the pointer - a permanent disc in the middle of the picture
+                                                                                // hides what is actually happening on screen.
             let hovered = ui
                 .ctx()
                 .input(|i| i.pointer.hover_pos())
@@ -748,10 +842,10 @@ impl Player {
         }
 
         if let Some(err) = self.error.clone() {
-            let mut child = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(Rect::from_center_size(rect.center(), Vec2::new(420.0, 140.0))),
-            );
+            let mut child = ui.new_child(UiBuilder::new().max_rect(Rect::from_center_size(
+                rect.center(),
+                Vec2::new(420.0, 140.0),
+            )));
             Frame::new()
                 .fill(t::alpha(Color32::from_rgb(24, 24, 24), 235))
                 .corner_radius(10.0)
@@ -759,7 +853,11 @@ impl Player {
                 .stroke(Stroke::new(1.0, t::LINE))
                 .show(&mut child, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("无法播放").font(t::heading(15.0)).color(t::ERR));
+                        ui.label(
+                            RichText::new("无法播放")
+                                .font(t::heading(15.0))
+                                .color(t::ERR),
+                        );
                         ui.add_space(6.0);
                         ui.label(RichText::new(err).size(12.5).color(t::TEXT_2));
                         ui.add_space(12.0);
@@ -803,7 +901,11 @@ impl Player {
                         .color(if selected { t::ON_ACCENT } else { t::TEXT_2 })
                         .font(t::heading(12.5)),
                 )
-                .fill(if selected { t::WHITE } else { Color32::TRANSPARENT })
+                .fill(if selected {
+                    t::WHITE
+                } else {
+                    Color32::TRANSPARENT
+                })
                 .corner_radius(7.0);
                 if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
                     self.drawer_tab = value;
@@ -817,7 +919,11 @@ impl Player {
                         .color(if selected { t::ON_ACCENT } else { t::TEXT_2 })
                         .font(t::heading(12.5)),
                 )
-                .fill(if selected { t::WHITE } else { Color32::TRANSPARENT })
+                .fill(if selected {
+                    t::WHITE
+                } else {
+                    Color32::TRANSPARENT
+                })
                 .corner_radius(7.0);
                 if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
                     self.drawer_tab = 2;
@@ -834,12 +940,16 @@ impl Player {
             }
             if self.drawer_tab == 1 {
                 ui.label(
-                    RichText::new(format!("{} 条", self.danmu.len())).size(11.0).color(t::TEXT_3),
+                    RichText::new(format!("{} 条", self.danmu.len()))
+                        .size(11.0)
+                        .color(t::TEXT_3),
                 );
             }
             if self.drawer_tab == 2 {
                 ui.label(
-                    RichText::new(format!("{} 人", self.rank.len())).size(11.0).color(t::TEXT_3),
+                    RichText::new(format!("{} 人", self.rank.len()))
+                        .size(11.0)
+                        .color(t::TEXT_3),
                 );
             }
         });
@@ -920,11 +1030,8 @@ impl Player {
                         .interact(row.response.rect, Id::new(("pl", idx)), Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.hovered() && !active {
-                        ui.painter().rect_filled(
-                            row.response.rect,
-                            0.0,
-                            t::alpha(t::WHITE, 12),
-                        );
+                        ui.painter()
+                            .rect_filled(row.response.rect, 0.0, t::alpha(t::WHITE, 12));
                     }
                     if resp.clicked() && !active {
                         self.cmd = Cmd::Goto(idx);
@@ -995,19 +1102,15 @@ impl Player {
                             ui.set_width(w - 20.0);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(RichText::new(&d.time).size(11.0).color(if live {
+                                    t::WHITE
+                                } else {
+                                    t::TEXT_3
+                                }));
                                 ui.label(
-                                    RichText::new(&d.time)
-                                        .size(11.0)
-                                        .color(if live { t::WHITE } else { t::TEXT_3 }),
-                                );
-                                ui.label(
-                                    RichText::new(crate::util::truncate(
-                                        &d.nickname,
-                                        96.0,
-                                        12.0,
-                                    ))
-                                    .size(12.0)
-                                    .color(if live { t::WHITE } else { t::TEXT_2 }),
+                                    RichText::new(crate::util::truncate(&d.nickname, 96.0, 12.0))
+                                        .size(12.0)
+                                        .color(if live { t::WHITE } else { t::TEXT_2 }),
                                 );
                                 ui.label(
                                     RichText::new(crate::util::truncate(&d.message, 120.0, 12.0))
@@ -1017,11 +1120,7 @@ impl Player {
                             });
                         });
                     let resp = ui
-                        .interact(
-                            frame.response.rect,
-                            Id::new(("danmu", row)),
-                            Sense::click(),
-                        )
+                        .interact(frame.response.rect, Id::new(("danmu", row)), Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
                         seek = Some(d.secs);
@@ -1099,16 +1198,13 @@ impl Player {
                                         .size(11.0)
                                         .color(t::TEXT_3),
                                 );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(crate::util::fmt_count(m.melee))
-                                                .size(12.0)
-                                                .color(t::TEXT_2),
-                                        );
-                                    },
-                                );
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(crate::util::fmt_count(m.melee))
+                                            .size(12.0)
+                                            .color(t::TEXT_2),
+                                    );
+                                });
                             });
                         });
                 }
@@ -1117,6 +1213,74 @@ impl Player {
 }
 
 const LINEAR: egui::TextureOptions = egui::TextureOptions::LINEAR;
+
+fn paint_announcement(ui: &Ui, bar: Rect, video: Rect, text: &str) -> bool {
+    let pad = 16.0;
+    let panel_w = (bar.width() - 36.0).clamp(150.0, 300.0);
+    let body_w = (panel_w - pad * 2.0).max(48.0);
+    let max_rows = (((bar.height() - 60.0) / 16.0).floor() as usize).clamp(1, 8);
+
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        egui::FontId::proportional(12.5),
+        t::TEXT_2,
+        body_w,
+    );
+    job.wrap.max_rows = max_rows;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+
+    let panel_h = pad * 2.0 + 24.0 + galley.size().y;
+    let panel_x = if bar.center().x < video.center().x {
+        (video.min.x - 18.0 - panel_w).max(bar.min.x + 16.0)
+    } else {
+        (video.max.x + 18.0).min(bar.max.x - panel_w - 16.0)
+    };
+    let panel_y = (video.min.y + 22.0)
+        .max(bar.min.y + 16.0)
+        .min((bar.max.y - 16.0 - panel_h).max(bar.min.y + 16.0));
+    let panel = Rect::from_min_size(Pos2::new(panel_x, panel_y), Vec2::new(panel_w, panel_h));
+    let close_rect = Rect::from_center_size(
+        Pos2::new(panel.max.x - 18.0, panel.min.y + 19.0),
+        Vec2::splat(20.0),
+    );
+    let close = ui
+        .interact(close_rect, Id::new("player_announcement_close"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("关闭公告");
+
+    ui.painter()
+        .rect_filled(panel, 10.0, Color32::from_rgb(16, 16, 16));
+    ui.painter().rect_filled(
+        Rect::from_min_size(panel.min + Vec2::new(14.0, 16.0), Vec2::new(2.0, 15.0)),
+        1.0,
+        t::WHITE,
+    );
+    ui.painter().text(
+        Pos2::new(panel.min.x + 24.0, panel.min.y + 14.0),
+        Align2::LEFT_TOP,
+        "公告",
+        egui::FontId::new(11.0, t::bold()),
+        t::TEXT,
+    );
+    if close.hovered() {
+        ui.painter()
+            .circle_filled(close_rect.center(), 9.5, t::alpha(t::WHITE, 24));
+    }
+    icons::draw(
+        ui,
+        Icon::Close,
+        close_rect.shrink(5.0),
+        if close.hovered() { t::WHITE } else { t::TEXT_3 },
+    );
+    ui.painter().galley(
+        Pos2::new(panel.min.x + pad, panel.min.y + 40.0),
+        galley,
+        t::TEXT_2,
+    );
+    close.clicked()
+}
 
 pub fn fit(avail: Vec2, ar: f32) -> Vec2 {
     if avail.x <= 0.0 || avail.y <= 0.0 {
