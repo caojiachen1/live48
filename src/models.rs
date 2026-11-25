@@ -67,6 +67,12 @@ pub struct LiveItem {
     pub avatar: String,
     pub user_id: String,
     pub room_id: String,
+    /// Team attributes; only member lives carry them.
+    pub team_id: i64,
+    pub team_name: String,
+    pub group_id: i64,
+    /// Theatre shows and history entries advertise a view count.
+    pub play_num: i64,
     pub source: Source,
 }
 
@@ -98,6 +104,9 @@ struct RawLiveItem {
     stime: Option<String>,
     #[serde(rename = "roomId", default)]
     room_id: Option<String>,
+    /// `playNum` arrives as a number on theatre shows and as a string in history lists.
+    #[serde(rename = "playNum", default)]
+    play_num: Option<serde_json::Value>,
     #[serde(rename = "userInfo", default)]
     user_info: UserInfo,
     #[serde(rename = "teamList", default)]
@@ -108,6 +117,18 @@ struct RawLiveItem {
 struct RawTeam {
     #[serde(rename = "teamName", default)]
     team_name: String,
+    #[serde(rename = "teamId", default)]
+    team_id: i64,
+    #[serde(rename = "groupId", default)]
+    group_id: i64,
+}
+
+fn loose_i64(v: &Option<serde_json::Value>) -> i64 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 impl From<RawLiveItem> for LiveItem {
@@ -120,7 +141,11 @@ impl From<RawLiveItem> for LiveItem {
         let sub_title = r
             .sub_title
             .filter(|s| !s.is_empty())
-            .or(if team.is_empty() { None } else { Some(team) })
+            .or(if team.is_empty() {
+                None
+            } else {
+                Some(team.clone())
+            })
             .unwrap_or_default();
         LiveItem {
             live_id: r.live_id_str.clone().unwrap_or_else(|| r.live_id.as_str().to_owned()),
@@ -141,6 +166,10 @@ impl From<RawLiveItem> for LiveItem {
             avatar: r.user_info.avatar,
             user_id: r.user_info.user_id,
             room_id: r.room_id.unwrap_or_default(),
+            team_id: r.team_list.first().map(|t| t.team_id).unwrap_or(0),
+            team_name: team,
+            group_id: r.team_list.first().map(|t| t.group_id).unwrap_or(0),
+            play_num: loose_i64(&r.play_num),
             source: Source::Member,
         }
     }
@@ -150,8 +179,9 @@ impl From<RawLiveItem> for LiveItem {
 struct ListContent {
     #[serde(rename = "liveList", default)]
     live_list: Vec<RawLiveItem>,
+    /// A string cursor on the list endpoints, a millisecond stamp on history.
     #[serde(default)]
-    next: Option<String>,
+    next: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -180,13 +210,32 @@ pub struct Stream {
     pub vip: bool,
 }
 
+impl Stream {
+    /// Live rooms only advertise RTMP; the built-in player demuxes it itself, so
+    /// those are kept in the清晰度 list instead of being filtered out.
+    pub fn is_rtmp(&self) -> bool {
+        self.path.starts_with("rtmp://") || self.path.starts_with("rtmps://")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RoomInfo {
     pub room_id: String,
     pub play_stream_path: Option<String>,
+    /// What the current app plays first: a merged, multi-CDN address.
+    pub merge_stream_url: Option<String>,
+    pub m3u8_path: Option<String>,
     pub streams: Vec<Stream>,
     /// A `.lrc` file with the record's danmaku; empty for lives and theatre shows.
     pub msg_file_path: Option<String>,
+    /// Shown as "人气值" in the app.
+    pub online_num: i64,
+    pub announcement: String,
+    /// 0 portrait, 1 landscape.
+    pub orientation: i64,
+    /// Theatre shows only.
+    pub play_num: i64,
+    pub praise_num: i64,
 }
 
 #[derive(Deserialize)]
@@ -195,10 +244,26 @@ struct RoomInfoContent {
     room_id: String,
     #[serde(rename = "playStreamPath", default)]
     play_stream_path: Option<String>,
+    #[serde(rename = "mergeStreamUrl", default)]
+    merge_stream_url: Option<String>,
+    #[serde(rename = "m3u8path", default)]
+    m3u8_path: Option<String>,
     #[serde(rename = "playStreams", default)]
     play_streams: Vec<RawStream>,
     #[serde(rename = "msgFilePath", default)]
     msg_file_path: Option<String>,
+    /// Numbers on this endpoint are sometimes strings, so every counter goes
+    /// through the loose reader.
+    #[serde(rename = "onlineNum", default)]
+    online_num: Option<serde_json::Value>,
+    #[serde(default)]
+    announcement: Option<String>,
+    #[serde(rename = "pictureOrientation", default)]
+    orientation: Option<serde_json::Value>,
+    #[serde(rename = "playNum", default)]
+    play_num: Option<serde_json::Value>,
+    #[serde(rename = "praiseNum", default)]
+    praise_num: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -239,7 +304,8 @@ pub fn parse_live_list(json: &str) -> Result<(Vec<LiveItem>, String), String> {
         serde_json::from_str(json).map_err(|e| format!("列表解析失败: {e}"))?;
     match res.content {
         Some(c) => {
-            let next = c.next.unwrap_or_else(|| "0".to_string());
+            let next = loose_string(&c.next);
+            let next = if next.is_empty() { "0".to_string() } else { next };
             Ok((
                 c.live_list
                     .into_iter()
@@ -263,7 +329,8 @@ pub fn parse_open_live_list(json: &str) -> Result<(Vec<LiveItem>, String), Strin
         serde_json::from_str(json).map_err(|e| format!("公演列表解析失败: {e}"))?;
     match res.content {
         Some(c) => {
-            let next = c.next.unwrap_or_else(|| "0".to_string());
+            let next = loose_string(&c.next);
+            let next = if next.is_empty() { "0".to_string() } else { next };
             let items = c
                 .live_list
                 .into_iter()
@@ -283,11 +350,10 @@ pub fn parse_room_info(json: &str) -> Result<RoomInfo, String> {
     let res: RoomInfoResponse =
         serde_json::from_str(json).map_err(|e| format!("房间信息解析失败: {e}"))?;
     let c = res.content.ok_or_else(|| "响应中没有 content".to_string())?;
-    let is_rtmp = |s: &str| s.starts_with("rtmp://") || s.starts_with("rtmps://");
     let streams: Vec<Stream> = c
         .play_streams
         .into_iter()
-        .filter(|s| !s.stream_path.is_empty() && !is_rtmp(&s.stream_path))
+        .filter(|s| !s.stream_path.is_empty())
         .map(|s| Stream {
             name: s.stream_name,
             stream_type: s.stream_type,
@@ -297,37 +363,49 @@ pub fn parse_room_info(json: &str) -> Result<RoomInfo, String> {
         .collect();
     Ok(RoomInfo {
         room_id: c.room_id,
-        play_stream_path: c.play_stream_path,
+        play_stream_path: c.play_stream_path.filter(|s| !s.is_empty()),
+        merge_stream_url: c.merge_stream_url.filter(|s| !s.is_empty()),
+        m3u8_path: c.m3u8_path.filter(|s| !s.is_empty()),
         streams,
         msg_file_path: c.msg_file_path.filter(|s| !s.is_empty()),
+        online_num: loose_i64(&c.online_num),
+        announcement: c.announcement.unwrap_or_default(),
+        orientation: loose_i64(&c.orientation),
+        play_num: loose_i64(&c.play_num),
+        praise_num: loose_i64(&c.praise_num),
     })
 }
 
-/// An explicit `streamType` wins; otherwise prefer the best non-RTMP address and only
-/// fall back to RTMP, which the built-in libVLC player can open but a system player
-/// usually cannot.
+/// The app resolves a room in this order: a明确清晰度 → the merged CDN address →
+/// the plain stream path → the `.m3u8` → the best stream in the list.
 pub fn pick_stream(info: &RoomInfo, want: Option<i64>) -> Result<String, String> {
     if let Some(t) = want {
         if let Some(s) = info.streams.iter().find(|s| s.stream_type == t) {
             return Ok(s.path.clone());
         }
     }
-    for st in [3i64, 1, 2] {
-        if let Some(s) = info.streams.iter().find(|s| s.stream_type == st) {
-            return Ok(s.path.clone());
+    if let Some(p) = info.merge_stream_url.as_deref() {
+        if !p.is_empty() {
+            return Ok(p.to_owned());
         }
+    }
+    if let Some(p) = info.play_stream_path.as_deref() {
+        if !p.is_empty() {
+            return Ok(p.to_owned());
+        }
+    }
+    if let Some(p) = info.m3u8_path.as_deref() {
+        if !p.is_empty() {
+            return Ok(p.to_owned());
+        }
+    }
+    if let Some(s) = info.streams.iter().find(|s| !s.is_rtmp()) {
+        return Ok(s.path.clone());
     }
     if let Some(s) = info.streams.first() {
         return Ok(s.path.clone());
     }
-    if let Some(p) = &info.play_stream_path {
-        if !p.starts_with("rtmp") {
-            return Ok(p.clone());
-        }
-    }
-    info.play_stream_path
-        .clone()
-        .ok_or_else(|| "未能获取到可用的流地址".to_string())
+    Err("未能获取到可用的流地址".to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -371,4 +449,137 @@ fn stamp_to_secs(stamp: &str) -> Option<f64> {
     let m: f64 = it.next()?.parse().ok()?;
     let s: f64 = it.next()?.parse().ok()?;
     Some(h * 3600.0 + m * 60.0 + s)
+}
+
+// ------------------------------------------------------------ history / rank
+
+fn loose_string(v: &Option<serde_json::Value>) -> String {
+    match v {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `getHistoryRecord` answers with the list envelope, but its cursor is a
+/// millisecond stamp (sometimes a number, sometimes a string).
+pub fn parse_history(json: &str) -> Result<(Vec<LiveItem>, String), String> {
+    parse_live_list(json)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemberRank {
+    pub rank: i64,
+    /// The applause/melee count the app sorts this list by.
+    pub melee: i64,
+    pub name: String,
+    pub avatar: String,
+    pub team: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RawRankUser {
+    #[serde(rename = "userName", default)]
+    name: String,
+    #[serde(rename = "userAvatar", default)]
+    avatar: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RawRankTeam {
+    #[serde(rename = "teamName", default)]
+    team: String,
+}
+
+#[derive(Deserialize)]
+struct RawRank {
+    #[serde(default)]
+    rank: i64,
+    #[serde(default)]
+    melee: i64,
+    #[serde(default)]
+    user: RawRankUser,
+    #[serde(rename = "userTeam", default)]
+    user_team: RawRankTeam,
+}
+
+pub fn parse_member_rank(json: &str) -> Result<Vec<MemberRank>, String> {
+    #[derive(Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        content: Option<serde_json::Value>,
+    }
+    let res: Resp = serde_json::from_str(json).map_err(|e| format!("榜单解析失败: {e}"))?;
+    let Some(serde_json::Value::Array(items)) = res.content else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let raw: RawRank =
+            serde_json::from_value(item).map_err(|e| format!("榜单条目解析失败: {e}"))?;
+        out.push(MemberRank {
+            rank: raw.rank,
+            melee: raw.melee,
+            name: raw.user.name,
+            avatar: raw.user.avatar,
+            team: raw.user_team.team,
+        });
+    }
+    Ok(out)
+}
+
+/// One room that is broadcasting right now, from `get/all/ongoing/live/info`.
+#[derive(Clone, Debug, Default)]
+pub struct OngoingLive {
+    pub star_id: String,
+    pub name: String,
+    pub live_url: String,
+    pub is_living: bool,
+    pub live_type: i64,
+    pub title: String,
+}
+
+#[derive(Deserialize)]
+struct RawGoing {
+    #[serde(rename = "starId", default)]
+    star_id: Option<serde_json::Value>,
+    #[serde(rename = "agentName", default)]
+    name: String,
+    #[serde(rename = "liveUrl", default)]
+    live_url: String,
+    #[serde(rename = "isLiving", default)]
+    is_living: bool,
+    #[serde(rename = "liveType", default)]
+    live_type: i64,
+    #[serde(default)]
+    title: String,
+}
+
+pub fn parse_ongoing(json: &str) -> Result<Vec<OngoingLive>, String> {
+    #[derive(Deserialize)]
+    struct Content {
+        #[serde(rename = "liveInfos", default)]
+        live_infos: Vec<RawGoing>,
+    }
+    #[derive(Deserialize)]
+    struct Resp {
+        #[serde(default)]
+        content: Option<Content>,
+    }
+    let res: Resp = serde_json::from_str(json).map_err(|e| format!("在播列表解析失败: {e}"))?;
+    let Some(content) = res.content else {
+        return Ok(Vec::new());
+    };
+    Ok(content
+        .live_infos
+        .into_iter()
+        .map(|r| OngoingLive {
+            star_id: loose_string(&r.star_id),
+            name: r.name,
+            live_url: r.live_url,
+            is_living: r.is_living,
+            live_type: r.live_type,
+            title: r.title,
+        })
+        .collect())
 }

@@ -36,17 +36,16 @@ fn headers() -> HeaderMap {
         CONTENT_TYPE,
         HeaderValue::from_static("application/json;charset=utf-8"),
     );
+    // Same shape as the client itself: PocketFans201807/<version> (platform…).
     h.insert(
         USER_AGENT,
-        HeaderValue::from_static(
-            "PocketFans201807/6.0.16 (iPhone; iOS 13.5.1; Scale/2.00)",
-        ),
+        HeaderValue::from_static("PocketFans201807/7.1.45 (iPhone; iOS 26.1; Scale/3.00)"),
     );
     h.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-Hans-AW;q=1"));
     h.insert(
         "appInfo",
         HeaderValue::from_static(
-            r#"{"vendor":"apple","deviceId":"11111111-1111-1111-1111-111111111111","appVersion":"7.0.4","appBuild":"23011601","osVersion":"16.3.1","osType":"ios","deviceName":"iPhone XR","os":"ios"}"#,
+            r#"{"vendor":"apple","deviceId":"11111111-1111-1111-1111-111111111111","appVersion":"7.1.45","appBuild":"26110901","osVersion":"26.1","osType":"ios","deviceName":"iPhone 16 Pro","os":"ios"}"#,
         ),
     );
     h
@@ -79,33 +78,42 @@ impl Api {
         res.text().map_err(|e| e.to_string())
     }
 
-    pub fn live_list(&self) -> Result<Vec<LiveItem>, String> {
+    pub fn live_list(&self, group_id: i64, team_id: i64) -> Result<Vec<LiveItem>, String> {
         let json = self.text(
             "getLiveList",
-            &serde_json::json!({ "debug": true, "next": "0", "groupId": 0, "record": false }),
+            &serde_json::json!({
+                "debug": false,
+                "next": "0",
+                "groupId": group_id,
+                "teamId": team_id,
+                "userId": 0,
+                "record": false,
+            }),
         )?;
         models::parse_live_list(&json).map(|(items, _)| items)
-    }
-
-    pub fn record_page(&self, next: &str) -> Result<(Vec<LiveItem>, String), String> {
-        self.record_page_group(next, 0)
     }
 
     pub fn record_page_group(
         &self,
         next: &str,
         group_id: i64,
+        team_id: i64,
     ) -> Result<(Vec<LiveItem>, String), String> {
         let json = self.text(
             "getLiveList",
-            &serde_json::json!({ "debug": true, "next": next, "groupId": group_id, "record": true }),
+            &serde_json::json!({
+                "debug": false,
+                "next": next,
+                "record": true,
+                "groupId": group_id,
+                "teamId": team_id,
+                "userId": 0,
+            }),
         )?;
         models::parse_live_list(&json)
     }
 
-    /// One page of a single member's records. `next` must not be `"0"` here: the server
-    /// silently returns nothing for `userId` + `next=0`, so the caller has to hand it a
-    /// real cursor - which is why [records_for_user] seeds itself from the newest record.
+    /// One page of one member's live records: the same list endpoint with a `userId`.
     pub fn record_page_user(
         &self,
         next: &str,
@@ -114,14 +122,43 @@ impl Api {
         let json = self.text(
             "getLiveList",
             &serde_json::json!({
-                "debug": true,
+                "debug": false,
                 "next": next,
-                "groupId": 0,
                 "record": true,
-                "userId": user_id,
+                "groupId": 0,
+                "teamId": 0,
+                "userId": user_id.parse::<i64>().unwrap_or(0),
             }),
         )?;
         models::parse_live_list(&json)
+    }
+
+    /// The theatre playbacks a member took part in. The app asks for this next to
+    /// `getOpenLiveOne` on a show's page, which is why the rows are opened as
+    /// theatre items even though the request only carries the member id.
+    pub fn member_playback(&self, star_id: &str) -> Result<(Vec<LiveItem>, String), String> {
+        let json = self.text(
+            "getHistoryRecord",
+            &serde_json::json!({ "starId": star_id.parse::<i64>().unwrap_or(0), "next": 0 }),
+        )?;
+        let (mut items, next) = models::parse_history(&json)?;
+        for item in &mut items {
+            item.source = Source::Open;
+        }
+        Ok((items, next))
+    }
+
+    /// Raw page of `getHistoryRecord`, kept for the self-check output.
+    pub fn history_records(
+        &self,
+        star_id: &str,
+        next: &str,
+    ) -> Result<(Vec<LiveItem>, String), String> {
+        let json = self.text(
+            "getHistoryRecord",
+            &serde_json::json!({ "starId": star_id.parse::<i64>().unwrap_or(0), "next": next.parse::<i64>().unwrap_or(0) }),
+        )?;
+        models::parse_history(&json)
     }
 
     /// Walk pages back until the newest-oldest cursor passes `target_ms`
@@ -130,6 +167,8 @@ impl Api {
         &self,
         from_next: &str,
         target_ms: i64,
+        group_id: i64,
+        team_id: i64,
     ) -> Result<(Vec<LiveItem>, String), String> {
         let mut next = from_next.to_string();
         let mut acc: Vec<LiveItem> = Vec::new();
@@ -137,47 +176,11 @@ impl Api {
             if next == "0" && !acc.is_empty() {
                 break;
             }
-            let (items, cursor) = self.record_page(&next)?;
+            let (items, cursor) = self.record_page_group(&next, group_id, team_id)?;
             let reached = items.last().and_then(|i| i.ctime).unwrap_or(i64::MAX) < target_ms;
             acc.extend(items);
             next = cursor;
             if reached || next == "0" {
-                break;
-            }
-        }
-        Ok((acc, next))
-    }
-
-    pub fn records_for_user(
-        &self,
-        user_id: &str,
-        target_ms: i64,
-    ) -> Result<(Vec<LiveItem>, String), String> {
-        let (seed, cursor) = self.record_page("0")?;
-        let newest_is_target = seed
-            .first()
-            .is_some_and(|i| i.user_id == user_id || i.nickname == user_id);
-        let seed_first = seed.first().cloned();
-        let mut acc: Vec<LiveItem> = Vec::new();
-        if newest_is_target {
-            if let Some(first) = seed_first.clone() {
-                acc.push(first);
-            }
-        }
-        let mut next = if cursor == "0" {
-            seed_first.map(|i| i.live_id).unwrap_or_default()
-        } else {
-            cursor
-        };
-        if next.is_empty() {
-            return Ok((acc, "0".to_owned()));
-        }
-        loop {
-            let (items, cursor) = self.record_page_user(&next, user_id)?;
-            let reached = items.last().and_then(|i| i.ctime).unwrap_or(i64::MAX) < target_ms;
-            acc.extend(items);
-            next = cursor;
-            if reached || next == "0" || next.is_empty() {
                 break;
             }
         }
@@ -216,55 +219,36 @@ impl Api {
         models::parse_room_info(&json)
     }
 
-    fn get_live_stream_v2(&self, live_id: &str) -> Result<String, String> {
-        self.text(
-            "getlivestream",
-            &serde_json::json!({ "liveId": live_id, "streamType": 3 }),
-        )
-    }
-
-    /// Prefer a non-RTMP address; falls back to RTMP, which the built-in libVLC
-    /// player can open directly but an external system player may not.
-    pub fn playable_stream_url(
+    /// The address for a room, resolved the way the app does it: an explicit清晰度,
+    /// then the merged multi-CDN URL, then the plain path.
+    pub fn stream_url(
         &self,
         live_id: &str,
         source: Source,
         want_type: Option<i64>,
     ) -> Result<String, String> {
         let info = self.room_info(live_id, source)?;
-        if let Some(path) = models::pick_stream(&info, want_type).ok() {
-            return Ok(path);
-        }
-        if source == Source::Member {
-            if let Ok(v2) = self.get_live_stream_v2(live_id) {
-                if let Some(serde_json::Value::String(p)) =
-                    serde_json::from_str::<serde_json::Value>(&v2)
-                        .ok()
-                        .and_then(|v| v.get("content").cloned())
-                {
-                    if !p.is_empty() && !p.starts_with("rtmp") {
-                        return Ok(p);
-                    }
-                }
-            }
-        }
-        models::pick_stream(&info, None)
-            .or_else(|_| info.play_stream_path.clone().ok_or("未能获取到可用的流地址".to_string()))
+        models::pick_stream(&info, want_type)
     }
 
-    /// The raw `playStreamPath` / best stream, which is what libVLC wants: it demuxes
-    /// RTMP itself, so there is no reason to prefer the weaker HTTPS copy.
-    pub fn stream_url(&self, live_id: &str, source: Source, want_type: Option<i64>) -> Result<String, String> {
-        let info = self.room_info(live_id, source)?;
-        if let Some(t) = want_type {
-            if let Some(s) = info.streams.iter().find(|s| s.stream_type == t) {
-                return Ok(s.path.clone());
-            }
-        }
-        match info.play_stream_path.clone() {
-            Some(p) if !p.is_empty() => Ok(p),
-            _ => models::pick_stream(&info, None),
-        }
+    /// The whole room detail, which also feeds the人气值/公告/公演 numbers.
+    pub fn room_detail(&self, live_id: &str, source: Source) -> Result<RoomInfo, String> {
+        self.room_info(live_id, source)
+    }
+
+    /// The applause ranking of a theatre show. Anonymous, one parameter.
+    pub fn open_member_rank(&self, live_id: &str) -> Result<Vec<models::MemberRank>, String> {
+        let json = self.text(
+            "getOpenLiveMemberRank",
+            &serde_json::json!({ "liveId": live_id }),
+        )?;
+        models::parse_member_rank(&json)
+    }
+
+    /// Every room that is on air right now, in one call.
+    pub fn ongoing_lives(&self) -> Result<Vec<models::OngoingLive>, String> {
+        let json = self.text("get/all/ongoing/live/info", &serde_json::json!({}))?;
+        models::parse_ongoing(&json)
     }
 
     /// A record's danmaku sits in a plain `.lrc` next to the stream address.

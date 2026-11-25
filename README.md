@@ -29,11 +29,18 @@ L48_PERF=1 live48-egui                             # per-frame cost on stderr
 ## What it does
 
 * Four lists — live, records, theatre shows, and theatre archives; shows go through
-  `getOpenLiveList` + `getOpenLiveOne`
+  `getOpenLiveList` + `getOpenLiveOne`, and the live tab can be narrowed by team
+  (`teamId`) from chips built out of the loaded rows
 * Cards are tagged by type, mic connection, and "screen recording" (`liveMode=1`);
-  records show their duration
+  records show their duration, theatre shows their play count
 * Built-in libVLC plays RTMP / HLS / HTTP-TS, with selectable quality (SD / HD / UHD,
-  VIP entries flagged)
+  VIP entries flagged). The address is resolved the way the app does it: merged
+  multi-CDN `mergeStreamUrl` first, then `playStreamPath`, then `m3u8path`
+* Player chrome shows the room's 人气 (`onlineNum`), its announcement as an overlay,
+  and for theatre shows 播放 / 赞 (`playNum` / `praiseNum`), plus an 应援榜 page in the
+  drawer fed by `getOpenLiveMemberRank`
+* Portrait rooms (`pictureOrientation != 1`) get a tall placeholder before the first
+  frame instead of a wide one
 * Record danmaku: the `.lrc` at `msgFilePath` is read, highlighted against the
   playhead, seekable by click, and can be saved
 * Record download: every TS segment lands in `<target>.cache/`, existing segments are
@@ -44,9 +51,17 @@ L48_PERF=1 live48-egui                             # per-frame cost on stderr
   `(1)` file
 * Auto capture: polls the live list against a watch list, records on a hit, up to 5
   streams at once, and logs to `pocket48_live_log.txt`
-* Per-member record lookup against the server (`userId` plus cursor priming)
+* Per-member lookup: `getLiveList` with `userId` plus the emerging-page cursor, merged
+  with the member's `getHistoryRecord` theatre playbacks
+* A dead live stream is re-requested automatically three times, ten seconds apart,
+  and the error card has a 重试 button
+* `get/all/ongoing/live/info` is read in one call, so a member's row can be marked
+  as being on air and opened straight from the history view
 
 Media requests go out as `User-Agent: SNH48 ENGINE`, which some record CDNs insist on.
+
+Anonymous requests omit the app's `pa` signature header (it needs the bundled
+`libencryptlib.so`); everything used here answers without it.
 
 ## Branches
 

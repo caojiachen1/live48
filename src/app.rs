@@ -14,13 +14,17 @@ use crate::events::{Action, DownloadEvent, Event, ToastKind};
 use crate::images::ImageCache;
 use crate::player::{Entry, Player};
 use crate::vlc::{Engine, Recorder};
-use crate::models::{badge_text, LiveItem, Source};
+use crate::models::{badge_text, LiveItem, MemberRank, RoomInfo, Source};
 use crate::theme as t;
 
 const DAY_MS: i64 = 86_400_000;
 /// How long a dropped recording waits before asking the server for a fresh address,
 /// which is how the original client rides out a member reconnecting.
 const RESUME_AFTER: Duration = Duration::from_secs(60);
+/// A live player that hits an error asks for a new address this often, at most
+/// [`MAX_AUTO_RETRIES`] times.
+const AUTO_RETRY_EVERY: Duration = Duration::from_secs(10);
+const MAX_AUTO_RETRIES: u8 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -147,9 +151,15 @@ pub struct App {
     pub loading_open: bool,
     /// Server-side "only this member's records"; a nickname is enough to resolve the id.
     pub member_only: Option<(String, String)>,
+    /// Everyone broadcasting right now, from the one-call aggregate endpoint.
+    pub ongoing: Vec<crate::models::OngoingLive>,
+    pub loading_ongoing: bool,
 
     pub search: String,
     pub groups: Vec<String>,
+    /// 队伍 filter ("TEAM SII" …); empty means every team. Only the live tab can
+    /// offer it, because record rows carry no team list.
+    pub teams: Vec<String>,
     pub types: Vec<String>,
     pub members: Vec<String>,
     pub date_on: bool,
@@ -181,6 +191,14 @@ pub struct App {
     /// Chosen清晰度 per item; absent means "best non-RTMP".
     pub qualities: HashMap<String, i64>,
     pub grab_at: Option<Instant>,
+    /// Room detail per item, kept because the request usually beats the player: the
+    /// address and the detail are two calls on the same room.
+    pub rooms: HashMap<String, RoomInfo>,
+    pub ranks: HashMap<String, Vec<MemberRank>>,
+    /// Auto-retry bookkeeping for a dead live stream.
+    pub retry_live: Option<String>,
+    pub retry_at: Option<Instant>,
+    pub retries: u8,
 
     pub cfg: Config,
     pub mode: PlayerMode,
@@ -233,8 +251,11 @@ impl App {
             open_record_next: "0".to_owned(),
             loading_open: false,
             member_only: None,
+            ongoing: Vec::new(),
+            loading_ongoing: false,
             search: String::new(),
             groups: Vec::new(),
+            teams: Vec::new(),
             types: Vec::new(),
             members: Vec::new(),
             date_on: false,
@@ -249,6 +270,11 @@ impl App {
             grab_pending: false,
             qualities: HashMap::new(),
             grab_at: None,
+            rooms: HashMap::new(),
+            ranks: HashMap::new(),
+            retry_live: None,
+            retry_at: None,
+            retries: 0,
             cfg,
             mode,
             images: ImageCache::default(),
@@ -271,6 +297,7 @@ impl App {
         }
         app.check_vlc();
         app.refresh_live();
+        app.refresh_ongoing();
         app.refresh_records(false);
         app
     }
@@ -283,10 +310,52 @@ impl App {
         }
         self.loading_live = true;
         let req = self.req.clone();
+        let team = self.team_filter();
+        let group = match self.groups.as_slice() {
+            [only] => crate::api::group_id(only).unwrap_or(0),
+            _ => 0,
+        };
         req.spawn(move |r| {
             let api = Api::new();
-            r.send(Event::LiveList(api.live_list()));
+            r.send(Event::LiveList(api.live_list(group, team)));
         });
+    }
+
+    /// One call for every room that is on air; the app uses it instead of polling
+    /// each member, so the watch list and the "正在直播" badges stay cheap.
+    pub fn refresh_ongoing(&mut self) {
+        if self.loading_ongoing {
+            return;
+        }
+        self.loading_ongoing = true;
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let api = Api::new();
+            r.send(Event::Ongoing(api.ongoing_lives()));
+        });
+    }
+
+    /// Is this member on air right now, according to the aggregate feed?
+    pub fn is_ongoing(&self, user_id: &str) -> bool {
+        self.ongoing
+            .iter()
+            .any(|o| o.is_living && o.star_id == user_id)
+    }
+
+    /// The `teamId` behind the selected 队伍 chip. The API cannot enumerate teams, so
+    /// the id is read back off a loaded item that belongs to that team.
+    pub fn team_filter(&self) -> i64 {
+        let Some(name) = self.teams.first() else {
+            return 0;
+        };
+        self.lives
+            .iter()
+            .chain(self.records.iter())
+            .chain(self.open_lives.iter())
+            .chain(self.open_records.iter())
+            .find(|i| &i.team_name == name)
+            .map(|i| i.team_id)
+            .unwrap_or(0)
     }
 
     pub fn refresh_records(&mut self, append: bool) {
@@ -302,14 +371,25 @@ impl App {
         };
         let target = self.target_ms;
         let only = self.member_only.clone();
+        // Records carry no team list, so the 队伍 chip only narrows the live tab.
+        let team = 0;
+        let group = match self.groups.as_slice() {
+            [only] => crate::api::group_id(only).unwrap_or(0),
+            _ => 0,
+        };
         req.spawn(move |r| {
             let api = Api::new();
             let res = match &only {
-                Some((id, _)) if !append => api.records_for_user(id, target),
-                Some((id, _)) => api
-                    .record_page_user(&next, id)
-                    .map(|(items, cursor)| (items, cursor)),
-                None => api.records_back_to(&next, target),
+                Some((id, _)) if !append => api
+                    .record_page_user("0", id)
+                    .map(|(mut items, cursor)| {
+                        if let Ok((shows, _)) = api.member_playback(id) {
+                            Self::merge_by_time(&mut items, shows);
+                        }
+                        (items, cursor)
+                    }),
+                Some((id, _)) => api.record_page_user(&next, id),
+                None => api.records_back_to(&next, target, group, team),
             };
             r.send(Event::Records {
                 result: res,
@@ -354,10 +434,23 @@ impl App {
         });
     }
 
-    /// Switches the record list to one member. The server needs a real cursor for a
-    /// `userId` query, so the lookup happens on the worker thread.
+    /// Merges a bonus list into a page of items, newest first.
+    fn merge_by_time(items: &mut Vec<LiveItem>, extra: Vec<LiveItem>) {
+        for e in extra {
+            if items.iter().any(|i| i.live_id == e.live_id) {
+                continue;
+            }
+            let at = items
+                .iter()
+                .position(|i| i.ctime.unwrap_or(0) < e.ctime.unwrap_or(0))
+                .unwrap_or(items.len());
+            items.insert(at, e);
+        }
+    }
+
+    /// Switches the record list to one member: their live records plus the theatre
+    /// playbacks they took part in, which the app shows on a show's own page.
     pub fn records_of(&mut self, nickname: &str) {
-        let target = self.target_ms;
         let Some(id) = self
             .records
             .iter()
@@ -375,7 +468,15 @@ impl App {
         let req = self.req.clone();
         req.spawn(move |r| {
             let api = Api::new();
-            let res = api.records_for_user(&id, target);
+            let res = api
+                .record_page_user("0", &id)
+                .map(|(mut items, cursor)| {
+                    // The playbacks are a bonus list: a failure must not hide the records.
+                    if let Ok((shows, _)) = api.member_playback(&id) {
+                        Self::merge_by_time(&mut items, shows);
+                    }
+                    (items, cursor)
+                });
             r.send(Event::Records {
                 result: res,
                 append: false,
@@ -407,13 +508,17 @@ impl App {
             None
         };
         let member = tab.source() == Source::Member;
+        // The server already narrowed the list to one member, and its rows do not
+        // always carry the nickname the chips use, so the local chips must step
+        // aside or they would empty the page.
+        let narrowed = tab == Tab::Record && self.member_only.is_some();
 
         source
             .iter()
             .filter(|i| {
                 if tab.is_record() && !tab.is_open() {
                     if let Some(c) = i.ctime {
-                        if c < self.target_ms {
+                        if !narrowed && c < self.target_ms {
                             return false;
                         }
                         if let Some(f) = from {
@@ -437,16 +542,24 @@ impl App {
                 }
                 // Group, type and member filters describe a person's room; a theatre
                 // show has none of those attributes, so they must not hide it.
-                if member && !self.groups.is_empty() {
-                    if !self
-                        .groups
-                        .iter()
-                        .any(|g| i.nickname.to_uppercase().starts_with(g))
-                    {
+                if member && !narrowed && !self.groups.is_empty() {
+                    // The API sends a `groupId` and the rows carry it, so compare ids;
+                    // older rows without one still fall back to the nickname prefix.
+                    let hit = self.groups.iter().any(|g| {
+                        let gid = crate::api::group_id(g).unwrap_or(0);
+                        (gid != 0 && i.group_id == gid)
+                            || (i.group_id == 0 && i.nickname.to_uppercase().starts_with(g))
+                    });
+                    if !hit {
                         return false;
                     }
                 }
-                if member && !self.types.is_empty() {
+                if member && !self.teams.is_empty() && tab == Tab::Live {
+                    if !self.teams.iter().any(|n| &i.team_name == n) {
+                        return false;
+                    }
+                }
+                if member && !narrowed && !self.types.is_empty() {
                     let badge = badge_text(i);
                     let linked = i.in_microphone_connection;
                     let hit = self.types.iter().any(|ty| {
@@ -460,7 +573,11 @@ impl App {
                         return false;
                     }
                 }
-                if member && !self.members.is_empty() && !self.members.contains(&i.nickname) {
+                if member
+                    && !narrowed
+                    && !self.members.is_empty()
+                    && !self.members.contains(&i.nickname)
+                {
                     return false;
                 }
                 true
@@ -483,6 +600,7 @@ impl App {
 
     pub fn has_filters(&self) -> bool {
         !self.groups.is_empty()
+            || !self.teams.is_empty()
             || !self.types.is_empty()
             || !self.members.is_empty()
             || self.date_on
@@ -497,7 +615,7 @@ impl App {
         let source = item.source;
         req.spawn(move |r| {
             let api = Api::new();
-            let res = api.playable_stream_url(&live_id, source, None);
+            let res = api.stream_url(&live_id, source, None);
             r.send(Event::StreamUrl {
                 result: res,
                 action: Box::new(action),
@@ -505,17 +623,26 @@ impl App {
         });
     }
 
-    /// Fills in the清晰度 menu and the danmaku address for the item that just opened.
+    /// Room detail: the清晰度 menu, the danmaku address, and人气/公告/公演 numbers.
     pub fn fetch_streams(&mut self, live_id: String, source: Source) {
         let req = self.req.clone();
         req.spawn(move |r| {
             let api = Api::new();
-            let res = api
-                .room_info(&live_id, source)
-                .map(|info| (info.streams, info.msg_file_path));
             r.send(Event::Streams {
-                live_id,
-                result: res,
+                live_id: live_id.clone(),
+                result: api.room_detail(&live_id, source),
+            });
+        });
+    }
+
+    /// The applause ranking, which only theatre shows have.
+    pub fn fetch_rank(&mut self, live_id: String) {
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let api = Api::new();
+            r.send(Event::Rank {
+                live_id: live_id.clone(),
+                result: api.open_member_rank(&live_id),
             });
         });
     }
@@ -562,7 +689,7 @@ impl App {
         self.toast(ToastKind::Info, "已发送取消下载请求");
     }
 
-    fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+    pub fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
         self.toasts.push((kind, text.into(), Instant::now()));
         if self.toasts.len() > 4 {
             let overflow = self.toasts.len() - 4;
@@ -625,6 +752,97 @@ impl App {
         (entries, is_live)
     }
 
+    /// Opens one item on its own, without borrowing the playlist of whichever tab
+    /// happens to be on screen. Used by the "跳到 TA 的直播间" shortcut.
+    pub fn play_single(&mut self, item: &LiveItem) {
+        self.playlist = vec![Entry {
+            live_id: item.live_id.clone(),
+            title: item.title.clone(),
+            nickname: if item.nickname.is_empty() {
+                item.sub_title.clone()
+            } else {
+                item.nickname.clone()
+            },
+            cover: crate::api::resolve_image(&item.cover_path),
+            source: item.source,
+        }];
+        self.playlist_live = item.source == Source::Member || item.source == Source::Open;
+        self.ensure_engine();
+        self.resolve_builtin(0);
+    }
+
+    /// Opens a raw address with no API lookup. The aggregate live feed already hands
+    /// out a `liveUrl`, which is the only thing available for a member whose row is
+    /// no longer in the list.
+    pub fn play_direct(&mut self, live_id: &str, title: &str, url: &str) {
+        let Some(engine) = self.engine.clone() else {
+            self.ensure_engine();
+            self.toast(ToastKind::Info, "正在准备播放引擎，稍后再试一次");
+            return;
+        };
+        let ctx = self.req.ctx().clone();
+        let entries = vec![Entry {
+            live_id: live_id.to_owned(),
+            title: title.to_owned(),
+            nickname: title.to_owned(),
+            cover: String::new(),
+            source: Source::Member,
+        }];
+        self.playlist = entries.clone();
+        self.playlist_live = true;
+        match Player::open(&engine, url, entries, 0, true, &ctx) {
+            Ok(p) => self.player = Some(Arc::new(Mutex::new(p))),
+            Err(e) => self.toast(ToastKind::Error, format!("内置播放失败：{e}")),
+        }
+    }
+
+    /// A live stream that drops out gets a fresh address, the way the app re-pulls
+    /// after its `playError`. Three tries, ten seconds apart, then it stops.
+    pub fn tick_retry(&mut self) {
+        let Some(arc) = &self.player else {
+            self.retry_at = None;
+            self.retries = 0;
+            return;
+        };
+        let (live_id, is_live, error) = {
+            let p = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                p.entries.get(p.index).map(|e| e.live_id.clone()),
+                p.is_live,
+                p.error.clone(),
+            )
+        };
+        let (Some(live_id), true, true) = (live_id, is_live, error.is_some()) else {
+            self.retry_at = None;
+            self.retries = 0;
+            return;
+        };
+        if self.retry_live.as_deref() != Some(&live_id) {
+            self.retry_live = Some(live_id.clone());
+            self.retries = 0;
+            self.retry_at = None;
+        }
+        if self.retries >= MAX_AUTO_RETRIES {
+            return;
+        }
+        let now = Instant::now();
+        match self.retry_at {
+            Some(at) if now >= at => {
+                self.retries += 1;
+                self.retry_at = Some(now + AUTO_RETRY_EVERY);
+                if let Some(arc) = &self.player {
+                    let index = arc
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .index;
+                    self.resolve_builtin(index);
+                }
+            }
+            Some(_) => {}
+            None => self.retry_at = Some(now + AUTO_RETRY_EVERY),
+        }
+    }
+
     /// Where the playlist drawer currently sits, for wheel hit-testing.
     pub fn playlist_hit(&self) -> Rect {
         self.player.as_ref().map_or(Rect::NOTHING, |p| {
@@ -661,16 +879,16 @@ impl App {
         let probe = live_id.clone();
         req.spawn(move |r| {
             let api = Api::new();
-            // libVLC demuxes RTMP itself, so the raw playStreamPath is preferred here.
-            let res = api
-                .stream_url(&probe, source, want)
-                .or_else(|_| api.playable_stream_url(&probe, source, want));
+            let res = api.stream_url(&probe, source, want);
             r.send(Event::StreamUrl {
                 result: res,
                 action: Box::new(Action::OpenBuiltin { index }),
             });
         });
-        self.fetch_streams(live_id, source);
+        self.fetch_streams(live_id.clone(), source);
+        if source == Source::Open {
+            self.fetch_rank(live_id);
+        }
     }
 
     fn open_builtin(&mut self, index: usize, url: String) {
@@ -702,6 +920,25 @@ impl App {
                 Err(e) => self.toast(ToastKind::Error, format!("内置播放失败：{e}")),
             }
         }
+        // The detail call and the address call race, so replay whatever detail has
+        // already landed; the fresh event was dropped while there was no player.
+        let live_id = self
+            .playlist
+            .get(index)
+            .map(|e| e.live_id.clone())
+            .unwrap_or_default();
+        if let Some(arc) = &self.player {
+            let want = self.qualities.get(&live_id).copied();
+            let room = self.rooms.get(&live_id).cloned();
+            let rank = self.ranks.get(&live_id).cloned();
+            let mut p = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(info) = room {
+                p.set_room(info, want);
+            }
+            if let Some(ranks) = rank {
+                p.set_rank(ranks);
+            }
+        }
     }
 
     pub fn handle_cmd(&mut self, cmd: crate::player::Cmd) {
@@ -712,6 +949,15 @@ impl App {
                 self.player = None;
             }
             Cmd::Refresh => {
+                if let Some(arc) = &self.player {
+                    let index = arc
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .index;
+                    self.resolve_builtin(index);
+                }
+            }
+            Cmd::Retry => {
                 if let Some(arc) = &self.player {
                     let index = arc
                         .lock()
@@ -839,7 +1085,6 @@ impl App {
             let api = Api::new();
             let res = api
                 .stream_url(&live_id, source, None)
-                .or_else(|_| api.playable_stream_url(&live_id, source, None))
                 .and_then(|url| engine.record(&url, &path).map(|rec| (url, rec)));
             r.send(Event::RecordStarted { live_id, result: res });
         });
@@ -886,9 +1131,7 @@ impl App {
             let base = item.clone();
             req.spawn(move |r| {
                 let api = Api::new();
-                let url = api
-                    .stream_url(&live_id, base.source, None)
-                    .or_else(|_| api.playable_stream_url(&live_id, base.source, None));
+                let url = api.stream_url(&live_id, base.source, None);
                 match url {
                     Err(_) => r.send(Event::RecordStopped { live_id }),
                     Ok(u) if u == previous => r.send(Event::RecordStopped { live_id }),
@@ -1059,21 +1302,43 @@ impl App {
                 },
                 Event::Streams {
                     live_id,
-                    result: Ok((streams, msg)),
+                    result: Ok(info),
                 } => {
+                    self.rooms.insert(live_id.clone(), info.clone());
                     if let Some(arc) = &self.player {
                         let want = self.qualities.get(&live_id).copied();
                         let mut p = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         if p.entries.get(p.index).map(|e| e.live_id.as_str()) == Some(&live_id) {
-                            p.set_streams(streams, want);
-                            p.danmu_url = msg;
+                            p.set_room(info, want);
                         }
                     }
                 }
-                Event::Streams {
-                    live_id: _,
-                    result: Err(_),
-                } => {}
+                Event::Streams { result: Err(e), .. } => {
+                    self.toast(ToastKind::Warning, format!("房间信息加载失败：{e}"));
+                }
+                Event::Rank {
+                    live_id,
+                    result: Ok(ranks),
+                } => {
+                    self.ranks.insert(live_id.clone(), ranks.clone());
+                    if let Some(arc) = &self.player {
+                        let mut p = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if p.entries.get(p.index).map(|e| e.live_id.as_str()) == Some(&live_id) {
+                            p.set_rank(ranks);
+                        }
+                    }
+                }
+                Event::Rank { result: Err(_), .. } => {}
+                Event::Ongoing(result) => match result {
+                    Ok(items) => {
+                        self.ongoing = items;
+                        self.loading_ongoing = false;
+                    }
+                    Err(e) => {
+                        self.loading_ongoing = false;
+                        self.toast(ToastKind::Warning, format!("在播列表获取失败：{e}"));
+                    }
+                },
                 Event::Danmu { live_id, result } => match result {
                     Ok(items) => {
                         if let Some(arc) = &self.player {

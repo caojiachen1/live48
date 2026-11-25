@@ -12,7 +12,7 @@ use egui::{
 use crate::events::Event;
 use crate::icons::{self, Icon};
 use crate::images::ImageCache;
-use crate::models::{Danmu, Source, Stream};
+use crate::models::{Danmu, MemberRank, RoomInfo, Source, Stream};
 use crate::theme as t;
 use crate::vlc::{Engine, Session};
 
@@ -46,6 +46,8 @@ pub enum Cmd {
     /// Start or stop capturing the stream that is on screen.
     Record,
     SaveDanmu,
+    /// The app's own remedy for a dead stream: ask for a fresh address and re-open.
+    Retry,
 }
 
 pub struct Player {
@@ -86,8 +88,17 @@ pub struct Player {
     pub danmu: Vec<Danmu>,
     /// The `.lrc` is fetched once per item, not once per frame.
     pub danmu_requested: bool,
-    /// The drawer shows the playlist (false) or the danmaku (true).
-    pub show_danmu: bool,
+    /// Drawer page: 0 playlist, 1 danmaku, 2 ranking.
+    pub drawer_tab: u8,
+    /// Room data the app shows next to the picture.
+    pub online_num: i64,
+    pub announcement: String,
+    pub play_num: i64,
+    pub praise_num: i64,
+    /// `pictureOrientation == 1` means landscape; everything else is a portrait room.
+    pub portrait: bool,
+    /// Applause ranking of a theatre show; empty for member rooms.
+    pub rank: Vec<MemberRank>,
     /// Mirrored from the app every pass so the button can show the truth.
     pub recording: bool,
     danmu_cur: usize,
@@ -147,7 +158,13 @@ impl Player {
             danmu_url: None,
             danmu: Vec::new(),
             danmu_requested: false,
-            show_danmu: false,
+            drawer_tab: 0,
+            online_num: 0,
+            announcement: String::new(),
+            play_num: 0,
+            praise_num: 0,
+            portrait: false,
+            rank: Vec::new(),
             recording: false,
             danmu_cur: 0,
             uploads: 0,
@@ -165,6 +182,14 @@ impl Player {
         self.danmu = Vec::new();
         self.danmu_requested = false;
         self.danmu_cur = 0;
+        self.online_num = 0;
+        self.announcement.clear();
+        self.play_num = 0;
+        self.praise_num = 0;
+        self.rank.clear();
+        if self.drawer_tab == 2 {
+            self.drawer_tab = 0;
+        }
         if let Some(e) = self.entries.get(index) {
             self.title = if e.title.is_empty() {
                 "无标题".into()
@@ -181,18 +206,33 @@ impl Player {
         Ok(())
     }
 
+    /// Applies a room's detail: the清晰度 menu, the danmaku file, and the numbers the
+    /// app prints next to the picture.
     /// `want` is the清晰度 this item already uses, so a reattach does not silently
     /// drop back to automatic.
-    pub fn set_streams(&mut self, streams: Vec<Stream>, want: Option<i64>) {
+    pub fn set_room(&mut self, info: RoomInfo, want: Option<i64>) {
         self.quality = want.unwrap_or_else(|| {
             for t in [3i64, 1, 2] {
-                if streams.iter().any(|s| s.stream_type == t) {
+                if info.streams.iter().any(|s| s.stream_type == t) {
                     return t;
                 }
             }
-            streams.first().map(|s| s.stream_type).unwrap_or(0)
+            info.streams.first().map(|s| s.stream_type).unwrap_or(0)
         });
-        self.streams = streams;
+        self.online_num = info.online_num;
+        self.announcement = info.announcement;
+        self.play_num = info.play_num;
+        self.praise_num = info.praise_num;
+        self.portrait = info.orientation != 1;
+        self.danmu_url = info.msg_file_path;
+        self.streams = info.streams;
+    }
+
+    pub fn set_rank(&mut self, ranks: Vec<MemberRank>) {
+        if ranks.is_empty() && self.drawer_tab == 2 {
+            self.drawer_tab = 0;
+        }
+        self.rank = ranks;
     }
 
     pub fn set_danmu(&mut self, items: Vec<Danmu>) {
@@ -259,6 +299,11 @@ impl Player {
     }
 
     pub fn aspect(&self) -> f32 {
+        if !self.started {
+            // Before the first frame arrives, the room's own orientation decides
+            // whether the black box is a wide or a tall one.
+            return if self.portrait { 9.0 / 16.0 } else { 16.0 / 9.0 };
+        }
         (self.frame_size.0 as f32 / self.frame_size.1 as f32).max(0.2)
     }
 
@@ -304,7 +349,17 @@ impl Player {
                         .color(t::TEXT)
                         .font(t::heading(14.5)),
                 );
-                ui.label(RichText::new(&self.nickname).size(11.5).color(t::TEXT_3));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(RichText::new(&self.nickname).size(11.5).color(t::TEXT_3));
+                    if self.online_num > 0 {
+                        ui.label(
+                            RichText::new(format!("人气 {}", crate::util::fmt_count(self.online_num)))
+                                .size(11.5)
+                                .color(t::TEXT_2),
+                        );
+                    }
+                });
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if self.entries.len() > 1
@@ -440,6 +495,17 @@ impl Player {
                         .size(11.0)
                         .color(t::TEXT_3),
                 );
+                if self.play_num > 0 || self.praise_num > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "播放 {} · 赞 {}",
+                            crate::util::fmt_count(self.play_num),
+                            crate::util::fmt_count(self.praise_num)
+                        ))
+                        .size(11.0)
+                        .color(t::TEXT_3),
+                    );
+                }
             });
         });
     }
@@ -498,9 +564,31 @@ impl Player {
             }
         }
 
+        // The room announcement, painted over the picture so the bars never shift.
+        if !self.announcement.is_empty() {
+            let size = 11.5;
+            let w = (rect.width() - 24.0).clamp(80.0, 560.0);
+            let strip = Rect::from_min_size(
+                Pos2::new(rect.center().x - w / 2.0, rect.min.y + 10.0),
+                Vec2::new(w, 24.0),
+            );
+            ui.painter()
+                .rect_filled(strip, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+            let text = format!(
+                "公告  {}",
+                crate::util::truncate(&self.announcement, w - 24.0, size)
+            );
+            ui.painter().text(
+                strip.center(),
+                Align2::CENTER_CENTER,
+                text,
+                egui::FontId::new(size, t::bold()),
+                t::TEXT_2,
+            );
+        }
+
         if self.started && self.error.is_none() {
-            let hot = Rect::from_center_size(rect.center(), Vec2::splat(72.0));
-            // Only under the pointer - a permanent disc in the middle of the picture
+            let hot = Rect::from_center_size(rect.center(), Vec2::splat(72.0));            // Only under the pointer - a permanent disc in the middle of the picture
             // hides what is actually happening on screen.
             let hovered = ui
                 .ctx()
@@ -542,12 +630,22 @@ impl Player {
                         ui.add_space(6.0);
                         ui.label(RichText::new(err).size(12.5).color(t::TEXT_2));
                         ui.add_space(12.0);
-                        if ui
-                            .add_sized(Vec2::new(100.0, 28.0), t::ghost_button("关闭"))
-                            .clicked()
-                        {
-                            self.cmd = Cmd::Close;
-                        }
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 212.0).max(0.0) / 2.0);
+                            if ui
+                                .add_sized(Vec2::new(100.0, 28.0), t::accent_button("重试"))
+                                .on_hover_text("重新取流并打开")
+                                .clicked()
+                            {
+                                self.cmd = Cmd::Retry;
+                            }
+                            if ui
+                                .add_sized(Vec2::new(100.0, 28.0), t::ghost_button("关闭"))
+                                .clicked()
+                            {
+                                self.cmd = Cmd::Close;
+                            }
+                        });
                     });
                 });
         }
@@ -564,8 +662,8 @@ impl Player {
         ui.spacing_mut().button_padding.y = 3.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            for (value, label) in [(false, "列表"), (true, "弹幕")] {
-                let selected = self.show_danmu == value;
+            for (value, label) in [(0u8, "列表"), (1, "弹幕")] {
+                let selected = self.drawer_tab == value;
                 let btn = egui::Button::new(
                     RichText::new(label)
                         .size(12.5)
@@ -575,10 +673,24 @@ impl Player {
                 .fill(if selected { t::WHITE } else { Color32::TRANSPARENT })
                 .corner_radius(7.0);
                 if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
-                    self.show_danmu = value;
+                    self.drawer_tab = value;
                 }
             }
-            if self.show_danmu && !self.danmu.is_empty() {
+            if !self.rank.is_empty() {
+                let selected = self.drawer_tab == 2;
+                let btn = egui::Button::new(
+                    RichText::new("榜单")
+                        .size(12.5)
+                        .color(if selected { t::ON_ACCENT } else { t::TEXT_2 })
+                        .font(t::heading(12.5)),
+                )
+                .fill(if selected { t::WHITE } else { Color32::TRANSPARENT })
+                .corner_radius(7.0);
+                if ui.add_sized(Vec2::new(52.0, 26.0), btn).clicked() {
+                    self.drawer_tab = 2;
+                }
+            }
+            if self.drawer_tab == 1 && !self.danmu.is_empty() {
                 if ui
                     .add_sized(Vec2::new(70.0, 26.0), t::ghost_button("保存弹幕"))
                     .on_hover_text("把这条录播的 .lrc 存到下载目录")
@@ -587,18 +699,30 @@ impl Player {
                     self.cmd = Cmd::SaveDanmu;
                 }
             }
-            if self.show_danmu {
+            if self.drawer_tab == 1 {
                 ui.label(
                     RichText::new(format!("{} 条", self.danmu.len())).size(11.0).color(t::TEXT_3),
+                );
+            }
+            if self.drawer_tab == 2 {
+                ui.label(
+                    RichText::new(format!("{} 人", self.rank.len())).size(11.0).color(t::TEXT_3),
                 );
             }
         });
         ui.spacing_mut().interact_size.y = floor;
         ui.add_space(6.0);
 
-        if self.show_danmu {
-            self.danmu_body(ui);
-            return;
+        match self.drawer_tab {
+            1 => {
+                self.danmu_body(ui);
+                return;
+            }
+            2 => {
+                self.rank_body(ui, thumbs, tx);
+                return;
+            }
+            _ => {}
         }
 
         egui::ScrollArea::vertical()
@@ -774,6 +898,88 @@ impl Player {
         if let Some(secs) = seek {
             self.session.set_time_ms((secs * 1000.0) as i64);
         }
+    }
+
+    /// The applause ranking of a theatre show. The app prints位置, name, team and the
+    /// melee (applause) count, so the same four columns are kept here.
+    fn rank_body(&mut self, ui: &mut Ui, thumbs: &mut ImageCache, tx: &Sender<Event>) {
+        if self.rank.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("这场公演没有应援榜单")
+                        .size(12.5)
+                        .color(t::TEXT_3),
+                );
+            });
+            return;
+        }
+        let rows: Vec<MemberRank> = self.rank.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("rank")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (n, m) in rows.iter().enumerate() {
+                    let top3 = m.rank <= 3;
+                    let w = ui.available_width();
+                    let avatar = crate::api::resolve_image(&m.avatar);
+                    Frame::new()
+                        .fill(if n % 2 == 0 {
+                            t::alpha(t::WHITE, 12)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .inner_margin(Margin {
+                            left: 10,
+                            right: 10,
+                            top: 3,
+                            bottom: 3,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(w - 20.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    RichText::new(format!("{:>2}", m.rank))
+                                        .size(12.0)
+                                        .color(if top3 { t::WHITE } else { t::TEXT_3 })
+                                        .font(t::heading(12.0)),
+                                );
+                                if m.avatar.is_empty() {
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                                    ui.painter().circle_filled(
+                                        rect.center(),
+                                        10.0,
+                                        t::alpha(t::WHITE, 22),
+                                    );
+                                } else {
+                                    thumbs.avatar(ui, &avatar, 20.0, tx);
+                                }
+                                ui.label(
+                                    RichText::new(crate::util::truncate(&m.name, 110.0, 12.0))
+                                        .size(12.0)
+                                        .color(if top3 { t::WHITE } else { t::TEXT_2 }),
+                                );
+                                ui.label(
+                                    RichText::new(crate::util::truncate(&m.team, 96.0, 11.0))
+                                        .size(11.0)
+                                        .color(t::TEXT_3),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(crate::util::fmt_count(m.melee))
+                                                .size(12.0)
+                                                .color(t::TEXT_2),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                }
+            });
     }
 }
 

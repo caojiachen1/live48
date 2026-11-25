@@ -25,6 +25,7 @@ impl eframe::App for App {
         self.drain_events();
         self.tick_toasts();
         self.tick_timers();
+        self.tick_retry();
 
         if self.player.is_some() {
             // Mirrors the web player's gestures: wheel and arrow keys switch
@@ -219,10 +220,10 @@ impl App {
         }
         pl.fly_prev = ui.ctx().input(|i| i.time);
         if pl.fly_t > 0.001 {
-            let title = if pl.show_danmu {
-                format!("弹幕 {}", pl.danmu.len())
-            } else {
-                format!("播放列表 {}", pl.entries.len())
+            let title = match pl.drawer_tab {
+                1 => format!("弹幕 {}", pl.danmu.len()),
+                2 => format!("应援榜 {}", pl.rank.len()),
+                _ => format!("播放列表 {}", pl.entries.len()),
             };
             let (close, rect) = flyout(
                 ui,
@@ -363,8 +364,43 @@ impl App {
                         self.search_box(ui, 240.0);
                         self.type_combo(ui);
                         self.group_combo(ui);
+                        if self.tab == Tab::Live {
+                            self.team_combo(ui);
+                        }
                     });
                 });
+            });
+    }
+
+    /// 队伍 filter. The server only accepts a numeric `teamId` and offers no way to
+    /// enumerate teams, so the list is derived from the rows that are already loaded.
+    fn team_combo(&mut self, ui: &mut Ui) {
+        let mut names: Vec<String> = self
+            .lives
+            .iter()
+            .map(|i| i.team_name.clone())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            return;
+        }
+        let text = self.teams.first().cloned().unwrap_or_else(|| "全部队伍".into());
+        egui::ComboBox::from_id_salt("team_combo")
+            .width(112.0)
+            .selected_text(RichText::new(text).size(13.0).color(t::TEXT_2))
+            .show_ui(ui, |ui| {
+                if ui.selectable_value(&mut self.teams, vec![], "全部队伍").clicked() {
+                    self.refresh_live();
+                }
+                for name in names {
+                    let selected = self.teams.first() == Some(&name);
+                    if ui.selectable_label(selected, &name).clicked() {
+                        self.teams = vec![name];
+                        self.refresh_live();
+                    }
+                }
             });
     }
 
@@ -857,16 +893,27 @@ impl App {
                                 format!("录制中 {}:{}", secs / 60, secs % 60)
                             } else if let Some(ms) = ctime {
                                 let when = crate::app::fmt_time(ms);
-                                if item.duration.is_empty() {
+                                let mut line = if item.duration.is_empty() {
                                     when
                                 } else {
                                     format!("{when} · {}", item.duration)
+                                };
+                                if item.play_num > 0 {
+                                    line.push_str(&format!(
+                                        " · 播放 {}",
+                                        util::fmt_count(item.play_num)
+                                    ));
                                 }
+                                line
                             } else {
                                 String::new()
                             };
                             if !second.is_empty() {
-                                ui.label(RichText::new(second).color(t::TEXT_3).size(11.0));
+                                ui.label(
+                                    RichText::new(util::truncate(&second, inner - 60.0, 11.0))
+                                        .color(t::TEXT_3)
+                                        .size(11.0),
+                                );
                             }
                         });
                     });
@@ -1104,9 +1151,12 @@ impl App {
 
             let only = self.member_only.clone();
             util::section(ui, "按成员查询录播（服务端）");
-            if let Some((_, name)) = only {
+            if let Some((id, name)) = only {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("当前只看 {name}")).size(12.5).color(t::TEXT));
+                    if self.is_ongoing(&id) {
+                        ui.label(RichText::new("● 正在直播").size(11.5).color(t::OK));
+                    }
                     if ui
                         .add(egui::Button::new(RichText::new("取消").size(12.0).color(t::TEXT_3)))
                         .clicked()
@@ -1114,6 +1164,34 @@ impl App {
                         self.clear_member_only();
                     }
                 });
+                if self.is_ongoing(&id) {
+                    if ui
+                        .add_sized(
+                            Vec2::new(ui.available_width(), 26.0),
+                            t::ghost_button("跳到 TA 的直播间"),
+                        )
+                        .clicked()
+                    {
+                        let live_row = self.lives.iter().find(|i| i.user_id == id).cloned();
+                        let ongoing_row = live_row
+                            .is_none()
+                            .then(|| {
+                                self.ongoing
+                                    .iter()
+                                    .find(|o| o.star_id == id && !o.live_url.is_empty())
+                                    .cloned()
+                            })
+                            .flatten();
+                        if let Some(item) = live_row {
+                            self.play_single(&item);
+                        } else if let Some(o) = ongoing_row {
+                            self.play_direct(&o.star_id, &o.name, &o.live_url);
+                        } else {
+                            self.refresh_live();
+                            self.toast(ToastKind::Info, "正在刷新直播列表，请稍后再点");
+                        }
+                    }
+                }
             } else if self.members.len() == 1 {
                 let name = self.members[0].clone();
                 if ui

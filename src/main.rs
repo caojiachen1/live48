@@ -144,7 +144,7 @@ fn dltest(live_id: &str, out: &str, secs: u64) -> i32 {
     use std::sync::{Arc, mpsc};
 
     let api = api::Api::new();
-    let url = match api.playable_stream_url(live_id, models::Source::Member, None) {
+    let url = match api.stream_url(live_id, models::Source::Member, None) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("stream url FAILED: {e}");
@@ -279,7 +279,7 @@ fn apitest() -> i32 {
     use std::time::{Duration, Instant};
 
     let api = api::Api::new();
-    let live = match api.live_list() {
+    let live = match api.live_list(0, 0) {
         Ok(items) => {
             println!("live list: {} items", items.len());
             items
@@ -298,33 +298,100 @@ fn apitest() -> i32 {
             .map(|d| d.timestamp_millis() - 86_400_000)
             .unwrap_or(0)
     };
-    match api.records_back_to("0", yesterday) {
+    match api.records_back_to("0", yesterday, 0, 0) {
         Ok((items, next)) => println!("record list: {} items, next={next}", items.len()),
         Err(e) => eprintln!("record list FAILED: {e}"),
+    }
+    match api.ongoing_lives() {
+        Ok(items) => {
+            println!("ongoing: {} rooms", items.len());
+            for o in items.iter().take(5) {
+                println!(
+                    "  {} {} living={} type={} {}",
+                    o.star_id, o.name, o.is_living, o.live_type, o.title
+                );
+            }
+        }
+        Err(e) => eprintln!("ongoing FAILED: {e}"),
     }
     for record in [false, true] {
         match api.open_live_list(record, "0", 0) {
             Ok((items, next)) => println!(
                 "open live (record={record}): {} items, next={next}, first={:?}",
                 items.len(),
-                items.first().map(|i| (i.title.clone(), i.status, i.sub_title.clone()))
+                items.first().map(|i| (i.title.clone(), i.status, i.sub_title.clone(), i.play_num))
             ),
             Err(e) => eprintln!("open live list (record={record}) FAILED: {e}"),
+        }
+    }
+    // A finished show is the only kind that has an applaus ranking, and the list
+    // only ever carries upcoming and running ones, so this may legitimately find
+    // nothing to ask about.
+    let ended = api.open_live_list(false, "0", 0).ok().and_then(|(v, _)| {
+        v.into_iter().find(|i| i.status == 4 || i.status == 2)
+    });
+    match ended {
+        Some(theatre) => {
+            match api.room_detail(&theatre.live_id, theatre.source) {
+                Ok(info) => println!(
+                    "theatre {}: room_id={} streams={} play={} praise={} online={}",
+                    theatre.live_id,
+                    info.room_id,
+                    info.streams.len(),
+                    info.play_num,
+                    info.praise_num,
+                    info.online_num
+                ),
+                Err(e) => eprintln!("theatre detail FAILED: {e}"),
+            }
+            match api.open_member_rank(&theatre.live_id) {
+                Ok(ranks) => println!(
+                    "rank for {}: {} rows, first={:?}",
+                    theatre.live_id,
+                    ranks.len(),
+                    ranks.first().map(|m| (m.rank, m.melee, m.name.clone(), m.team.clone()))
+                ),
+                Err(e) => eprintln!("rank FAILED: {e}"),
+            }
+        }
+        None => println!("rank: no finished show in the open list right now"),
+    }
+
+    // The member history endpoint is the one the record tab now uses.
+    let history_target = live.first().cloned().or_else(|| {
+        api.records_back_to("0", yesterday, 0, 0)
+            .ok()
+            .and_then(|(v, _)| v.into_iter().next())
+    });
+    if let Some(m) = history_target {
+        match api.history_records(&m.user_id, "0") {
+            Ok((items, next)) => println!(
+                "history for {} ({}): {} items, next={next}",
+                m.nickname,
+                m.user_id,
+                items.len()
+            ),
+            Err(e) => eprintln!("history FAILED: {e}"),
         }
     }
 
     // Prefer a running live stream; fall back to the newest record so the HLS
     // decode path still gets exercised when nobody is live.
-    let records = api.records_back_to("0", yesterday).map(|(v, _)| v).unwrap_or_default();
+    let records = api.records_back_to("0", yesterday, 0, 0).map(|(v, _)| v).unwrap_or_default();
     if let Some(r) = records.first() {
         match api.room_info(&r.live_id, r.source) {
             Ok(info) => {
                 println!(
-                    "room {}: room_id={} streams={} msg_file={}",
+                    "room {}: room_id={} streams={} msg_file={} online={} announce={} play={} praise={} merge={}",
                     r.live_id,
                     info.room_id,
                     info.streams.len(),
-                    info.msg_file_path.is_some()
+                    info.msg_file_path.is_some(),
+                    info.online_num,
+                    info.announcement.chars().take(24).collect::<String>(),
+                    info.play_num,
+                    info.praise_num,
+                    info.merge_stream_url.as_deref().is_some_and(|s| !s.is_empty())
                 );
                 if let Some(u) = info.msg_file_path.clone() {
                     match api.danmaku(&u) {
@@ -344,7 +411,7 @@ fn apitest() -> i32 {
         println!("nothing to decode");
         return 0;
     };
-    let url = match api.playable_stream_url(&item.live_id, item.source, None) {
+    let url = match api.stream_url(&item.live_id, item.source, None) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("stream url FAILED: {e}");

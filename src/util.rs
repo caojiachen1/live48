@@ -54,8 +54,20 @@ pub fn truncate(text: &str, max_width: f32, size: f32) -> String {
     out
 }
 
-pub fn section(ui: &mut Ui, title: &str) {
-    ui.add_space(10.0);
+/// `12345` -> `1.2万`, the way the app prints its counters.
+pub fn fmt_count(n: i64) -> String {
+    if n < 10_000 {
+        return n.to_string();
+    }
+    let w = n as f64 / 10_000.0;
+    if w >= 10.0 {
+        format!("{:.0}万", w)
+    } else {
+        format!("{:.1}万", w)
+    }
+}
+
+pub fn section(ui: &mut Ui, title: &str) {    ui.add_space(10.0);
     ui.label(
         RichText::new(title)
             .size(11.5)

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::models::{Danmu, LiveItem, Stream};
+use crate::models::{Danmu, LiveItem, MemberRank, OngoingLive, RoomInfo};
 use crate::vlc::{Engine, Recorder};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,11 +34,18 @@ pub enum Event {
         result: Result<String, String>,
         action: Box<Action>,
     },
-    /// The清晰度 menu for one item, plus the danmaku file address if it has one.
+    /// The room detail behind the清晰度 menu: streams,人气值,公告,公演 numbers…
     Streams {
         live_id: String,
-        result: Result<(Vec<Stream>, Option<String>), String>,
+        result: Result<RoomInfo, String>,
     },
+    /// The applause ranking of the theatre show that is on screen.
+    Rank {
+        live_id: String,
+        result: Result<Vec<MemberRank>, String>,
+    },
+    /// Everything that is on air right now.
+    Ongoing(Result<Vec<OngoingLive>, String>),
     Danmu {
         live_id: String,
         result: Result<Vec<Danmu>, String>,
