@@ -468,9 +468,14 @@ impl Player {
     /// Pushes the desired level to libVLC. It is deliberately unconditional:
     /// a fresh session may still be muted even though our flag says otherwise,
     /// and the first set can fail before the audio output exists.
+    ///
+    /// Only the per-player volume is used for silence. libVLC's mute flag is
+    /// routed through the Windows audio backend and can affect every media
+    /// player in the same instance, which made one mute button silence the
+    /// whole multi-view wall.
     fn push_audio(&mut self) {
         let percent = (self.volume.clamp(0.0, 1.0) * 100.0).round() as i32;
-        self.session.set_muted(percent == 0);
+        self.session.set_muted(false);
         self.session.set_volume(percent);
         self.muted = percent == 0;
         let actual = self.session.volume();

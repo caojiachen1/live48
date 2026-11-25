@@ -597,6 +597,10 @@ impl Engine {
             args.push(CString::new("--verbose=0").unwrap());
         }
         args.extend([
+            // The default Windows audio output in libVLC 3 shares one mixer
+            // between media players, so muting one tile silences the whole wall.
+            // DirectSound keeps a separate audio output per player.
+            CString::new("--aout=directsound").unwrap(),
             CString::new("--network-caching=300").unwrap(),
             CString::new("--live-caching=300").unwrap(),
             CString::new("--file-caching=400").unwrap(),
