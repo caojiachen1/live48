@@ -121,6 +121,10 @@ struct RawTeam {
     team_id: i64,
     #[serde(rename = "groupId", default)]
     group_id: i64,
+    /// Theatre rows have no `userInfo`; the circle beside the title shows the team
+    /// logo instead, which is what the app does.
+    #[serde(rename = "teamLogo", default)]
+    team_logo: String,
 }
 
 fn loose_i64(v: &Option<serde_json::Value>) -> i64 {
@@ -147,6 +151,12 @@ impl From<RawLiveItem> for LiveItem {
                 Some(team.clone())
             })
             .unwrap_or_default();
+        let team_logo = r.team_list.first().map(|t| t.team_logo.clone()).unwrap_or_default();
+        let avatar = if r.user_info.avatar.is_empty() {
+            team_logo
+        } else {
+            r.user_info.avatar.clone()
+        };
         LiveItem {
             live_id: r.live_id_str.clone().unwrap_or_else(|| r.live_id.as_str().to_owned()),
             title: r.title.unwrap_or_default(),
@@ -163,7 +173,7 @@ impl From<RawLiveItem> for LiveItem {
                 .and_then(|s| s.parse().ok()),
             duration: r.duration.unwrap_or_default(),
             nickname: r.user_info.nickname,
-            avatar: r.user_info.avatar,
+            avatar,
             user_id: r.user_info.user_id,
             room_id: r.room_id.unwrap_or_default(),
             team_id: r.team_list.first().map(|t| t.team_id).unwrap_or(0),

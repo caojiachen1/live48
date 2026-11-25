@@ -292,7 +292,6 @@ impl App {
                             .color(t::TEXT)
                             .font(t::heading(21.0)),
                     );
-                    ui.label(RichText::new("EGUI · NATIVE").size(10.0).color(t::TEXT_3));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // The player hint moved up here, to the right of the settings
