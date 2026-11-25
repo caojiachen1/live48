@@ -23,6 +23,42 @@ pub const MAX_H: u32 = 720;
 /// A record's danmaku stays on screen for this long, matching the original client.
 pub const DANMU_WINDOW: f64 = 3.0;
 
+/// libVLC's `player_stop` waits for its output threads, which on a 1080p archive can
+/// take a moment. Closing or switching a record used to pay that on the UI thread, so
+/// the old session is handed to one thread that only ever drops things.
+fn reaper() -> &'static Sender<Retired> {
+    static TX: std::sync::OnceLock<Sender<Retired>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Retired>();
+        std::thread::Builder::new()
+            .name("vlc-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(item) = rx.recv() {
+                    drop(item);
+                }
+            })
+            .expect("vlc reaper thread");
+        tx
+    })
+}
+
+/// Both variants exist only to be dropped on the reaper thread, so their payloads are
+/// deliberately never read here.
+#[allow(dead_code)]
+enum Retired {
+    Session(Session),
+    Player(std::sync::Arc<std::sync::Mutex<Player>>),
+}
+
+pub fn retire(session: Session) {
+    let _ = reaper().send(Retired::Session(session));
+}
+
+/// Moves a whole player, texture included, off the UI thread before it is dropped.
+pub fn retire_player(player: std::sync::Arc<std::sync::Mutex<Player>>) {
+    let _ = reaper().send(Retired::Player(player));
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub live_id: String,
@@ -172,10 +208,11 @@ impl Player {
         })
     }
 
-    /// Swaps in a new stream while keeping the playlist and chrome state.
-    pub fn reattach(&mut self, engine: &Engine, url: &str, index: usize) -> Result<(), String> {
+    /// Swaps in a new stream while keeping the playlist and chrome state. The old
+    /// session comes back so the caller can drop it off the UI thread.
+    pub fn reattach(&mut self, engine: &Engine, url: &str, index: usize) -> Result<Session, String> {
         let session = engine.open(url, MAX_W, MAX_H)?;
-        self.session = session;
+        let old = std::mem::replace(&mut self.session, session);
         self.index = index;
         self.streams = Vec::new();
         self.danmu_url = None;
@@ -203,7 +240,7 @@ impl Player {
         self.error = None;
         self.last_seq = 0;
         self.paused = false;
-        Ok(())
+        Ok(old)
     }
 
     /// Applies a room's detail: the清晰度 menu, the danmaku file, and the numbers the
@@ -294,7 +331,16 @@ impl Player {
         self.time_ms = self.session.time_ms().max(0);
         self.len_ms = self.session.length_ms().max(0);
 
-        let every = if self.started { 16 } else { 80 };
+        // Poll a little faster than the stream (25fps) instead of pinning the window to
+        // 60 repaints a second: a 1440p pass costs the same whether or not there is a
+        // new frame, and a paused picture needs almost none.
+        let every = if self.paused {
+            200
+        } else if self.started {
+            20
+        } else {
+            80
+        };
         ctx.request_repaint_after_for(Duration::from_millis(every), viewport);
     }
 
@@ -532,7 +578,11 @@ impl Player {
             None
         };
         if let Some(f) = jump {
+            let t0 = Instant::now();
             self.session.set_time_ms((f as f64 * self.len_ms as f64) as i64);
+            if crate::perf::on() {
+                eprintln!("PROBE seek {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+            }
         }
 
         let rail = Rect::from_min_size(Pos2::new(rect.min.x, rect.center().y - 2.0), Vec2::new(rect.width(), 4.0));

@@ -29,6 +29,18 @@ fn main() -> eframe::Result {
     if args.iter().any(|a| a == "--apitest") {
         std::process::exit(apitest());
     }
+    if let Some(pos) = args.iter().position(|a| a == "--closetest") {
+        let (Some(live_id), kind) = (args.get(pos + 1), args.get(pos + 2)) else {
+            eprintln!("用法: live48-egui --closetest <liveId> [open|member] [秒]");
+            std::process::exit(2);
+        };
+        let source = match kind.map(|s| s.as_str()) {
+            Some("member") => models::Source::Member,
+            _ => models::Source::Open,
+        };
+        let secs = args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
+        std::process::exit(closetest(live_id, source, secs));
+    }
     if let Some(pos) = args.iter().position(|a| a == "--selftest") {
         let Some(target) = args.get(pos + 1) else {
             eprintln!("用法: live48-egui --selftest <视频文件或流地址>");
@@ -135,6 +147,65 @@ fn selftest(target: &str) -> i32 {
         println!("SELFTEST FAIL");
         5
     }
+}
+
+/// Opens a real stream, lets it decode for `secs`, then times the teardown. Closing a
+/// player is a `Session::drop`, so this is the number the UI thread would eat.
+fn closetest(live_id: &str, source: models::Source, secs: u64) -> i32 {
+    let api = api::Api::new();
+    let url = match api.stream_url(live_id, source, None) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("stream url FAILED: {e}");
+            return 10;
+        }
+    };
+    println!("url = {}", url.chars().take(90).collect::<String>());
+    let engine = match vlc::Engine::load() {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("FAIL engine: {e}");
+            return 3;
+        }
+    };
+    let t_open = Instant::now();
+    let session = match engine.open(&url, player::MAX_W, player::MAX_H) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("FAIL open: {e}");
+            return 4;
+        }
+    };
+    println!(
+        "open took {:.0}ms",
+        t_open.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut buf = Vec::new();
+    let mut frames = 0usize;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        if session.frames().take_rgba(&mut buf) {
+            frames += 1;
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    println!(
+        "played {} frames in {}s, {:.1} fps, negotiated={:?}",
+        frames,
+        secs,
+        frames as f32 / secs as f32,
+        session.frames().size()
+    );
+    let t_drop = Instant::now();
+    drop(session);
+    let ms = t_drop.elapsed().as_secs_f64() * 1000.0;
+    println!("closing the session took {ms:.0}ms");
+    if ms > 250.0 {
+        println!("CLOSETEST SLOW");
+    } else {
+        println!("CLOSETEST OK");
+    }
+    0
 }
 
 /// Drives the real record downloader for a bounded time so the segment cache, the
@@ -298,9 +369,27 @@ fn apitest() -> i32 {
             .map(|d| d.timestamp_millis() - 86_400_000)
             .unwrap_or(0)
     };
+    let t_rec = Instant::now();
     match api.records_back_to("0", yesterday, 0, 0) {
-        Ok((items, next)) => println!("record list: {} items, next={next}", items.len()),
+        Ok((items, next)) => println!(
+            "record list: {} items, next={next} ({:.0}ms)",
+            items.len(),
+            t_rec.elapsed().as_secs_f64() * 1000.0
+        ),
         Err(e) => eprintln!("record list FAILED: {e}"),
+    }
+    // Twice more on the same client: the first walk pays the TLS setup, the rest only
+    // a request round trip, which is what the shared client buys.
+    for i in 0..2 {
+        let t = Instant::now();
+        match api.record_page_group("0", 0, 0) {
+            Ok((items, _)) => println!(
+                "  warm page {i}: {} items ({:.0}ms)",
+                items.len(),
+                t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => eprintln!("  warm page {i} FAILED: {e}"),
+        }
     }
     match api.ongoing_lives() {
         Ok(items) => {
@@ -476,10 +565,19 @@ fn apitest() -> i32 {
     // The prev/next/refresh buttons swap the session in place, so verify that the
     // old one tears down and the new one delivers frames too.
     let seq_before = p.session.frames().sequence();
-    if let Err(e) = p.reattach(&engine, &url, 0) {
+    let t_attach = Instant::now();
+    let attached = p.reattach(&engine, &url, 0);
+    if let Ok(old) = &attached {
+        let _ = old;
+    }
+    if let Err(e) = attached {
         eprintln!("reattach FAILED: {e}");
         ok = false;
     } else {
+        println!(
+            "reattach took {:.0}ms",
+            t_attach.elapsed().as_secs_f64() * 1000.0
+        );
         let t0 = Instant::now();
         let start_seq = p.session.frames().sequence();
         while t0.elapsed() < Duration::from_secs(6) {
@@ -500,12 +598,22 @@ fn apitest() -> i32 {
     // Seeking is only meaningful for a record, which is what we play when nobody is live.
     if p.session.length_ms() > 0 {
         let target = p.session.length_ms() / 2;
+        let t_seek = Instant::now();
         p.session.set_time_ms(target);
+        let seek_ms = t_seek.elapsed().as_secs_f64() * 1000.0;
         std::thread::sleep(Duration::from_millis(600));
         let got = p.session.time_ms();
-        println!("seek to {target}ms landed at {got}ms");
+        println!(
+            "seek to {target}ms landed at {got}ms (set_time blocked {seek_ms:.0}ms)"
+        );
         ok = ok && (got - target).abs() < 60_000;
     }
+    let t_drop = Instant::now();
+    drop(p);
+    println!(
+        "closing the player took {:.0}ms",
+        t_drop.elapsed().as_secs_f64() * 1000.0
+    );
 
     if ok {
         println!("APITEST PASS");

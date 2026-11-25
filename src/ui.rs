@@ -263,7 +263,9 @@ impl App {
             }
             crate::mini::ACTION_CLOSE => {
                 self.mini = None;
-                self.player = None;
+                if let Some(player) = self.player.take() {
+                    crate::player::retire_player(player);
+                }
             }
             _ => {}
         }

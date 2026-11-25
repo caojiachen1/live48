@@ -623,18 +623,6 @@ impl App {
         });
     }
 
-    /// Room detail: the清晰度 menu, the danmaku address, and人气/公告/公演 numbers.
-    pub fn fetch_streams(&mut self, live_id: String, source: Source) {
-        let req = self.req.clone();
-        req.spawn(move |r| {
-            let api = Api::new();
-            r.send(Event::Streams {
-                live_id: live_id.clone(),
-                result: api.room_detail(&live_id, source),
-            });
-        });
-    }
-
     /// The applause ranking, which only theatre shows have.
     pub fn fetch_rank(&mut self, live_id: String) {
         let req = self.req.clone();
@@ -877,15 +865,26 @@ impl App {
         let source = entry.source;
         let want = self.qualities.get(&live_id).copied();
         let probe = live_id.clone();
+        // One `getLiveOne` feeds both the address and thedetail chrome: asking twice
+        // for the same room was the slowest part of opening a record.
         req.spawn(move |r| {
             let api = Api::new();
-            let res = api.stream_url(&probe, source, want);
+            let detail = api.room_detail(&probe, source);
+            let res = match &detail {
+                Ok(info) => crate::models::pick_stream(info, want),
+                Err(e) => Err(e.clone()),
+            };
+            if let Ok(info) = detail {
+                r.send(Event::Streams {
+                    live_id: probe.clone(),
+                    result: Ok(info),
+                });
+            }
             r.send(Event::StreamUrl {
                 result: res,
                 action: Box::new(Action::OpenBuiltin { index }),
             });
         });
-        self.fetch_streams(live_id.clone(), source);
         if source == Source::Open {
             self.fetch_rank(live_id);
         }
@@ -900,14 +899,23 @@ impl App {
         let ctx = self.req.ctx().clone();
         let existing = self.player.clone();
         if let Some(arc) = existing {
+            let t0 = std::time::Instant::now();
             let result = arc
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .reattach(&engine, &url, index);
-            if let Err(e) = result {
-                self.toast(ToastKind::Error, format!("内置播放失败：{e}"));
+            if crate::perf::on() {
+                eprintln!(
+                    "PROBE reattach {:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            match result {
+                Ok(old) => crate::player::retire(old),
+                Err(e) => self.toast(ToastKind::Error, format!("内置播放失败：{e}")),
             }
         } else {
+            let t0 = std::time::Instant::now();
             match Player::open(
                 &engine,
                 &url,
@@ -916,7 +924,15 @@ impl App {
                 self.playlist_live,
                 &ctx,
             ) {
-                Ok(player) => self.player = Some(Arc::new(Mutex::new(player))),
+                Ok(player) => {
+                    self.player = Some(Arc::new(Mutex::new(player)));
+                    if crate::perf::on() {
+                        eprintln!(
+                            "PROBE player-open {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                }
                 Err(e) => self.toast(ToastKind::Error, format!("内置播放失败：{e}")),
             }
         }
@@ -946,7 +962,16 @@ impl App {
         match cmd {
             Cmd::None => {}
             Cmd::Close => {
-                self.player = None;
+                let t0 = std::time::Instant::now();
+                if let Some(player) = self.player.take() {
+                    crate::player::retire_player(player);
+                }
+                if crate::perf::on() {
+                    eprintln!(
+                        "PROBE close-drop {:.1}ms",
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
             Cmd::Refresh => {
                 if let Some(arc) = &self.player {
@@ -1214,18 +1239,22 @@ impl App {
 
     pub fn drain_events(&mut self) {
         // Upload a few textures per pass at most: a burst of 760px uploads in one
-        // frame is what turned into a visible hitch while scrolling.
-        for _ in 0..3 {
-            if self.img_pending.is_empty() {
-                break;
+        // frame is what turned into a visible hitch while scrolling. While the player
+        // owns the window the list is not drawn, so those uploads wait instead of
+        // landing in the middle of a video frame.
+        if self.player.is_none() {
+            for _ in 0..3 {
+                if self.img_pending.is_empty() {
+                    break;
+                }
+                let (url, result) = self.img_pending.remove(0);
+                self.images.apply_loaded(&url, result, self.req.ctx());
             }
-            let (url, result) = self.img_pending.remove(0);
-            self.images.apply_loaded(&url, result, self.req.ctx());
-        }
-        if !self.img_pending.is_empty() {
-            self.req
-                .ctx()
-                .request_repaint_after(std::time::Duration::from_millis(8));
+            if !self.img_pending.is_empty() {
+                self.req
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(8));
+            }
         }
         while let Ok(ev) = self.rx.try_recv() {
             match ev {

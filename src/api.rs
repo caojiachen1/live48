@@ -52,16 +52,28 @@ fn headers() -> HeaderMap {
 }
 
 pub struct Api {
-    client: Client,
+    client: &'static Client,
+}
+
+/// One client for every API call: building a `Client` spins up a TLS context, and a
+/// fresh one per request also threw away the connection, so walking three pages of
+/// records paid three handshakes in a row.
+fn shared_client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("api client")
+    })
 }
 
 impl Api {
     pub fn new() -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .expect("reqwest client");
-        Api { client }
+        Api {
+            client: shared_client(),
+        }
     }
 
     fn post(&self, path: &str, body: &serde_json::Value) -> Result<Response, String> {

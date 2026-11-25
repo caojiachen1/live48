@@ -21,6 +21,7 @@ Settings, downloads and the cached engine live in `%APPDATA%/live48-egui/`.
 ```bash
 live48-egui --selftest <file:///path/to/video.ts>   # libVLC frame path
 live48-egui --apitest                              # API + decode + reattach + seek
+live48-egui --closetest <liveId> [open|member] [s] # open, decode, then time the teardown
 live48-egui --recordtest <mrl> <out.ts>            # libVLC stream-out capture
 live48-egui --dltest <liveId> <out.ts> [seconds]   # segment download + resume
 L48_PERF=1 live48-egui                             # per-frame cost on stderr
@@ -41,6 +42,10 @@ L48_PERF=1 live48-egui                             # per-frame cost on stderr
   drawer fed by `getOpenLiveMemberRank`
 * Portrait rooms (`pictureOrientation != 1`) get a tall placeholder before the first
   frame instead of a wide one
+* One HTTP client backs every API call and one `getLiveOne` feeds both the address and
+  the chrome, so opening a record no longer pays two handshakes and two identical
+  requests; closing hands the libVLC session to a background reaper thread instead of
+  stopping it on the UI thread
 * Record danmaku: the `.lrc` at `msgFilePath` is read, highlighted against the
   playhead, seekable by click, and can be saved
 * Record download: every TS segment lands in `<target>.cache/`, existing segments are
