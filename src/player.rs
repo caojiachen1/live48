@@ -250,8 +250,19 @@ impl Player {
 
     /// Attaches the read-ahead cache the URL was served from; `None` for live.
     pub fn set_cache(&mut self, cache: Option<std::sync::Arc<crate::playcache::PlayCache>>) {
+        if let Some(old) = self.cache.take() {
+            old.close();
+        }
         self.buffered_ms = cache.as_ref().map(|c| c.buffered_ms()).unwrap_or(0);
         self.cache = cache;
+    }
+
+    /// Closing the player also closes the cache, which queues its folder for cleanup.
+    pub fn close_cache(&mut self) {
+        if let Some(cache) = self.cache.take() {
+            cache.close();
+        }
+        self.buffered_ms = 0;
     }
 
     /// Applies a room's detail: the清晰度 menu, the danmaku file, and the numbers the

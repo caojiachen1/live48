@@ -221,6 +221,7 @@ fn cachetest(m3u8: &str, secs: u64) -> i32 {
     }
     let final_time = session.time_ms();
     let final_buffered = cache.buffered_ms();
+    let cache_dir = cache.dir().to_path_buf();
     println!(
         "played {} frames in {}s, {:.1} fps, time = {}ms, buffered = {}ms",
         frames,
@@ -230,8 +231,20 @@ fn cachetest(m3u8: &str, secs: u64) -> i32 {
         final_buffered
     );
     drop(session);
+    cache.close();
     drop(cache);
-    if frames > 0 && final_buffered > final_time {
+    let mut cleaned = true;
+    if std::env::var("L48_CACHE_KEEP").is_ok() {
+        println!("cache kept at {}", cache_dir.display());
+    } else {
+        std::thread::sleep(Duration::from_millis(1800));
+        cleaned = !cache_dir.exists();
+        println!(
+            "cache dir removed = {cleaned} ({})",
+            cache_dir.display()
+        );
+    }
+    if frames > 0 && final_buffered > final_time && cleaned {
         println!("CACHETEST PASS");
         0
     } else {

@@ -7,12 +7,13 @@
 //! serves them back through a loopback HTTP server. Because we own the reads we also
 //! know the contiguous buffered end, which is the second rail on the progress bar.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::Api;
 
@@ -48,6 +49,8 @@ pub struct PlayCache {
     position: AtomicI64,
     buffered: AtomicI64,
     stop: AtomicBool,
+    closed: AtomicBool,
+    dir: PathBuf,
 }
 
 impl PlayCache {
@@ -72,6 +75,8 @@ impl PlayCache {
         let dir = crate::config::dir()
             .join("playcache")
             .join(format!("{}-{:016x}", safe_name(live_id), url_hash(m3u8)));
+        // Holds the folder against the cleanup a previous close may have queued.
+        let lease = DirLease::new(&dir);
         let _ = std::fs::create_dir_all(&dir);
         prune_old(&dir);
 
@@ -108,7 +113,10 @@ impl PlayCache {
             position: AtomicI64::new(0),
             buffered: AtomicI64::new(0),
             stop: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            dir: dir.clone(),
         });
+        lease.keep();
         cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
 
         spawn_server(&cache, listener);
@@ -135,6 +143,11 @@ impl PlayCache {
         self.total_ms
     }
 
+    /// The folder backing this cache; removed in the background once it closes.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Where the player is; a jump restarts the download window.
     pub fn note_position(&self, ms: i64) {
         let old = self.position.swap(ms.max(0), Ordering::Relaxed);
@@ -142,18 +155,159 @@ impl PlayCache {
             self.wake.notify_all();
         }
     }
-}
-
-impl Drop for PlayCache {
-    fn drop(&mut self) {
+    /// Stops the worker and queues the folder for background deletion. Safe to call
+    /// more than once; the threads may still hold an `Arc` for a moment, so close
+    /// must not wait for `Drop`.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut st) = self.state.lock() {
             st.stop = true;
             self.wake.notify_all();
         }
-        // The folder stays: reopening the same record then starts with its segments
-        // already on disk.
+        let last = release(&self.dir);
+        if std::env::var("L48_CACHE_DEBUG").is_ok() {
+            eprintln!("cache close {} last={last}", self.dir.display());
+        }
+        if last {
+            spawn_cleanup(self.dir.clone());
+        }
     }
+}
+
+impl Drop for PlayCache {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Folders with a `PlayCache` alive; close cleanup skips them.
+fn active_dirs() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register(dir: &Path) {
+    let mut map = active_dirs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *map.entry(dir.to_owned()).or_insert(0) += 1;
+}
+
+/// Returns true when this was the last cache on that folder.
+fn release(dir: &Path) -> bool {
+    let mut map = active_dirs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match map.get_mut(dir) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => {
+            map.remove(dir);
+            true
+        }
+        None => true,
+    }
+}
+
+/// Guards a folder during `start`; if setup fails before a `PlayCache` owns it, the
+/// guard releases it and queues the same cleanup.
+struct DirLease {
+    dir: PathBuf,
+    armed: bool,
+}
+
+impl DirLease {
+    fn new(dir: &Path) -> Self {
+        register(dir);
+        Self {
+            dir: dir.to_owned(),
+            armed: true,
+        }
+    }
+
+    /// The cache now owns the registration, released from its `Drop`.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DirLease {
+    fn drop(&mut self) {
+        if self.armed && release(&self.dir) {
+            spawn_cleanup(self.dir.clone());
+        }
+    }
+}
+
+/// Deletes a closed record's folder off the UI and reaper threads. The short grace
+/// period lets a quick reopen keep the segments it already has.
+fn spawn_cleanup(dir: PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("playcache-clean".to_owned())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            if std::env::var("L48_CACHE_DEBUG").is_ok() {
+                eprintln!("cache clean wake {}", dir.display());
+            }
+            let mut trash = None;
+            for _ in 0..15 {
+                let mut gone = false;
+                let moved = {
+                    let map = active_dirs()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let count = map.get(&dir).copied().unwrap_or(0);
+                    if count > 0 {
+                        // Opened again during the grace period; keep the folder
+                        // so that playback starts with what is already there.
+                        return;
+                    }
+                    let stamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let name = dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("playcache");
+                    let target = dir.with_file_name(format!("{name}.trash-{stamp}"));
+                    // Rename first: a reopen then finds no folder and starts clean,
+                    // instead of reading files that are halfway deleted.
+                    match std::fs::rename(&dir, &target) {
+                        Ok(()) => Some(target),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            gone = true;
+                            None
+                        }
+                        Err(e) => {
+                            if std::env::var("L48_CACHE_DEBUG").is_ok() {
+                                eprintln!("cache clean rename failed: {e}");
+                            }
+                            None
+                        }
+                    }
+                };
+                if gone {
+                    return;
+                }
+                if let Some(target) = moved {
+                    trash = Some(target);
+                    break;
+                }
+                // The worker may still be closing its last segment file.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            let Some(trash) = trash else { return };
+            // A segment handle may still be closing; retry briefly instead of
+            // giving up on the first sharing violation.
+            for _ in 0..10 {
+                if std::fs::remove_dir_all(&trash).is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
 }
 
 fn safe_name(id: &str) -> String {

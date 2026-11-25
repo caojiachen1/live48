@@ -989,6 +989,14 @@ impl App {
             Cmd::None => {}
             Cmd::Close => {
                 let t0 = std::time::Instant::now();
+                if let Some((_, cache)) = self.pending_cache.take() {
+                    cache.close();
+                }
+                if let Some(arc) = &self.player {
+                    arc.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .close_cache();
+                }
                 if let Some(player) = self.player.take() {
                     crate::player::retire_player(player);
                 }
