@@ -314,6 +314,10 @@ impl App {
                         {
                             self.settings_open = !self.settings_open;
                             self.filter_open = false;
+                            if self.settings_open {
+                                // Re-measure whenever the panel is opened.
+                                self.cache_bytes = None;
+                            }
                         }
                         if tool_button(ui, Icon::Filter, "筛选", self.has_filters())
                             .on_hover_text("按团体、类型、成员与日期筛选")
@@ -469,6 +473,7 @@ impl App {
         if resp.clicked() {
             self.settings_open = true;
             self.filter_open = false;
+            self.cache_bytes = None;
         }
     }
 
@@ -1440,6 +1445,57 @@ impl App {
                         .size(10.5)
                         .color(t::TEXT_3),
                 );
+            }
+
+            util::section(ui, "播放缓存");
+            if self.cache_bytes.is_none() && !self.cache_busy {
+                self.refresh_cache_stats();
+            }
+            let stat_w = ui.available_width();
+            Frame::new()
+                .fill(t::alpha(t::WHITE, 10))
+                .corner_radius(9.0)
+                .inner_margin(10)
+                .show(ui, |ui| {
+                    ui.set_width(stat_w - 20.0);
+                    ui.horizontal(|ui| {
+                        let stat = match self.cache_bytes {
+                            Some(bytes) => format!(
+                                "已用 {} · {} 个录播",
+                                crate::util::fmt_size(bytes),
+                                self.cache_dirs
+                            ),
+                            None => "正在统计…".to_owned(),
+                        };
+                        ui.label(RichText::new(stat).size(12.5).color(t::TEXT_2));
+                        if ui
+                            .add_sized(Vec2::new(46.0, 24.0), t::ghost_button("刷新"))
+                            .on_hover_text("重新统计磁盘占用")
+                            .clicked()
+                        {
+                            self.refresh_cache_stats();
+                        }
+                    });
+                    ui.label(
+                        RichText::new("关闭播放器后保留；后台三路并行，最多预下 4 分钟。删除只清理未在播放的录播")
+                            .size(11.0)
+                            .color(t::TEXT_3),
+                    );
+                });
+            ui.add_space(8.0);
+            let w = ui.available_width();
+            let clear = t::ghost_button(if self.cache_busy {
+                "正在处理…"
+            } else {
+                "清空播放缓存"
+            });
+            let resp = ui
+                .add_enabled_ui(!self.cache_busy, |ui| {
+                    ui.add_sized(Vec2::new(w, 32.0), clear)
+                })
+                .inner;
+            if resp.clicked() {
+                self.clear_cache();
             }
 
             util::section(ui, "下载与录制目录");

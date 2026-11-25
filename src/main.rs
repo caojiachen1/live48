@@ -233,21 +233,15 @@ fn cachetest(m3u8: &str, secs: u64) -> i32 {
     drop(session);
     cache.close();
     drop(cache);
-    let mut cleaned = true;
-    if std::env::var("L48_CACHE_KEEP").is_ok() {
-        println!("cache kept at {}", cache_dir.display());
-    } else {
-        std::thread::sleep(Duration::from_millis(1800));
-        cleaned = !cache_dir.exists();
-        println!(
-            "cache dir removed = {cleaned} ({})",
-            cache_dir.display()
-        );
-    }
-    if frames > 0 && final_buffered > final_time && cleaned {
+    println!("cache kept at {}", cache_dir.display());
+    let kept = cache_dir.exists();
+    if frames > 0 && final_buffered > final_time && kept {
         println!("CACHETEST PASS");
         0
     } else {
+        if !kept {
+            println!("cache dir gone after close");
+        }
         println!("CACHETEST FAIL");
         12
     }

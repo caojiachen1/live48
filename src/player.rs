@@ -257,7 +257,7 @@ impl Player {
         self.cache = cache;
     }
 
-    /// Closing the player also closes the cache, which queues its folder for cleanup.
+    /// Closing the player stops the cache workers; the downloaded files stay on disk.
     pub fn close_cache(&mut self) {
         if let Some(cache) = self.cache.take() {
             cache.close();

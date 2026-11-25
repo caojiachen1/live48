@@ -17,6 +17,22 @@ pub fn glyph_width(s: &str, size: f32) -> f32 {
     s.chars().map(|c| char_width(c, size)).sum()
 }
 
+/// Human-readable byte count for cache sizes; MB is the useful unit here.
+pub fn fmt_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 pub fn pill_width(text: &str, size: f32) -> f32 {
     glyph_width(text, size) + 12.0
 }

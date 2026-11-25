@@ -17,18 +17,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::Api;
 
-/// How far ahead of the playhead the worker keeps segments on disk, and what it lets
-/// go of once the playhead is well past a segment.
-const AHEAD_MS: i64 = 120_000;
-const BEHIND_MS: i64 = 120_000;
+/// How far ahead of the playhead the workers keep segments on disk. Watched segments
+/// are kept: the cache is meant to be cleared from settings, not silently pruned.
+const AHEAD_MS: i64 = 240_000;
 const WAIT_MS: u64 = 20_000;
-const KEEP_RECORDS: usize = 3;
+/// Parallel segment downloads. A single CDN connection often carries less than the
+/// record's bitrate, and then no amount of read-ahead can keep up.
+const LANES: usize = 3;
 
 struct Seg {
     url: String,
     path: PathBuf,
     ready: bool,
     failed: bool,
+    downloading: bool,
     dur_ms: i64,
     end_ms: i64,
 }
@@ -72,25 +74,29 @@ impl PlayCache {
         // Quality variants share a live id but not a segment list, so the folder is
         // keyed by the playlist too; otherwise a 720p fragment could be served for a
         // 1080p record.
-        let dir = crate::config::dir()
-            .join("playcache")
-            .join(format!("{}-{:016x}", safe_name(live_id), url_hash(m3u8)));
-        // Holds the folder against the cleanup a previous close may have queued.
+        let dir = crate::config::dir().join("playcache").join(format!(
+            "{}-{:016x}",
+            safe_name(live_id),
+            url_hash(m3u8)
+        ));
+        // Holds the folder in the active list while this cache runs.
         let lease = DirLease::new(&dir);
         let _ = std::fs::create_dir_all(&dir);
-        prune_old(&dir);
 
         let mut total = 0i64;
         let mut state_segs = Vec::with_capacity(segs.len());
         for (i, (url, dur)) in segs.iter().enumerate() {
             total += *dur;
             let path = dir.join(format!("s{i:05}.ts"));
-            let ready = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+            let ready = std::fs::metadata(&path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
             state_segs.push(Seg {
                 url: url.clone(),
                 path,
                 ready,
                 failed: false,
+                downloading: false,
                 dur_ms: *dur,
                 end_ms: total,
             });
@@ -117,17 +123,24 @@ impl PlayCache {
             dir: dir.clone(),
         });
         lease.keep();
-        cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+        cache
+            .buffered
+            .store(buffered_end(&cache), Ordering::Relaxed);
 
         spawn_server(&cache, listener);
-        spawn_worker(&cache);
+        for lane in 0..LANES {
+            spawn_worker(&cache, lane);
+        }
         // libVLC gives up on a segment request that takes too long, and on a cold
         // record the first fetch is the slowest one. Have it on disk before handing
         // out the playlist, so playback starts on the first read.
         if !wait_first(&cache, 10_000) {
+            cache.close();
             return Err("首段下载超时".to_owned());
         }
-        cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+        cache
+            .buffered
+            .store(buffered_end(&cache), Ordering::Relaxed);
         Ok(cache)
     }
 
@@ -143,7 +156,7 @@ impl PlayCache {
         self.total_ms
     }
 
-    /// The folder backing this cache; removed in the background once it closes.
+    /// The folder backing this cache; kept after close until settings clears it.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -155,9 +168,8 @@ impl PlayCache {
             self.wake.notify_all();
         }
     }
-    /// Stops the worker and queues the folder for background deletion. Safe to call
-    /// more than once; the threads may still hold an `Arc` for a moment, so close
-    /// must not wait for `Drop`.
+    /// Stops the workers and marks the folder free for manual cleanup. The files
+    /// themselves are kept: the cache survives closing the player.
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -167,12 +179,9 @@ impl PlayCache {
             st.stop = true;
             self.wake.notify_all();
         }
-        let last = release(&self.dir);
+        release(&self.dir);
         if std::env::var("L48_CACHE_DEBUG").is_ok() {
-            eprintln!("cache close {} last={last}", self.dir.display());
-        }
-        if last {
-            spawn_cleanup(self.dir.clone());
+            eprintln!("cache close {}", self.dir.display());
         }
     }
 }
@@ -183,20 +192,24 @@ impl Drop for PlayCache {
     }
 }
 
-/// Folders with a `PlayCache` alive; close cleanup skips them.
+/// Folders with a `PlayCache` alive; manual cache clearing skips them.
 fn active_dirs() -> &'static Mutex<HashMap<PathBuf, usize>> {
     static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn register(dir: &Path) {
-    let mut map = active_dirs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut map = active_dirs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *map.entry(dir.to_owned()).or_insert(0) += 1;
 }
 
 /// Returns true when this was the last cache on that folder.
 fn release(dir: &Path) -> bool {
-    let mut map = active_dirs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut map = active_dirs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match map.get_mut(dir) {
         Some(count) if *count > 1 => {
             *count -= 1;
@@ -211,7 +224,7 @@ fn release(dir: &Path) -> bool {
 }
 
 /// Guards a folder during `start`; if setup fails before a `PlayCache` owns it, the
-/// guard releases it and queues the same cleanup.
+/// guard frees the registration.
 struct DirLease {
     dir: PathBuf,
     armed: bool,
@@ -226,7 +239,7 @@ impl DirLease {
         }
     }
 
-    /// The cache now owns the registration, released from its `Drop`.
+    /// The cache now owns the registration, released from its `close`/`Drop`.
     fn keep(mut self) {
         self.armed = false;
     }
@@ -234,80 +247,10 @@ impl DirLease {
 
 impl Drop for DirLease {
     fn drop(&mut self) {
-        if self.armed && release(&self.dir) {
-            spawn_cleanup(self.dir.clone());
+        if self.armed {
+            release(&self.dir);
         }
     }
-}
-
-/// Deletes a closed record's folder off the UI and reaper threads. The short grace
-/// period lets a quick reopen keep the segments it already has.
-fn spawn_cleanup(dir: PathBuf) {
-    let _ = std::thread::Builder::new()
-        .name("playcache-clean".to_owned())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_millis(800));
-            if std::env::var("L48_CACHE_DEBUG").is_ok() {
-                eprintln!("cache clean wake {}", dir.display());
-            }
-            let mut trash = None;
-            for _ in 0..15 {
-                let mut gone = false;
-                let moved = {
-                    let map = active_dirs()
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let count = map.get(&dir).copied().unwrap_or(0);
-                    if count > 0 {
-                        // Opened again during the grace period; keep the folder
-                        // so that playback starts with what is already there.
-                        return;
-                    }
-                    let stamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let name = dir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("playcache");
-                    let target = dir.with_file_name(format!("{name}.trash-{stamp}"));
-                    // Rename first: a reopen then finds no folder and starts clean,
-                    // instead of reading files that are halfway deleted.
-                    match std::fs::rename(&dir, &target) {
-                        Ok(()) => Some(target),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            gone = true;
-                            None
-                        }
-                        Err(e) => {
-                            if std::env::var("L48_CACHE_DEBUG").is_ok() {
-                                eprintln!("cache clean rename failed: {e}");
-                            }
-                            None
-                        }
-                    }
-                };
-                if gone {
-                    return;
-                }
-                if let Some(target) = moved {
-                    trash = Some(target);
-                    break;
-                }
-                // The worker may still be closing its last segment file.
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            let Some(trash) = trash else { return };
-            // A segment handle may still be closing; retry briefly instead of
-            // giving up on the first sharing violation.
-            for _ in 0..10 {
-                if std::fs::remove_dir_all(&trash).is_ok() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        });
 }
 
 fn safe_name(id: &str) -> String {
@@ -323,30 +266,99 @@ fn url_hash(url: &str) -> u64 {
     hasher.finish()
 }
 
-/// Bounds the cache: only the newest `KEEP_RECORDS` record folders are kept.
-fn prune_old(current: &Path) {
-    let Some(root) = current.parent() else { return };
-    let Ok(rd) = std::fs::read_dir(root) else { return };
-    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            if p.is_dir() && p.as_path() != current {
-                let t = e.metadata().ok()?.modified().ok()?;
-                Some((t, p))
+pub fn root_dir() -> PathBuf {
+    crate::config::dir().join("playcache")
+}
+
+/// Bytes and record folders currently on disk, for the settings panel.
+pub fn disk_usage() -> (u64, usize) {
+    let root = root_dir();
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return (0, 0);
+    };
+    let mut bytes = 0u64;
+    let mut dirs = 0usize;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            dirs += 1;
+            bytes += dir_size(&path);
+        }
+    }
+    (bytes, dirs)
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|entry| {
+            let path = entry.path();
+            let meta = entry.metadata().ok();
+            if path.is_dir() {
+                dir_size(&path)
             } else {
-                None
+                meta.map(|m| m.len()).unwrap_or(0)
             }
         })
-        .collect();
-    if dirs.len() <= KEEP_RECORDS {
-        return;
+        .sum()
+}
+
+/// Removes every record folder that no live cache is using. Folders are renamed
+/// first so a record opened at the same moment starts with a clean directory.
+/// Returns (bytes freed, folders removed, folders kept because they are in use).
+pub fn clear_inactive() -> (u64, usize, usize) {
+    let root = root_dir();
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return (0, 0, 0);
+    };
+    let mut freed = 0u64;
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let target = {
+            let map = active_dirs()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if map.get(&path).copied().unwrap_or(0) > 0 {
+                kept += 1;
+                continue;
+            }
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("playcache");
+            let trash = path.with_file_name(format!("{name}.trash-{stamp}"));
+            match std::fs::rename(&path, &trash) {
+                Ok(()) => Some(trash),
+                Err(_) => None,
+            }
+        };
+        let Some(trash) = target else { continue };
+        let size = dir_size(&trash);
+        let mut done = false;
+        for _ in 0..10 {
+            if std::fs::remove_dir_all(&trash).is_ok() {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        if done {
+            freed += size;
+            removed += 1;
+        }
     }
-    dirs.sort_by_key(|(t, _)| *t);
-    let excess = dirs.len() - KEEP_RECORDS;
-    for (_, p) in dirs.into_iter().take(excess) {
-        let _ = std::fs::remove_dir_all(p);
-    }
+    (freed, removed, kept)
 }
 
 fn parse_playlist(text: &str, base: &url::Url) -> Result<Vec<(String, i64)>, String> {
@@ -473,7 +485,12 @@ fn serve(mut stream: TcpStream, cache: &Arc<PlayCache>) -> std::io::Result<()> {
     }
     if path.starts_with("/p.m3u8") {
         let body = playlist_text(cache);
-        return respond(&mut stream, "application/vnd.apple.mpegurl", body.as_bytes(), 200);
+        return respond(
+            &mut stream,
+            "application/vnd.apple.mpegurl",
+            body.as_bytes(),
+            200,
+        );
     }
     if let Some(idx) = path
         .strip_prefix("/s/")
@@ -481,11 +498,64 @@ fn serve(mut stream: TcpStream, cache: &Arc<PlayCache>) -> std::io::Result<()> {
         .and_then(|p| p.parse::<usize>().ok())
     {
         if let Some(bytes) = wait_segment(cache, idx) {
-            return respond(&mut stream, "video/mp2t", &bytes, 200);
+            let range = parse_range(&text, bytes.len());
+            return respond_segment(&mut stream, &bytes, range);
         }
         return respond(&mut stream, "text/plain", b"segment unavailable", 404);
     }
     respond(&mut stream, "text/plain", b"not found", 404)
+}
+
+/// `Range: bytes=a-b` from VLC; a range request is answered with a 206 slice so its
+/// seek does not have to read the whole segment again.
+fn parse_range(head: &str, total: usize) -> Option<(usize, usize)> {
+    let line = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("range:"))?;
+    let spec = line.split_once('=')?.1.split(',').next()?.trim();
+    let (start, end) = spec.split_once('-')?;
+    let start: usize = start.trim().parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if end.trim().is_empty() {
+        total - 1
+    } else {
+        end.trim().parse::<usize>().ok()?.min(total - 1)
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end + 1))
+}
+
+fn respond_segment(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    range: Option<(usize, usize)>,
+) -> std::io::Result<()> {
+    match range {
+        Some((start, end)) => {
+            let body = &bytes[start..end];
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp2t\r\nContent-Range: bytes {start}-{}-{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                end - 1,
+                bytes.len(),
+                body.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(body)?;
+        }
+        None => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(bytes)?;
+        }
+    }
+    stream.flush()
 }
 
 fn respond(stream: &mut TcpStream, mime: &str, body: &[u8], code: u16) -> std::io::Result<()> {
@@ -526,14 +596,19 @@ fn wait_segment(cache: &Arc<PlayCache>, idx: usize) -> Option<Vec<u8>> {
             }
             cache.wake.notify_all();
         }
-        let (guard, _) = cache.wake.wait_timeout(st, Duration::from_millis(200)).ok()?;
+        let (guard, _) = cache
+            .wake
+            .wait_timeout(st, Duration::from_millis(200))
+            .ok()?;
         st = guard;
     }
 }
 
 fn wait_first(cache: &Arc<PlayCache>, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
-    let Ok(mut st) = cache.state.lock() else { return false };
+    let Ok(mut st) = cache.state.lock() else {
+        return false;
+    };
     loop {
         if st.segs.first().map(|s| s.ready).unwrap_or(false) {
             return true;
@@ -548,10 +623,10 @@ fn wait_first(cache: &Arc<PlayCache>, ms: u64) -> bool {
     }
 }
 
-fn spawn_worker(cache: &Arc<PlayCache>) {
+fn spawn_worker(cache: &Arc<PlayCache>, lane: usize) {
     let weak = Arc::downgrade(cache);
-    std::thread::Builder::new()
-        .name("playcache-worker".to_owned())
+    let _ = std::thread::Builder::new()
+        .name(format!("playcache-worker-{lane}"))
         .spawn(move || {
             let api = Api::new();
             loop {
@@ -561,41 +636,51 @@ fn spawn_worker(cache: &Arc<PlayCache>) {
                 }
                 let pos = cache.position.load(Ordering::Relaxed);
                 let (start, end) = window(&cache, pos);
-                let mut progressed = false;
-                let mut seeked = false;
-                for i in start..end {
-                    if cache.stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let (ready, url, path) = {
-                        let st = cache.state.lock().unwrap();
-                        (st.segs[i].ready, st.segs[i].url.clone(), st.segs[i].path.clone())
+                let pick = {
+                    let mut st = match cache.state.lock() {
+                        Ok(st) => st,
+                        Err(_) => return,
                     };
-                    if ready {
-                        continue;
-                    }
-                    let ok = fetch(&api, &url, &path).is_ok();
-                    if let Ok(mut st) = cache.state.lock() {
-                        st.segs[i].ready = ok;
-                        st.segs[i].failed = !ok;
-                    }
-                    cache.wake.notify_all();
-                    progressed |= ok;
-                    cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
-                    if cache.position.load(Ordering::Relaxed) != pos {
-                        seeked = true;
-                        break;
-                    }
-                }
-                cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
-                prune_behind(&cache, pos);
-                if !progressed && !seeked {
-                    let st = cache.state.lock().unwrap();
+                    let idx = (start..end).find(|&i| {
+                        let seg = &st.segs[i];
+                        !seg.ready && !seg.downloading
+                    });
+                    idx.map(|i| {
+                        st.segs[i].downloading = true;
+                        (i, st.segs[i].url.clone(), st.segs[i].path.clone())
+                    })
+                };
+                let Some((i, url, path)) = pick else {
+                    let st = match cache.state.lock() {
+                        Ok(st) => st,
+                        Err(_) => return,
+                    };
                     let _ = cache.wake.wait_timeout(st, Duration::from_millis(150));
+                    continue;
+                };
+                let outcome = fetch(&api, &url, &path, &cache);
+                if let Ok(mut st) = cache.state.lock() {
+                    st.segs[i].downloading = false;
+                    match outcome {
+                        FetchEnd::Done => {
+                            st.segs[i].ready = true;
+                            st.segs[i].failed = false;
+                        }
+                        FetchEnd::Failed => {
+                            st.segs[i].ready = false;
+                            st.segs[i].failed = true;
+                        }
+                        // A seek pulled the playhead away; the file is discarded
+                        // and this lane picks a segment from the new window.
+                        FetchEnd::Cancel => {}
+                    }
                 }
+                cache.wake.notify_all();
+                cache
+                    .buffered
+                    .store(buffered_end(&cache), Ordering::Relaxed);
             }
-        })
-        .ok();
+        });
 }
 
 fn window(cache: &PlayCache, pos: i64) -> (usize, usize) {
@@ -637,39 +722,75 @@ fn buffered_end(cache: &PlayCache) -> i64 {
     end
 }
 
-/// Drops files the playhead has left far behind, so one record cannot fill the disk.
-fn prune_behind(cache: &PlayCache, pos: i64) {
-    let mut st = cache.state.lock().unwrap();
-    for s in st.segs.iter_mut() {
-        if s.end_ms < pos - BEHIND_MS && s.ready {
-            let _ = std::fs::remove_file(&s.path);
-            s.ready = false;
-        }
-    }
+enum FetchEnd {
+    Done,
+    Failed,
+    Cancel,
 }
 
-fn fetch(api: &Api, url: &str, path: &Path) -> Result<(), String> {
-    let mut res = api.get(url)?;
+fn fetch(api: &Api, url: &str, path: &Path, cache: &PlayCache) -> FetchEnd {
+    let mut res = match api.get(url) {
+        Ok(res) => res,
+        Err(_) => return FetchEnd::Failed,
+    };
     if !res.status().is_success() {
-        return Err(format!("HTTP {}", res.status()));
+        return FetchEnd::Failed;
     }
     let tmp = path.with_extension("part");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(file) => file,
+        Err(_) => return FetchEnd::Failed,
+    };
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0usize;
+    let mut seen = cache.position.load(Ordering::Relaxed);
+    let mut checked = Instant::now();
     loop {
-        let n = res.read(&mut buf).map_err(|e| e.to_string())?;
+        if cache.stop.load(Ordering::Relaxed) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return FetchEnd::Cancel;
+        }
+        // A seek moves the playhead much faster than wall time; a slow download
+        // moves it at about 1x, and a pause does not move it at all.
+        let now = cache.position.load(Ordering::Relaxed);
+        let wall = checked.elapsed().as_millis() as i64;
+        let moved = now - seen;
+        if moved.abs() > 2_000 && (moved - wall).abs() > 12_000 {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return FetchEnd::Cancel;
+        }
+        seen = now;
+        checked = Instant::now();
+        let n = match res.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return FetchEnd::Failed;
+            }
+        };
         if n == 0 {
             break;
         }
         total += n;
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        if file.write_all(&buf[..n]).is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return FetchEnd::Failed;
+        }
     }
     drop(file);
     if total == 0 {
         let _ = std::fs::remove_file(&tmp);
-        return Err("empty segment".to_owned());
+        return FetchEnd::Failed;
     }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => FetchEnd::Done,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            FetchEnd::Failed
+        }
+    }
 }

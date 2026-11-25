@@ -35,6 +35,10 @@ pub enum Event {
         live_id: String,
         cache: Arc<crate::playcache::PlayCache>,
     },
+    /// Disk usage of the play cache, for the settings panel.
+    CacheStat(u64, usize),
+    /// Result of clearing inactive cache folders: bytes freed, folders removed, kept.
+    CacheCleared(u64, usize, usize),
     StreamUrl {
         result: Result<String, String>,
         action: Box<Action>,

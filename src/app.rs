@@ -197,6 +197,10 @@ pub struct App {
     pub ranks: HashMap<String, Vec<MemberRank>>,
     /// Read-ahead cache handed over by the URL thread, waiting for the player.
     pub pending_cache: Option<(String, Arc<crate::playcache::PlayCache>)>,
+    /// Play-cache disk usage shown in settings; `None` until measured.
+    pub cache_bytes: Option<u64>,
+    pub cache_dirs: usize,
+    pub cache_busy: bool,
     /// Auto-retry bookkeeping for a dead live stream.
     pub retry_live: Option<String>,
     pub retry_at: Option<Instant>,
@@ -275,6 +279,9 @@ impl App {
             rooms: HashMap::new(),
             ranks: HashMap::new(),
             pending_cache: None,
+            cache_bytes: None,
+            cache_dirs: 0,
+            cache_busy: false,
             retry_live: None,
             retry_at: None,
             retries: 0,
@@ -700,6 +707,32 @@ impl App {
         self.engine_loading = true;
         let req = self.req.clone();
         req.spawn(move |r| r.send(Event::EngineReady(Engine::load().map(Arc::new))));
+    }
+
+    /// Measures the play cache off the UI thread; settings shows the result.
+    pub fn refresh_cache_stats(&mut self) {
+        if self.cache_busy {
+            return;
+        }
+        self.cache_busy = true;
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let (bytes, dirs) = crate::playcache::disk_usage();
+            r.send(Event::CacheStat(bytes, dirs));
+        });
+    }
+
+    /// Clears every cache folder that no open player is using.
+    pub fn clear_cache(&mut self) {
+        if self.cache_busy {
+            return;
+        }
+        self.cache_busy = true;
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let (bytes, dirs, kept) = crate::playcache::clear_inactive();
+            r.send(Event::CacheCleared(bytes, dirs, kept));
+        });
     }
 
     pub fn download_engine(&mut self) {
@@ -1321,6 +1354,28 @@ impl App {
                 },
                 Event::CacheReady { live_id, cache } => {
                     self.pending_cache = Some((live_id, cache));
+                }
+                Event::CacheStat(bytes, dirs) => {
+                    self.cache_bytes = Some(bytes);
+                    self.cache_dirs = dirs;
+                    self.cache_busy = false;
+                }
+                Event::CacheCleared(bytes, dirs, kept) => {
+                    self.cache_busy = false;
+                    if dirs == 0 && kept > 0 {
+                        self.toast(ToastKind::Info, "正在播放的录播缓存未清理");
+                    } else {
+                        self.toast(
+                            ToastKind::Success,
+                            format!(
+                                "已清理 {} 个录播缓存，共 {}",
+                                dirs,
+                                crate::util::fmt_size(bytes)
+                            ),
+                        );
+                    }
+                    self.cache_bytes = None;
+                    self.refresh_cache_stats();
                 }
                 Event::Image { url, result } => {
                     self.img_pending.push((url, result));

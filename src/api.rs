@@ -273,6 +273,9 @@ impl Api {
         self.client
             .get(url)
             .header(USER_AGENT, HeaderValue::from_static(ENGINE_UA))
+            // API calls stay on the 20s client timeout; a media segment on a slow
+            // link can legitimately take longer, and the cache tolerates it.
+            .timeout(std::time::Duration::from_secs(60))
             .send()
             .map_err(|e| e.to_string())
     }
