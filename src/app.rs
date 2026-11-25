@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate, TimeZone};
@@ -12,10 +12,11 @@ use crate::api::Api;
 use crate::config::{self, Config};
 use crate::events::{Action, DownloadEvent, Event, ToastKind};
 use crate::images::ImageCache;
-use crate::player::{Entry, Player};
-use crate::vlc::{Engine, Recorder};
 use crate::models::{badge_text, LiveItem, MemberRank, RoomInfo, Source};
+use crate::multiview::{AddOutcome, MultiAction, MultiView};
+use crate::player::{Entry, Player};
 use crate::theme as t;
+use crate::vlc::{Engine, Recorder};
 
 const DAY_MS: i64 = 86_400_000;
 /// How long a dropped recording waits before asking the server for a fresh address,
@@ -154,6 +155,10 @@ pub struct App {
     /// Everyone broadcasting right now, from the one-call aggregate endpoint.
     pub ongoing: Vec<crate::models::OngoingLive>,
     pub loading_ongoing: bool,
+    /// All on-air member rooms, regardless of the list filters. The multi-view
+    /// picker uses this instead of mutating the user's current filter.
+    pub multi_candidates: Vec<LiveItem>,
+    pub loading_multi_candidates: bool,
 
     pub search: String,
     pub groups: Vec<String>,
@@ -220,6 +225,8 @@ pub struct App {
     pub pending_record: Option<String>,
     pub player: Option<Arc<Mutex<Player>>>,
     pub mini: Option<Arc<crate::mini::MiniState>>,
+    /// The single-window wall of live rooms. Mutually exclusive with `player`.
+    pub multi: Option<MultiView>,
     pub playlist: Vec<Entry>,
     pub playlist_live: bool,
 }
@@ -259,6 +266,8 @@ impl App {
             member_only: None,
             ongoing: Vec::new(),
             loading_ongoing: false,
+            multi_candidates: Vec::new(),
+            loading_multi_candidates: false,
             search: String::new(),
             groups: Vec::new(),
             teams: Vec::new(),
@@ -298,6 +307,7 @@ impl App {
             pending_record: None,
             player: None,
             mini: None,
+            multi: None,
             playlist: Vec::new(),
             playlist_live: true,
         };
@@ -342,6 +352,20 @@ impl App {
         req.spawn(move |r| {
             let api = Api::new();
             r.send(Event::Ongoing(api.ongoing_lives()));
+        });
+    }
+
+    /// Fetch the unfiltered live list for the multi-view picker. The normal list
+    /// keeps whatever group/team the user selected; this one must not.
+    pub fn refresh_multi_candidates(&mut self) {
+        if self.loading_multi_candidates {
+            return;
+        }
+        self.loading_multi_candidates = true;
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let api = Api::new();
+            r.send(Event::MultiCandidates(api.live_list(0, 0)));
         });
     }
 
@@ -390,14 +414,14 @@ impl App {
         req.spawn(move |r| {
             let api = Api::new();
             let res = match &only {
-                Some((id, _)) if !append => api
-                    .record_page_user("0", id)
-                    .map(|(mut items, cursor)| {
+                Some((id, _)) if !append => {
+                    api.record_page_user("0", id).map(|(mut items, cursor)| {
                         if let Ok((shows, _)) = api.member_playback(id) {
                             Self::merge_by_time(&mut items, shows);
                         }
                         (items, cursor)
-                    }),
+                    })
+                }
                 Some((id, _)) => api.record_page_user(&next, id),
                 None => api.records_back_to(&next, target, group, team),
             };
@@ -478,15 +502,13 @@ impl App {
         let req = self.req.clone();
         req.spawn(move |r| {
             let api = Api::new();
-            let res = api
-                .record_page_user("0", &id)
-                .map(|(mut items, cursor)| {
-                    // The playbacks are a bonus list: a failure must not hide the records.
-                    if let Ok((shows, _)) = api.member_playback(&id) {
-                        Self::merge_by_time(&mut items, shows);
-                    }
-                    (items, cursor)
-                });
+            let res = api.record_page_user("0", &id).map(|(mut items, cursor)| {
+                // The playbacks are a bonus list: a failure must not hide the records.
+                if let Ok((shows, _)) = api.member_playback(&id) {
+                    Self::merge_by_time(&mut items, shows);
+                }
+                (items, cursor)
+            });
             r.send(Event::Records {
                 result: res,
                 append: false,
@@ -508,12 +530,24 @@ impl App {
         };
         let q = self.search.to_lowercase();
         let from = if self.date_on {
-            Some(self.date_from.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
+            Some(
+                self.date_from
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis(),
+            )
         } else {
             None
         };
         let to = if self.date_on {
-            Some(self.date_to.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp_millis())
+            Some(
+                self.date_to
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis(),
+            )
         } else {
             None
         };
@@ -676,7 +710,12 @@ impl App {
             .download_dir
             .clone()
             .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| config::dir().join("downloads").to_string_lossy().to_string())
+            .unwrap_or_else(|| {
+                config::dir()
+                    .join("downloads")
+                    .to_string_lossy()
+                    .to_string()
+            })
     }
 
     pub fn cancel_download(&mut self, live_id: &str) {
@@ -697,7 +736,6 @@ impl App {
         self.req.ctx().request_repaint();
     }
 
-
     // ---------------------------------------------------------------- engine
 
     pub fn ensure_engine(&mut self) {
@@ -707,6 +745,170 @@ impl App {
         self.engine_loading = true;
         let req = self.req.clone();
         req.spawn(move |r| r.send(Event::EngineReady(Engine::load().map(Arc::new))));
+    }
+
+    // ------------------------------------------------------------- multiview
+
+    pub fn open_multi(&mut self) {
+        if self.player.is_some() || self.mini.is_some() {
+            self.toast(ToastKind::Info, "先关闭当前播放器再打开多画面");
+            return;
+        }
+        self.filter_open = false;
+        self.settings_open = false;
+        if self.multi.is_none() {
+            self.multi = Some(MultiView::new(&self.cfg));
+        }
+        self.ensure_engine();
+        if self.engine.is_some() {
+            self.start_multi_all();
+        }
+        if !self.loading_live {
+            self.refresh_live();
+        }
+        self.refresh_multi_candidates();
+        self.req.ctx().request_repaint();
+    }
+
+    pub fn close_multi(&mut self) {
+        if self.multi.take().is_some() {
+            self.req.ctx().request_repaint();
+        }
+    }
+
+    fn start_multi_all(&mut self) {
+        if self.engine.is_none() {
+            self.ensure_engine();
+            return;
+        }
+        let due = self
+            .multi
+            .as_ref()
+            .map(|m| m.slots_to_start())
+            .unwrap_or_default();
+        for index in due {
+            self.start_multi_slot(index);
+        }
+    }
+
+    fn start_multi_slot(&mut self, index: usize) {
+        let Some(engine) = self.engine.clone() else {
+            self.ensure_engine();
+            return;
+        };
+        let Some((token, info)) = self.multi.as_mut().and_then(|m| m.begin_open(index)) else {
+            return;
+        };
+        let (max_w, max_h) = self
+            .multi
+            .as_ref()
+            .map(|m| m.frame_limits())
+            .unwrap_or((640, 360));
+        let ctx = self.req.ctx().clone();
+        let req = self.req.clone();
+        req.spawn(move |r| {
+            let api = Api::new();
+            let result = api
+                .stream_url(&info.live_id, info.source, None)
+                .and_then(|url| {
+                    let entries = vec![Entry {
+                        live_id: info.live_id.clone(),
+                        title: info.title.clone(),
+                        nickname: info.nickname.clone(),
+                        cover: String::new(),
+                        source: info.source,
+                    }];
+                    Player::open_sized(&engine, &url, entries, 0, true, &ctx, max_w, max_h).map(
+                        |mut p| {
+                            // Every tile starts silent; the accepted focus tile is
+                            // unmuted once the player is installed in the grid.
+                            p.set_muted_exact(true);
+                            Arc::new(Mutex::new(p))
+                        },
+                    )
+                });
+            r.send(Event::MultiPlayer { token, result });
+        });
+    }
+
+    fn add_multi_live(&mut self, item: &LiveItem) {
+        let outcome = {
+            let Some(multi) = self.multi.as_mut() else {
+                return;
+            };
+            multi.add_live(item)
+        };
+        match outcome {
+            AddOutcome::Added(index) => self.start_multi_slot(index),
+            AddOutcome::Duplicate => {
+                self.toast(ToastKind::Info, "这个成员已经在多画面里");
+            }
+            AddOutcome::Full => {
+                self.toast(ToastKind::Info, "多画面最多同时显示 9 路");
+            }
+        }
+    }
+
+    pub fn tick_multi(&mut self) {
+        if self.engine.is_none() {
+            self.ensure_engine();
+            return;
+        }
+        let due = self
+            .multi
+            .as_mut()
+            .map(|m| m.due_retries())
+            .unwrap_or_default();
+        for index in due {
+            self.start_multi_slot(index);
+        }
+    }
+
+    pub fn multi_view(&mut self, ui: &mut egui::Ui) {
+        let candidates = if self.multi_candidates.is_empty() {
+            self.lives.clone()
+        } else {
+            self.multi_candidates.clone()
+        };
+        let loading = if self.multi_candidates.is_empty() {
+            self.loading_live || self.loading_multi_candidates
+        } else {
+            self.loading_multi_candidates
+        };
+        let actions = {
+            let Some(multi) = self.multi.as_mut() else {
+                return;
+            };
+            multi.show(ui, &candidates, loading)
+        };
+
+        let mut close = false;
+        for action in actions {
+            match action {
+                MultiAction::Close => close = true,
+                MultiAction::Add(item) => self.add_multi_live(&item),
+                MultiAction::RefreshCandidates => {
+                    self.refresh_live();
+                    self.refresh_multi_candidates();
+                }
+                MultiAction::Retry(index) => self.start_multi_slot(index),
+            }
+        }
+
+        let dirty = self.multi.as_ref().is_some_and(|m| m.dirty);
+        if dirty {
+            if let Some(multi) = self.multi.as_ref() {
+                multi.sync_config(&mut self.cfg);
+            }
+            config::save(&self.cfg);
+            if let Some(multi) = self.multi.as_mut() {
+                multi.dirty = false;
+            }
+        }
+
+        if close {
+            self.close_multi();
+        }
     }
 
     /// Measures the play cache off the UI thread; settings shows the result.
@@ -870,7 +1072,8 @@ impl App {
     /// Where the playlist drawer currently sits, for wheel hit-testing.
     pub fn playlist_hit(&self) -> Rect {
         self.player.as_ref().map_or(Rect::NOTHING, |p| {
-            p.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            p.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .playlist_rect
         })
     }
@@ -997,10 +1200,10 @@ impl App {
             .get(index)
             .map(|e| e.live_id.clone())
             .unwrap_or_default();
-        let cache = self
-            .pending_cache
-            .take()
-            .and_then(|(id, cache)| if id == live_id { Some(cache) } else { None });
+        let cache =
+            self.pending_cache
+                .take()
+                .and_then(|(id, cache)| if id == live_id { Some(cache) } else { None });
         if let Some(arc) = &self.player {
             let want = self.qualities.get(&live_id).copied();
             let room = self.rooms.get(&live_id).cloned();
@@ -1064,9 +1267,17 @@ impl App {
                     let p = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     (p.index, p.entries.len(), p.entries.clone(), p.is_live)
                 };
-                let next = if cmd == Cmd::Next { index + 1 } else { index.saturating_sub(1) };
+                let next = if cmd == Cmd::Next {
+                    index + 1
+                } else {
+                    index.saturating_sub(1)
+                };
                 if next >= len {
-                    let msg = if cmd == Cmd::Next { "已经是最后一个了" } else { "已经是第一个了" };
+                    let msg = if cmd == Cmd::Next {
+                        "已经是最后一个了"
+                    } else {
+                        "已经是第一个了"
+                    };
                     self.toast(ToastKind::Info, msg);
                     return;
                 }
@@ -1086,7 +1297,9 @@ impl App {
                 }
             }
             Cmd::Mini => {
-                let Some(player) = self.player.clone() else { return };
+                let Some(player) = self.player.clone() else {
+                    return;
+                };
                 self.mini = Some(Arc::new(crate::mini::MiniState::new(player)));
                 // Same behaviour as the original: the main window steps aside.
                 self.req
@@ -1116,7 +1329,9 @@ impl App {
                 }
             }
             Cmd::SaveDanmu => {
-                let Some(arc) = self.player.clone() else { return };
+                let Some(arc) = self.player.clone() else {
+                    return;
+                };
                 let found = {
                     let guard = arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     guard
@@ -1164,7 +1379,11 @@ impl App {
             self.toast(ToastKind::Error, format!("无法创建录制目录：{e}"));
             return;
         }
-        let kind = if item.source == Source::Open { "48公演直播" } else { "口袋48直播" };
+        let kind = if item.source == Source::Open {
+            "48公演直播"
+        } else {
+            "口袋48直播"
+        };
         let path = std::path::Path::new(&dir).join(file_name(&item, kind, "ts"));
         self.start_capture(item, engine, path.to_string_lossy().to_string());
     }
@@ -1178,7 +1397,10 @@ impl App {
             let res = api
                 .stream_url(&live_id, source, None)
                 .and_then(|url| engine.record(&url, &path).map(|rec| (url, rec)));
-            r.send(Event::RecordStarted { live_id, result: res });
+            r.send(Event::RecordStarted {
+                live_id,
+                result: res,
+            });
         });
         self.toast(ToastKind::Info, "开始录制");
     }
@@ -1215,11 +1437,17 @@ impl App {
             }
         }
         for (id, item, previous) in restart {
-            let Some(engine) = self.engine.clone() else { continue };
+            let Some(engine) = self.engine.clone() else {
+                continue;
+            };
             let req = self.req.clone();
             let live_id = id.clone();
             let dir = self.download_dir();
-            let kind = if item.source == Source::Open { "48公演直播" } else { "口袋48直播" };
+            let kind = if item.source == Source::Open {
+                "48公演直播"
+            } else {
+                "口袋48直播"
+            };
             let base = item.clone();
             req.spawn(move |r| {
                 let api = Api::new();
@@ -1230,7 +1458,10 @@ impl App {
                     Ok(u) => {
                         let path = next_take(&dir, &base, kind);
                         let res = engine.record(&u, &path).map(|rec| (u, rec));
-                        r.send(Event::RecordStarted { live_id, result: res });
+                        r.send(Event::RecordStarted {
+                            live_id,
+                            result: res,
+                        });
                     }
                 }
             });
@@ -1288,14 +1519,16 @@ impl App {
             if slots == 0 {
                 break;
             }
-            let hit = names.iter().any(|n| {
-                item.nickname.to_lowercase().contains(n) || item.user_id == *n
-            });
+            let hit = names
+                .iter()
+                .any(|n| item.nickname.to_lowercase().contains(n) || item.user_id == *n);
             if !hit || self.recordings.contains_key(&item.live_id) {
                 continue;
             }
             let path = next_take(&dir, item, "口袋48直播(自动抓取)");
-            let Some(engine) = self.engine.clone() else { return };
+            let Some(engine) = self.engine.clone() else {
+                return;
+            };
             append_grab_log(&dir, item, &path);
             self.start_capture(item.clone(), engine, path);
             slots -= 1;
@@ -1336,6 +1569,15 @@ impl App {
                 Event::LiveList(Err(e)) => {
                     self.loading_live = false;
                     self.toast(ToastKind::Error, format!("获取直播列表失败：{e}"));
+                }
+                Event::MultiCandidates(result) => {
+                    self.loading_multi_candidates = false;
+                    match result {
+                        Ok(items) => self.multi_candidates = items,
+                        Err(e) => {
+                            self.toast(ToastKind::Warning, format!("多画面成员列表加载失败：{e}"))
+                        }
+                    }
                 }
                 Event::Records { result, append } => match result {
                     Ok((items, next)) => {
@@ -1584,6 +1826,9 @@ impl App {
                     if let Some(live_id) = self.pending_record.take() {
                         self.toggle_recording(&live_id);
                     }
+                    if self.multi.is_some() {
+                        self.start_multi_all();
+                    }
                 }
                 Event::EngineReady(Err(e)) => {
                     self.engine_loading = false;
@@ -1593,22 +1838,44 @@ impl App {
                     self.toast(ToastKind::Error, format!("启动播放器失败：{e}"))
                 }
                 Event::ExternalPlayer(Ok(())) => {}
+                Event::MultiPlayer { token, result } => {
+                    if let Some(multi) = self.multi.as_mut() {
+                        match result {
+                            Ok(player) => {
+                                multi.accept_player(token, player);
+                            }
+                            Err(e) => multi.fail_open(token, e),
+                        }
+                    } else if let Ok(player) = result {
+                        crate::player::retire_player(player);
+                    }
+                }
             }
         }
     }
 
     fn save_dialog(&mut self, url: String, item: LiveItem) {
         let dir = self.download_dir();
-        let kind = if item.source == Source::Open { "48公演录播" } else { "口袋48录播" };
+        let kind = if item.source == Source::Open {
+            "48公演录播"
+        } else {
+            "口袋48录播"
+        };
         let suggested = std::path::Path::new(&dir).join(file_name(&item, kind, "ts"));
         let file = rfd::FileDialog::new()
-            .set_file_name(suggested.file_name().and_then(|s| s.to_str()).unwrap_or("record.ts"))
+            .set_file_name(
+                suggested
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("record.ts"),
+            )
             .add_filter("视频文件", &["ts", "mp4", "flv"])
             .save_file();
         let Some(path) = file else { return };
         let save_path = path.to_string_lossy().to_string();
         let live_id = item.live_id.clone();
-        self.jobs.insert(live_id.clone(), (url.clone(), save_path.clone()));
+        self.jobs
+            .insert(live_id.clone(), (url.clone(), save_path.clone()));
         self.begin_download(live_id, url, save_path);
     }
 
@@ -1657,7 +1924,8 @@ impl App {
     pub fn tick_toasts(&mut self) {
         let now = Instant::now();
         let before = self.toasts.len();
-        self.toasts.retain(|(_, _, at)| now.duration_since(*at) < Duration::from_secs(4));
+        self.toasts
+            .retain(|(_, _, at)| now.duration_since(*at) < Duration::from_secs(4));
         if self.toasts.len() != before || !self.toasts.is_empty() {
             self.req
                 .ctx()
@@ -1677,7 +1945,11 @@ fn start_of_today_ms() -> i64 {
 }
 
 fn start_of_day_ms(ms: i64) -> i64 {
-    let d = Local.timestamp_millis_opt(ms).single().unwrap().date_naive();
+    let d = Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .unwrap()
+        .date_naive();
     d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
 }
 
@@ -1694,7 +1966,11 @@ pub fn fmt_time(ms: i64) -> String {
 fn append_grab_log(dir: &str, item: &LiveItem, path: &str) {
     use std::io::Write;
     let file = std::path::Path::new(dir).join("pocket48_live_log.txt");
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+    else {
         return;
     };
     let started = item
@@ -1743,7 +2019,12 @@ fn file_time(ms: i64) -> String {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\t'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\t'
+            )
+        })
         .collect()
 }
 
@@ -1756,7 +2037,11 @@ fn next_take(dir: &str, item: &LiveItem, kind: &str) -> String {
         if !path.exists() {
             return path.to_string_lossy().to_string();
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("take").to_owned();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("take")
+            .to_owned();
         let (head, paren) = match (stem.rfind('('), stem.rfind(')')) {
             (Some(a), Some(b)) if b > a => (&stem[..a], stem[a + 1..b].parse::<u32>().ok()),
             _ => (stem.as_str(), None),

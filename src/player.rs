@@ -158,7 +158,24 @@ impl Player {
         is_live: bool,
         ctx: &Context,
     ) -> Result<Player, String> {
-        let session = engine.open(url, MAX_W, MAX_H)?;
+        Self::open_sized(engine, url, entries, index, is_live, ctx, MAX_W, MAX_H)
+    }
+
+    /// Same player, but with a smaller libVLC conversion target. A wall of live
+    /// tiles does not need a 720p RGBA copy per stream, and the grid uploads every
+    /// frame of every tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_sized(
+        engine: &Engine,
+        url: &str,
+        entries: Vec<Entry>,
+        index: usize,
+        is_live: bool,
+        ctx: &Context,
+        max_w: u32,
+        max_h: u32,
+    ) -> Result<Player, String> {
+        let session = engine.open(url, max_w, max_h)?;
         let title = entries
             .get(index)
             .map(|e| e.title.clone())
@@ -397,6 +414,14 @@ impl Player {
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
         self.session.set_muted(self.muted);
+    }
+
+    /// Sets the mute flag explicitly; the grid keeps exactly one tile audible.
+    pub fn set_muted_exact(&mut self, muted: bool) {
+        if self.muted != muted {
+            self.muted = muted;
+            self.session.set_muted(muted);
+        }
     }
 
     // ------------------------------------------------------------------ bars

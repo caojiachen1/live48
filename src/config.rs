@@ -50,6 +50,19 @@ impl Default for Grab {
     }
 }
 
+/// One member kept in the multi-view grid. The address is resolved again on every
+/// launch because a live URL expires, but the name and room id are enough to show
+/// the tile while that happens.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultiMember {
+    pub live_id: String,
+    pub title: String,
+    pub nickname: String,
+    /// Theatre shows use a different room endpoint.
+    pub open: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// "system" | "vlc" | "builtin"
@@ -58,6 +71,19 @@ pub struct Config {
     pub fetch_audio: Option<bool>,
     pub grab: Grab,
     pub download_dir: Option<String>,
+    /// Members and layout of the multi-view grid, restored on the next launch.
+    #[serde(default)]
+    pub multi_members: Vec<MultiMember>,
+    #[serde(default)]
+    pub multi_layout: String,
+    /// Column and row shares after the user drags a gutter. They are only valid
+    /// for the layout recorded in `multi_weights_layout`.
+    #[serde(default)]
+    pub multi_col_w: Vec<f32>,
+    #[serde(default)]
+    pub multi_row_w: Vec<f32>,
+    #[serde(default)]
+    pub multi_weights_layout: String,
 }
 
 pub fn dir() -> PathBuf {

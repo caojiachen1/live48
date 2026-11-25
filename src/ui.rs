@@ -27,6 +27,11 @@ impl eframe::App for App {
         self.tick_timers();
         self.tick_retry();
 
+        if self.multi.is_some() {
+            self.tick_multi();
+            return;
+        }
+
         if self.player.is_some() {
             // Mirrors the web player's gestures: wheel and arrow keys switch
             // between neighbours, Esc tears the overlay down.
@@ -89,6 +94,12 @@ impl eframe::App for App {
         }
 
         self.mini_tick(&ctx);
+
+        if self.multi.is_some() {
+            self.multi_view(ui);
+            self.paint_toasts(&ctx);
+            return;
+        }
 
         if self.player.is_some() && self.mini.is_none() {
             self.player_view(ui);
@@ -302,6 +313,13 @@ impl App {
                             .color(t::TEXT)
                             .font(t::heading(21.0)),
                     );
+                    ui.add_space(14.0);
+                    if tool_button(ui, Icon::Grid, "多画面", false)
+                        .on_hover_text("同一窗口里同时看多路成员直播，可自选成员和布局")
+                        .clicked()
+                    {
+                        self.open_multi();
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // The player hint moved up here, to the right of the settings

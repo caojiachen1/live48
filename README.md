@@ -68,6 +68,12 @@ L48_PERF=1 live48-egui                             # per-frame cost on stderr
   with the member's `getHistoryRecord` theatre playbacks
 * A dead live stream is re-requested automatically three times, ten seconds apart,
   and the error card has a 重试 button
+* Multi-view puts up to nine live rooms in one window. The member drawer lists every
+  room that is on air (independent of the list filters), the layout menu offers
+  auto / two-column / three-column / focus, dragging a tile swaps positions, and
+  dragging the gutters changes row and column sizes. One tile owns the audio; clicking
+  another moves the sound there. The chosen members, layout, and dragged row /
+  column sizes are kept in `config.json`
 * `get/all/ongoing/live/info` is read in one call, so a member's row can be marked
   as being on air and opened straight from the history view
 

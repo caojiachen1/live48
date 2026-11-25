@@ -9,6 +9,7 @@ mod icons;
 mod images;
 mod mini;
 mod models;
+mod multiview;
 mod perf;
 mod playcache;
 mod player;

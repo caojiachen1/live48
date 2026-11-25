@@ -83,6 +83,13 @@ pub enum Event {
     VlcDownload(DownloadEvent),
     EngineReady(Result<Arc<Engine>, String>),
     ExternalPlayer(Result<(), String>),
+    /// A tile in the multi-view grid finished resolving and opening its stream.
+    MultiPlayer {
+        token: u64,
+        result: Result<Arc<std::sync::Mutex<crate::player::Player>>, String>,
+    },
+    /// The unfiltered on-air list used by the multi-view member picker.
+    MultiCandidates(Result<Vec<LiveItem>, String>),
 }
 
 /// What to do once a stream address has been resolved.

@@ -4,6 +4,8 @@ use egui::{Color32, Pos2, Rect, Response, Shape, Stroke, Ui, Vec2};
 pub enum Icon {
     Play,
     Pause,
+    Plus,
+    Grid,
     Stop,
     Close,
     Refresh,
@@ -104,6 +106,39 @@ pub fn draw(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
         .into_iter()
         .flat_map(|p| bar(p[0], p[1], w, color))
         .collect(),
+        Icon::Plus => [
+            [
+                Pos2::new(x0 + rect.width() * 0.18, c.y),
+                Pos2::new(x1 - rect.width() * 0.18, c.y),
+            ],
+            [
+                Pos2::new(c.x, y0 + rect.height() * 0.18),
+                Pos2::new(c.x, y1 - rect.height() * 0.18),
+            ],
+        ]
+        .into_iter()
+        .flat_map(|p| bar(p[0], p[1], w, color))
+        .collect(),
+        Icon::Grid => {
+            let gap = rect.width() * 0.12;
+            let cell = (rect.width() - gap) * 0.5;
+            let mut out = Vec::new();
+            for row in 0..2 {
+                for col in 0..2 {
+                    let min = Pos2::new(
+                        x0 + col as f32 * (cell + gap),
+                        y0 + row as f32 * (cell + gap),
+                    );
+                    out.push(Shape::rect_stroke(
+                        Rect::from_min_size(min, Vec2::splat(cell)),
+                        2.0,
+                        Stroke::new(w, color),
+                        egui::StrokeKind::Inside,
+                    ));
+                }
+            }
+            out
+        }
         Icon::Refresh => {
             let r = rect.width() * 0.42;
             let mut pts: Vec<Pos2> = (0..22)
