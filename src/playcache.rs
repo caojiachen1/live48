@@ -8,10 +8,10 @@
 //! know the contiguous buffered end, which is the second rail on the progress bar.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +23,7 @@ const AHEAD_MS: i64 = 240_000;
 const WAIT_MS: u64 = 20_000;
 /// Parallel segment downloads. A single CDN connection often carries less than the
 /// record's bitrate, and then no amount of read-ahead can keep up.
-const LANES: usize = 3;
+const LANES: usize = 6;
 
 struct Seg {
     url: String,
@@ -31,6 +31,10 @@ struct Seg {
     ready: bool,
     failed: bool,
     downloading: bool,
+    /// Bytes of the in-progress download and the response length, so the seek bar
+    /// can show the buffer growing between two segment boundaries.
+    written: u64,
+    total: u64,
     dur_ms: i64,
     end_ms: i64,
 }
@@ -49,6 +53,9 @@ pub struct PlayCache {
     port: u16,
     total_ms: i64,
     position: AtomicI64,
+    /// Bumped on a seek so one reserved lane can start the new segment immediately,
+    /// even while the other lanes are still stuck on the old window.
+    seek_gen: AtomicU64,
     buffered: AtomicI64,
     stop: AtomicBool,
     closed: AtomicBool,
@@ -91,12 +98,18 @@ impl PlayCache {
             let ready = std::fs::metadata(&path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false);
+            if ready {
+                // Left behind when a reader still had the temp file open at close.
+                let _ = std::fs::remove_file(path.with_extension("part"));
+            }
             state_segs.push(Seg {
                 url: url.clone(),
                 path,
                 ready,
                 failed: false,
                 downloading: false,
+                written: 0,
+                total: 0,
                 dur_ms: *dur,
                 end_ms: total,
             });
@@ -117,6 +130,7 @@ impl PlayCache {
             port,
             total_ms: total,
             position: AtomicI64::new(0),
+            seek_gen: AtomicU64::new(0),
             buffered: AtomicI64::new(0),
             stop: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -165,6 +179,7 @@ impl PlayCache {
     pub fn note_position(&self, ms: i64) {
         let old = self.position.swap(ms.max(0), Ordering::Relaxed);
         if (old - ms).abs() > 3_000 {
+            self.seek_gen.fetch_add(1, Ordering::Relaxed);
             self.wake.notify_all();
         }
     }
@@ -497,13 +512,117 @@ fn serve(mut stream: TcpStream, cache: &Arc<PlayCache>) -> std::io::Result<()> {
         .and_then(|p| p.split('.').next())
         .and_then(|p| p.parse::<usize>().ok())
     {
-        if let Some(bytes) = wait_segment(cache, idx) {
+        if let Some(bytes) = ready_segment(cache, idx) {
             let range = parse_range(&text, bytes.len());
             return respond_segment(&mut stream, &bytes, range);
+        }
+        if segment_exists(cache, idx) {
+            return stream_segment(&mut stream, cache, idx);
         }
         return respond(&mut stream, "text/plain", b"segment unavailable", 404);
     }
     respond(&mut stream, "text/plain", b"not found", 404)
+}
+
+fn seg_state(cache: &Arc<PlayCache>, idx: usize) -> Option<(bool, bool, bool, PathBuf)> {
+    let st = cache.state.lock().ok()?;
+    let seg = st.segs.get(idx)?;
+    Some((
+        seg.ready,
+        seg.failed,
+        seg.downloading,
+        seg.path.clone(),
+    ))
+}
+
+fn ready_segment(cache: &Arc<PlayCache>, idx: usize) -> Option<Vec<u8>> {
+    let (ready, _, _, path) = seg_state(cache, idx)?;
+    if !ready {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+fn segment_exists(cache: &Arc<PlayCache>, idx: usize) -> bool {
+    seg_state(cache, idx).is_some()
+}
+
+/// Serves a segment while the worker is still writing it. libVLC starts decoding as
+/// soon as the first bytes arrive; waiting for the whole segment made every seek feel
+/// like a cold start on a slow link.
+fn stream_segment(stream: &mut TcpStream, cache: &Arc<PlayCache>, idx: usize) -> std::io::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(WAIT_MS);
+    let part_of = |path: &Path| path.with_extension("part");
+
+    // Wait for the worker to create the file (or for an older complete copy).
+    let path = loop {
+        let Some((ready, failed, _, path)) = seg_state(cache, idx) else {
+            return respond(stream, "text/plain", b"segment unavailable", 404);
+        };
+        if ready {
+            let bytes = std::fs::read(&path)?;
+            return respond_segment(stream, &bytes, None);
+        }
+        let part = part_of(&path);
+        if std::fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false) {
+            break part;
+        }
+        if failed || cache.stop.load(Ordering::Relaxed) || Instant::now() > deadline {
+            return respond(stream, "text/plain", b"segment unavailable", 404);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let mut file = std::fs::File::open(&path)?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut sent = 0u64;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => {
+                let (ready, failed, downloading, path) =
+                    match seg_state(cache, idx) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                if ready {
+                    // The worker may have renamed the file while we held the handle.
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if sent >= size {
+                        break;
+                    }
+                }
+                if failed || (!downloading && !ready) || cache.stop.load(Ordering::Relaxed) {
+                    // A failed or cancelled segment is incomplete; dropping the
+                    // connection makes VLC ask again instead of accepting a short file.
+                    return Ok(());
+                }
+                // Reopen so a file that grew (or was renamed on completion) is visible.
+                std::thread::sleep(Duration::from_millis(20));
+                let current = if path.exists() { path } else { part_of(&path) };
+                match std::fs::File::open(&current) {
+                    Ok(mut next) => {
+                        let _ = next.seek(SeekFrom::Start(sent));
+                        file = next;
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok(n) => {
+                let data = &buf[..n];
+                write!(stream, "{:x}\r\n", data.len())?;
+                stream.write_all(data)?;
+                stream.write_all(b"\r\n")?;
+                sent += n as u64;
+            }
+            Err(_) => break,
+        }
+    }
+    stream.write_all(b"0\r\n\r\n")?;
+    stream.flush()
 }
 
 /// `Range: bytes=a-b` from VLC; a range request is answered with a 206 slice so its
@@ -569,49 +688,21 @@ fn respond(stream: &mut TcpStream, mime: &str, body: &[u8], code: u16) -> std::i
     stream.flush()
 }
 
-fn wait_segment(cache: &Arc<PlayCache>, idx: usize) -> Option<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_millis(WAIT_MS);
-    let mut st = cache.state.lock().ok()?;
-    loop {
-        let (ready, failed) = {
-            let seg = st.segs.get(idx)?;
-            (seg.ready, seg.failed)
-        };
-        if ready {
-            let path = st.segs[idx].path.clone();
-            drop(st);
-            return std::fs::read(path).ok();
-        }
-        if st.stop || cache.stop.load(Ordering::Relaxed) || Instant::now() > deadline {
-            if std::env::var("L48_CACHE_DEBUG").is_ok() {
-                eprintln!("cache req s/{idx} unavailable failed={failed}");
-            }
-            return None;
-        }
-        if failed {
-            // A single CDN hiccup should not reach VLC as a 404: clear the flag so
-            // the worker retries this segment while the request keeps waiting.
-            if let Some(seg) = st.segs.get_mut(idx) {
-                seg.failed = false;
-            }
-            cache.wake.notify_all();
-        }
-        let (guard, _) = cache
-            .wake
-            .wait_timeout(st, Duration::from_millis(200))
-            .ok()?;
-        st = guard;
-    }
-}
-
 fn wait_first(cache: &Arc<PlayCache>, ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(ms);
     let Ok(mut st) = cache.state.lock() else {
         return false;
     };
     loop {
-        if st.segs.first().map(|s| s.ready).unwrap_or(false) {
-            return true;
+        if let Some(seg) = st.segs.first() {
+            if seg.ready {
+                return true;
+            }
+            let part = seg.path.with_extension("part");
+            if std::fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false) {
+                // Progressive serving: the first bytes are enough to start VLC.
+                return true;
+            }
         }
         if st.stop || Instant::now() > deadline {
             return false;
@@ -625,14 +716,34 @@ fn wait_first(cache: &Arc<PlayCache>, ms: u64) -> bool {
 
 fn spawn_worker(cache: &Arc<PlayCache>, lane: usize) {
     let weak = Arc::downgrade(cache);
+    let urgent = lane == LANES - 1;
     let _ = std::thread::Builder::new()
         .name(format!("playcache-worker-{lane}"))
         .spawn(move || {
             let api = Api::new();
+            let mut seen_seek = 0u64;
+            let mut urgent_until = Instant::now();
             loop {
                 let Some(cache) = weak.upgrade() else { return };
                 if cache.stop.load(Ordering::Relaxed) {
                     return;
+                }
+                if urgent {
+                    let gen = cache.seek_gen.load(Ordering::Relaxed);
+                    if gen != seen_seek {
+                        seen_seek = gen;
+                        // Give the seek a short burst on the reserved lane so VLC
+                        // can start on the new segment while the others cancel.
+                        urgent_until = Instant::now() + Duration::from_secs(8);
+                    }
+                    if Instant::now() >= urgent_until {
+                        let st = match cache.state.lock() {
+                            Ok(st) => st,
+                            Err(_) => return,
+                        };
+                        let _ = cache.wake.wait_timeout(st, Duration::from_millis(150));
+                        continue;
+                    }
                 }
                 let pos = cache.position.load(Ordering::Relaxed);
                 let (start, end) = window(&cache, pos);
@@ -647,6 +758,8 @@ fn spawn_worker(cache: &Arc<PlayCache>, lane: usize) {
                     });
                     idx.map(|i| {
                         st.segs[i].downloading = true;
+                        st.segs[i].written = 0;
+                        st.segs[i].total = 0;
                         (i, st.segs[i].url.clone(), st.segs[i].path.clone())
                     })
                 };
@@ -658,7 +771,7 @@ fn spawn_worker(cache: &Arc<PlayCache>, lane: usize) {
                     let _ = cache.wake.wait_timeout(st, Duration::from_millis(150));
                     continue;
                 };
-                let outcome = fetch(&api, &url, &path, &cache);
+                let outcome = fetch(&api, &url, &path, &cache, i);
                 if let Ok(mut st) = cache.state.lock() {
                     st.segs[i].downloading = false;
                     match outcome {
@@ -669,10 +782,15 @@ fn spawn_worker(cache: &Arc<PlayCache>, lane: usize) {
                         FetchEnd::Failed => {
                             st.segs[i].ready = false;
                             st.segs[i].failed = true;
+                            st.segs[i].written = 0;
+                            st.segs[i].total = 0;
                         }
                         // A seek pulled the playhead away; the file is discarded
                         // and this lane picks a segment from the new window.
-                        FetchEnd::Cancel => {}
+                        FetchEnd::Cancel => {
+                            st.segs[i].written = 0;
+                            st.segs[i].total = 0;
+                        }
                     }
                 }
                 cache.wake.notify_all();
@@ -708,14 +826,24 @@ fn buffered_end(cache: &PlayCache) -> i64 {
         return cache.total_ms;
     };
     let start_of = st.segs[i].end_ms - st.segs[i].dur_ms;
+    let part = |seg: &Seg| {
+        if seg.total > 0 {
+            seg.dur_ms * (seg.written.min(seg.total) as i64) / seg.total as i64
+        } else {
+            0
+        }
+    };
     if !st.segs[i].ready {
-        return start_of;
+        return start_of + part(&st.segs[i]);
     }
     let mut end = st.segs[i].end_ms;
     for s in &st.segs[i + 1..] {
         if s.ready {
             end = s.end_ms;
         } else {
+            // The worker is still writing this segment; expose the downloaded
+            // fraction so the cache rail creeps forward instead of jumping every 6s.
+            end += part(s);
             break;
         }
     }
@@ -728,13 +856,20 @@ enum FetchEnd {
     Cancel,
 }
 
-fn fetch(api: &Api, url: &str, path: &Path, cache: &PlayCache) -> FetchEnd {
+fn fetch(api: &Api, url: &str, path: &Path, cache: &PlayCache, idx: usize) -> FetchEnd {
     let mut res = match api.get(url) {
         Ok(res) => res,
         Err(_) => return FetchEnd::Failed,
     };
     if !res.status().is_success() {
         return FetchEnd::Failed;
+    }
+    let expected = res.content_length().unwrap_or(0);
+    if let Ok(mut st) = cache.state.lock() {
+        if let Some(seg) = st.segs.get_mut(idx) {
+            seg.total = expected;
+            seg.written = 0;
+        }
     }
     let tmp = path.with_extension("part");
     let mut file = match std::fs::File::create(&tmp) {
@@ -780,14 +915,27 @@ fn fetch(api: &Api, url: &str, path: &Path, cache: &PlayCache) -> FetchEnd {
             let _ = std::fs::remove_file(&tmp);
             return FetchEnd::Failed;
         }
+        if let Ok(mut st) = cache.state.lock() {
+            if let Some(seg) = st.segs.get_mut(idx) {
+                seg.written = total as u64;
+            }
+        }
+        cache
+            .buffered
+            .store(buffered_end(cache), Ordering::Relaxed);
     }
     drop(file);
     if total == 0 {
         let _ = std::fs::remove_file(&tmp);
         return FetchEnd::Failed;
     }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => FetchEnd::Done,
+    match std::fs::copy(&tmp, path) {
+        Ok(_) => {
+            // A reader may still hold the `.part` handle; Windows can refuse the
+            // delete, so startup also sweeps stale parts.
+            let _ = std::fs::remove_file(&tmp);
+            FetchEnd::Done
+        }
         Err(_) => {
             let _ = std::fs::remove_file(&tmp);
             FetchEnd::Failed

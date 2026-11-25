@@ -174,6 +174,7 @@ pub fn visuals() -> Visuals {
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_2);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE_SOFT);
     v.widgets.noninteractive.corner_radius = CornerRadius::same(6);
+    v.widgets.noninteractive.expansion = 0.0;
 
     v.widgets.inactive.bg_fill = FIELD;
     v.widgets.inactive.weak_bg_fill = FIELD;
@@ -186,20 +187,21 @@ pub fn visuals() -> Visuals {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, WHITE);
     v.widgets.hovered.corner_radius = CornerRadius::same(6);
-    v.widgets.hovered.expansion = 0.5;
+    v.widgets.hovered.expansion = 0.0;
 
     v.widgets.active.bg_fill = ACTIVE;
     v.widgets.active.weak_bg_fill = ACTIVE;
     v.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x66, 0x66, 0x66));
     v.widgets.active.fg_stroke = Stroke::new(1.0, WHITE);
     v.widgets.active.corner_radius = CornerRadius::same(6);
-    v.widgets.active.expansion = 1.0;
+    v.widgets.active.expansion = 0.0;
 
     v.widgets.open.bg_fill = HOVER;
     v.widgets.open.weak_bg_fill = HOVER;
     v.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55));
     v.widgets.open.fg_stroke = Stroke::new(1.0, WHITE);
     v.widgets.open.corner_radius = CornerRadius::same(6);
+    v.widgets.open.expansion = 0.0;
 
     v.image_loading_spinners = true;
     v

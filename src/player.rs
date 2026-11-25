@@ -562,6 +562,15 @@ impl Player {
                         .size(12.0)
                         .color(t::TEXT_3),
                 );
+                let ahead = self.buffered_ms - self.time_ms;
+                if ahead > 0 {
+                    ui.label(
+                        RichText::new(format!("缓存 +{}", fmt_time(ahead as f64 / 1000.0)))
+                            .size(12.0)
+                            .color(t::TEXT_2),
+                    )
+                    .on_hover_text("这之后的录播已经下载到本机，拖过去可以立即播放");
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
@@ -613,15 +622,27 @@ impl Player {
             }
         }
 
-        let rail = Rect::from_min_size(Pos2::new(rect.min.x, rect.center().y - 2.0), Vec2::new(rect.width(), 4.0));
+        let rail = Rect::from_min_size(
+            Pos2::new(rect.min.x, rect.center().y - 2.0),
+            Vec2::new(rect.width(), 4.0),
+        );
         ui.painter().rect_filled(rail, 2.0, t::LINE_SOFT);
-        // What is already in the local cache, the way a video site draws it.
+        // What is already in the local cache, the way a video site draws it. The
+        // downloaded fraction of the segment being written keeps this moving.
         if self.len_ms > 0 && self.buffered_ms > 0 {
             let buf = (self.buffered_ms as f32 / self.len_ms as f32).clamp(0.0, 1.0);
             ui.painter().rect_filled(
                 Rect::from_min_size(rail.min, Vec2::new(rail.width() * buf, 4.0)),
                 2.0,
-                t::alpha(t::WHITE, 46),
+                t::alpha(t::WHITE, 105),
+            );
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(rail.min.x + rail.width() * buf - 1.0, rail.center().y - 3.0),
+                    Vec2::new(2.0, 6.0),
+                ),
+                1.0,
+                t::alpha(t::WHITE, 170),
             );
         }
         ui.painter().rect_filled(

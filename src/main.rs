@@ -196,17 +196,32 @@ fn cachetest(m3u8: &str, secs: u64) -> i32 {
     let mut frames = 0usize;
     let mut last_report = Instant::now();
     let start = Instant::now();
+    let seek_at = (cache.total_ms() / 2).clamp(60_000, 1_800_000);
     let mut seeked = false;
+    let mut seek_start: Option<Instant> = None;
+    let mut seek_seq = 0u64;
     while start.elapsed() < Duration::from_secs(secs) {
         if session.frames().take_rgba(&mut buf) {
             frames += 1;
         }
         cache.note_position(session.time_ms());
+        if let Some(t) = seek_start {
+            if session.time_ms() >= seek_at - 1_000 && session.frames().sequence() > seek_seq {
+                println!("  seek resumed in {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
+                seek_start = None;
+            }
+        }
         if secs >= 10 && !seeked && start.elapsed() >= Duration::from_secs(secs / 2) {
             seeked = true;
             let t = Instant::now();
-            session.set_time_ms(300_000);
-            println!("  seek to 300s took {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
+            seek_seq = session.frames().sequence();
+            seek_start = Some(t);
+            session.set_time_ms(seek_at);
+            println!(
+                "  seek to {}s took {:.0}ms",
+                seek_at / 1000,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();

@@ -69,6 +69,19 @@ fn shared_client() -> &'static Client {
     })
 }
 
+/// Media downloads need a longer total budget than API calls, but one slow segment
+/// must not pin a cache lane forever: the cache retries and seeks reuse those lanes.
+fn media_client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("media client")
+    })
+}
+
 impl Api {
     pub fn new() -> Self {
         Api {
@@ -270,12 +283,9 @@ impl Api {
     }
 
     fn engine_get(&self, url: &str) -> Result<Response, String> {
-        self.client
+        media_client()
             .get(url)
             .header(USER_AGENT, HeaderValue::from_static(ENGINE_UA))
-            // API calls stay on the 20s client timeout; a media segment on a slow
-            // link can legitimately take longer, and the cache tolerates it.
-            .timeout(std::time::Duration::from_secs(60))
             .send()
             .map_err(|e| e.to_string())
     }
