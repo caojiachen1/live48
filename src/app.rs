@@ -195,6 +195,8 @@ pub struct App {
     /// address and the detail are two calls on the same room.
     pub rooms: HashMap<String, RoomInfo>,
     pub ranks: HashMap<String, Vec<MemberRank>>,
+    /// Read-ahead cache handed over by the URL thread, waiting for the player.
+    pub pending_cache: Option<(String, Arc<crate::playcache::PlayCache>)>,
     /// Auto-retry bookkeeping for a dead live stream.
     pub retry_live: Option<String>,
     pub retry_at: Option<Instant>,
@@ -272,6 +274,7 @@ impl App {
             grab_at: None,
             rooms: HashMap::new(),
             ranks: HashMap::new(),
+            pending_cache: None,
             retry_live: None,
             retry_at: None,
             retries: 0,
@@ -867,6 +870,9 @@ impl App {
         let probe = live_id.clone();
         // One `getLiveOne` feeds both the address and thedetail chrome: asking twice
         // for the same room was the slowest part of opening a record.
+        // An m3u8 goes through the read-ahead cache; `start` refuses a live playlist
+        // (no ENDLIST), and the direct address is kept in that case.
+        let cache_id = live_id.clone();
         req.spawn(move |r| {
             let api = Api::new();
             let detail = api.room_detail(&probe, source);
@@ -880,6 +886,21 @@ impl App {
                     result: Ok(info),
                 });
             }
+            let res = match res {
+                Ok(url) if url.contains(".m3u8") => {
+                    match crate::playcache::PlayCache::start(&url, &cache_id) {
+                        Ok(cache) => {
+                            r.send(Event::CacheReady {
+                                live_id: cache_id,
+                                cache: cache.clone(),
+                            });
+                            Ok(cache.url())
+                        }
+                        Err(_) => Ok(url),
+                    }
+                }
+                other => other,
+            };
             r.send(Event::StreamUrl {
                 result: res,
                 action: Box::new(Action::OpenBuiltin { index }),
@@ -943,6 +964,10 @@ impl App {
             .get(index)
             .map(|e| e.live_id.clone())
             .unwrap_or_default();
+        let cache = self
+            .pending_cache
+            .take()
+            .and_then(|(id, cache)| if id == live_id { Some(cache) } else { None });
         if let Some(arc) = &self.player {
             let want = self.qualities.get(&live_id).copied();
             let room = self.rooms.get(&live_id).cloned();
@@ -954,6 +979,7 @@ impl App {
             if let Some(ranks) = rank {
                 p.set_rank(ranks);
             }
+            p.set_cache(cache);
         }
     }
 
@@ -1285,6 +1311,9 @@ impl App {
                         self.toast(ToastKind::Error, format!("获取录播列表失败：{e}"));
                     }
                 },
+                Event::CacheReady { live_id, cache } => {
+                    self.pending_cache = Some((live_id, cache));
+                }
                 Event::Image { url, result } => {
                     self.img_pending.push((url, result));
                 }

@@ -106,6 +106,9 @@ pub struct Player {
     pub error: Option<String>,
     time_ms: i64,
     len_ms: i64,
+    /// Record read-ahead cache, when this item has one; drives the second rail.
+    pub cache: Option<std::sync::Arc<crate::playcache::PlayCache>>,
+    pub buffered_ms: i64,
 
     pub playlist_open: bool,
     /// Slide progress of the playlist drawer, and the window it occupies so the wheel
@@ -183,6 +186,8 @@ impl Player {
             error: None,
             time_ms: 0,
             len_ms: 0,
+            cache: None,
+            buffered_ms: 0,
             playlist_open: false,
             fly_t: 0.0,
             fly_prev: 0.0,
@@ -241,6 +246,12 @@ impl Player {
         self.last_seq = 0;
         self.paused = false;
         Ok(old)
+    }
+
+    /// Attaches the read-ahead cache the URL was served from; `None` for live.
+    pub fn set_cache(&mut self, cache: Option<std::sync::Arc<crate::playcache::PlayCache>>) {
+        self.buffered_ms = cache.as_ref().map(|c| c.buffered_ms()).unwrap_or(0);
+        self.cache = cache;
     }
 
     /// Applies a room's detail: the清晰度 menu, the danmaku file, and the numbers the
@@ -330,6 +341,12 @@ impl Player {
 
         self.time_ms = self.session.time_ms().max(0);
         self.len_ms = self.session.length_ms().max(0);
+        if let Some(cache) = &self.cache {
+            cache.note_position(self.time_ms);
+            self.buffered_ms = cache.buffered_ms();
+        } else {
+            self.buffered_ms = 0;
+        }
 
         // Poll a little faster than the stream (25fps) instead of pinning the window to
         // 60 repaints a second: a 1440p pass costs the same whether or not there is a
@@ -587,6 +604,15 @@ impl Player {
 
         let rail = Rect::from_min_size(Pos2::new(rect.min.x, rect.center().y - 2.0), Vec2::new(rect.width(), 4.0));
         ui.painter().rect_filled(rail, 2.0, t::LINE_SOFT);
+        // What is already in the local cache, the way a video site draws it.
+        if self.len_ms > 0 && self.buffered_ms > 0 {
+            let buf = (self.buffered_ms as f32 / self.len_ms as f32).clamp(0.0, 1.0);
+            ui.painter().rect_filled(
+                Rect::from_min_size(rail.min, Vec2::new(rail.width() * buf, 4.0)),
+                2.0,
+                t::alpha(t::WHITE, 46),
+            );
+        }
         ui.painter().rect_filled(
             Rect::from_min_size(rail.min, Vec2::new(rail.width() * frac, 4.0)),
             2.0,

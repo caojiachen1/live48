@@ -1,0 +1,521 @@
+//! Read-ahead cache for records.
+//!
+//! libVLC normally pulls an HLS playlist straight from the CDN with only its own
+//! 300ms network cache in front, so one slow segment shows up as a visible hitch and
+//! there is nothing to draw on the seek bar. This module fetches the playlist once,
+//! downloads segments a little ahead of the playhead into a per-record folder, and
+//! serves them back through a loopback HTTP server. Because we own the reads we also
+//! know the contiguous buffered end, which is the second rail on the progress bar.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::api::Api;
+
+/// How far ahead of the playhead the worker keeps segments on disk, and what it lets
+/// go of once the playhead is well past a segment.
+const AHEAD_MS: i64 = 120_000;
+const BEHIND_MS: i64 = 120_000;
+const WAIT_MS: u64 = 20_000;
+const KEEP_RECORDS: usize = 3;
+
+struct Seg {
+    url: String,
+    path: PathBuf,
+    ready: bool,
+    failed: bool,
+    dur_ms: i64,
+    end_ms: i64,
+}
+
+struct State {
+    segs: Vec<Seg>,
+    stop: bool,
+}
+
+pub struct PlayCache {
+    state: Mutex<State>,
+    wake: Condvar,
+    /// The playlist as fetched; tags keep their original order when it is rewritten.
+    text: String,
+    base: url::Url,
+    port: u16,
+    total_ms: i64,
+    position: AtomicI64,
+    buffered: AtomicI64,
+    stop: AtomicBool,
+}
+
+impl PlayCache {
+    /// `m3u8` is the record's playlist address. Errors when the playlist is not a
+    /// plain segment list, and the caller then keeps the direct URL.
+    pub fn start(m3u8: &str, live_id: &str) -> Result<Arc<PlayCache>, String> {
+        let api = Api::new();
+        let text = api.download_text(m3u8)?;
+        if !text.contains("#EXT-X-ENDLIST") {
+            // A live playlist keeps growing; freezing it would cut the stream short.
+            return Err("live playlist".to_owned());
+        }
+        let base = url::Url::parse(m3u8).map_err(|e| e.to_string())?;
+        let segs = parse_playlist(&text, &base)?;
+        if segs.is_empty() {
+            return Err("播放列表里没有分片".to_owned());
+        }
+
+        // Quality variants share a live id but not a segment list, so the folder is
+        // keyed by the playlist too; otherwise a 720p fragment could be served for a
+        // 1080p record.
+        let dir = crate::config::dir()
+            .join("playcache")
+            .join(format!("{}-{:016x}", safe_name(live_id), url_hash(m3u8)));
+        let _ = std::fs::create_dir_all(&dir);
+        prune_old(&dir);
+
+        let mut total = 0i64;
+        let mut state_segs = Vec::with_capacity(segs.len());
+        for (i, (url, dur)) in segs.iter().enumerate() {
+            total += *dur;
+            let path = dir.join(format!("s{i:05}.ts"));
+            let ready = std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+            state_segs.push(Seg {
+                url: url.clone(),
+                path,
+                ready,
+                failed: false,
+                dur_ms: *dur,
+                end_ms: total,
+            });
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+
+        let cache = Arc::new(PlayCache {
+            state: Mutex::new(State {
+                segs: state_segs,
+                stop: false,
+            }),
+            wake: Condvar::new(),
+            text,
+            base,
+            port,
+            total_ms: total,
+            position: AtomicI64::new(0),
+            buffered: AtomicI64::new(0),
+            stop: AtomicBool::new(false),
+        });
+        cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+
+        spawn_server(&cache, listener);
+        spawn_worker(&cache);
+        // libVLC gives up on a segment request that takes too long, and on a cold
+        // record the first fetch is the slowest one. Have it on disk before handing
+        // out the playlist, so playback starts on the first read.
+        if !wait_first(&cache, 10_000) {
+            return Err("首段下载超时".to_owned());
+        }
+        cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+        Ok(cache)
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/p.m3u8", self.port)
+    }
+
+    pub fn buffered_ms(&self) -> i64 {
+        self.buffered.load(Ordering::Relaxed)
+    }
+
+    pub fn total_ms(&self) -> i64 {
+        self.total_ms
+    }
+
+    /// Where the player is; a jump restarts the download window.
+    pub fn note_position(&self, ms: i64) {
+        let old = self.position.swap(ms.max(0), Ordering::Relaxed);
+        if (old - ms).abs() > 3_000 {
+            self.wake.notify_all();
+        }
+    }
+}
+
+impl Drop for PlayCache {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Ok(mut st) = self.state.lock() {
+            st.stop = true;
+            self.wake.notify_all();
+        }
+        // The folder stays: reopening the same record then starts with its segments
+        // already on disk.
+    }
+}
+
+fn safe_name(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn url_hash(url: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Bounds the cache: only the newest `KEEP_RECORDS` record folders are kept.
+fn prune_old(current: &Path) {
+    let Some(root) = current.parent() else { return };
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            if p.is_dir() && p.as_path() != current {
+                let t = e.metadata().ok()?.modified().ok()?;
+                Some((t, p))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if dirs.len() <= KEEP_RECORDS {
+        return;
+    }
+    dirs.sort_by_key(|(t, _)| *t);
+    let excess = dirs.len() - KEEP_RECORDS;
+    for (_, p) in dirs.into_iter().take(excess) {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+fn parse_playlist(text: &str, base: &url::Url) -> Result<Vec<(String, i64)>, String> {
+    if text.contains("EXT-X-BYTERANGE") {
+        // Byte ranges of one file need offset-aware serving; leave those to VLC.
+        return Err("byterange playlist".to_owned());
+    }
+    let mut segs = Vec::new();
+    let mut pending: Option<i64> = None;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            let dur = rest.split(',').next().unwrap_or("0");
+            pending = Some(((dur.parse::<f64>().unwrap_or(0.0) * 1000.0) as i64).max(1));
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(dur) = pending.take() else { continue };
+        let abs = base.join(line).map_err(|e| e.to_string())?;
+        segs.push((abs.to_string(), dur));
+    }
+    Ok(segs)
+}
+
+/// `#EXT-X-KEY:METHOD=AES-128,URI="k.bin"` (and MAP) only keep working from loopback
+/// when those URIs are absolute.
+fn absolute_attrs(line: &str, base: &url::Url) -> String {
+    let mut out = String::with_capacity(line.len() + 40);
+    let mut rest = line;
+    while let Some(pos) = rest.find("URI=\"") {
+        out.push_str(&rest[..pos + 5]);
+        let tail = &rest[pos + 5..];
+        let Some(end) = tail.find('"') else {
+            out.push_str(tail);
+            return out;
+        };
+        let raw = &tail[..end];
+        let abs = base
+            .join(raw)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| raw.to_owned());
+        out.push_str(&abs);
+        out.push('"');
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn playlist_text(cache: &PlayCache) -> String {
+    let st = cache.state.lock().unwrap();
+    let mut out = String::with_capacity(cache.text.len() + 40);
+    let mut pending = false;
+    let mut i = 0usize;
+    for line in cache.text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with("#EXTINF") {
+            pending = true;
+            out.push_str(line);
+        } else if line.starts_with('#') {
+            // KEY and MAP URIs must be absolute once the playlist is served from
+            // loopback; every other tag stays exactly where it was.
+            out.push_str(&absolute_attrs(line, &cache.base));
+        } else if pending && i < st.segs.len() {
+            pending = false;
+            out.push_str(&format!("http://127.0.0.1:{}/s/{i}.ts", cache.port));
+            i += 1;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn spawn_server(cache: &Arc<PlayCache>, listener: TcpListener) {
+    let weak = Arc::downgrade(cache);
+    std::thread::Builder::new()
+        .name("playcache-server".to_owned())
+        .spawn(move || loop {
+            let Some(c) = weak.upgrade() else { return };
+            if c.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let w = Arc::downgrade(&c);
+                    std::thread::spawn(move || {
+                        let Some(c) = w.upgrade() else { return };
+                        let _ = serve(stream, &c);
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        })
+        .ok();
+}
+
+fn serve(mut stream: TcpStream, cache: &Arc<PlayCache>) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 16 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let path = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    if std::env::var("L48_CACHE_DEBUG").is_ok() {
+        eprintln!("cache req {path}");
+    }
+    if path.starts_with("/p.m3u8") {
+        let body = playlist_text(cache);
+        return respond(&mut stream, "application/vnd.apple.mpegurl", body.as_bytes(), 200);
+    }
+    if let Some(idx) = path
+        .strip_prefix("/s/")
+        .and_then(|p| p.split('.').next())
+        .and_then(|p| p.parse::<usize>().ok())
+    {
+        if let Some(bytes) = wait_segment(cache, idx) {
+            return respond(&mut stream, "video/mp2t", &bytes, 200);
+        }
+        return respond(&mut stream, "text/plain", b"segment unavailable", 404);
+    }
+    respond(&mut stream, "text/plain", b"not found", 404)
+}
+
+fn respond(stream: &mut TcpStream, mime: &str, body: &[u8], code: u16) -> std::io::Result<()> {
+    let reason = if code == 200 { "OK" } else { "Not Found" };
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+fn wait_segment(cache: &Arc<PlayCache>, idx: usize) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_millis(WAIT_MS);
+    let mut st = cache.state.lock().ok()?;
+    loop {
+        let (ready, failed) = {
+            let seg = st.segs.get(idx)?;
+            (seg.ready, seg.failed)
+        };
+        if ready {
+            let path = st.segs[idx].path.clone();
+            drop(st);
+            return std::fs::read(path).ok();
+        }
+        if st.stop || cache.stop.load(Ordering::Relaxed) || Instant::now() > deadline {
+            if std::env::var("L48_CACHE_DEBUG").is_ok() {
+                eprintln!("cache req s/{idx} unavailable failed={failed}");
+            }
+            return None;
+        }
+        if failed {
+            // A single CDN hiccup should not reach VLC as a 404: clear the flag so
+            // the worker retries this segment while the request keeps waiting.
+            if let Some(seg) = st.segs.get_mut(idx) {
+                seg.failed = false;
+            }
+            cache.wake.notify_all();
+        }
+        let (guard, _) = cache.wake.wait_timeout(st, Duration::from_millis(200)).ok()?;
+        st = guard;
+    }
+}
+
+fn wait_first(cache: &Arc<PlayCache>, ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let Ok(mut st) = cache.state.lock() else { return false };
+    loop {
+        if st.segs.first().map(|s| s.ready).unwrap_or(false) {
+            return true;
+        }
+        if st.stop || Instant::now() > deadline {
+            return false;
+        }
+        let Ok((guard, _)) = cache.wake.wait_timeout(st, Duration::from_millis(50)) else {
+            return false;
+        };
+        st = guard;
+    }
+}
+
+fn spawn_worker(cache: &Arc<PlayCache>) {
+    let weak = Arc::downgrade(cache);
+    std::thread::Builder::new()
+        .name("playcache-worker".to_owned())
+        .spawn(move || {
+            let api = Api::new();
+            loop {
+                let Some(cache) = weak.upgrade() else { return };
+                if cache.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let pos = cache.position.load(Ordering::Relaxed);
+                let (start, end) = window(&cache, pos);
+                let mut progressed = false;
+                let mut seeked = false;
+                for i in start..end {
+                    if cache.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let (ready, url, path) = {
+                        let st = cache.state.lock().unwrap();
+                        (st.segs[i].ready, st.segs[i].url.clone(), st.segs[i].path.clone())
+                    };
+                    if ready {
+                        continue;
+                    }
+                    let ok = fetch(&api, &url, &path).is_ok();
+                    if let Ok(mut st) = cache.state.lock() {
+                        st.segs[i].ready = ok;
+                        st.segs[i].failed = !ok;
+                    }
+                    cache.wake.notify_all();
+                    progressed |= ok;
+                    cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+                    if cache.position.load(Ordering::Relaxed) != pos {
+                        seeked = true;
+                        break;
+                    }
+                }
+                cache.buffered.store(buffered_end(&cache), Ordering::Relaxed);
+                prune_behind(&cache, pos);
+                if !progressed && !seeked {
+                    let st = cache.state.lock().unwrap();
+                    let _ = cache.wake.wait_timeout(st, Duration::from_millis(150));
+                }
+            }
+        })
+        .ok();
+}
+
+fn window(cache: &PlayCache, pos: i64) -> (usize, usize) {
+    let st = cache.state.lock().unwrap();
+    let n = st.segs.len();
+    let start = st
+        .segs
+        .iter()
+        .position(|s| s.end_ms > pos)
+        .unwrap_or(n.saturating_sub(1));
+    let end = st
+        .segs
+        .iter()
+        .position(|s| s.end_ms >= pos + AHEAD_MS)
+        .map(|i| i + 1)
+        .unwrap_or(n)
+        .max(start + 1);
+    (start, end.min(n))
+}
+
+fn buffered_end(cache: &PlayCache) -> i64 {
+    let st = cache.state.lock().unwrap();
+    let pos = cache.position.load(Ordering::Relaxed);
+    let Some(i) = st.segs.iter().position(|s| s.end_ms > pos) else {
+        return cache.total_ms;
+    };
+    let start_of = st.segs[i].end_ms - st.segs[i].dur_ms;
+    if !st.segs[i].ready {
+        return start_of;
+    }
+    let mut end = st.segs[i].end_ms;
+    for s in &st.segs[i + 1..] {
+        if s.ready {
+            end = s.end_ms;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// Drops files the playhead has left far behind, so one record cannot fill the disk.
+fn prune_behind(cache: &PlayCache, pos: i64) {
+    let mut st = cache.state.lock().unwrap();
+    for s in st.segs.iter_mut() {
+        if s.end_ms < pos - BEHIND_MS && s.ready {
+            let _ = std::fs::remove_file(&s.path);
+            s.ready = false;
+        }
+    }
+}
+
+fn fetch(api: &Api, url: &str, path: &Path) -> Result<(), String> {
+    let mut res = api.get(url)?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+    let tmp = path.with_extension("part");
+    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0usize;
+    loop {
+        let n = res.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
+    drop(file);
+    if total == 0 {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("empty segment".to_owned());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}

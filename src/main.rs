@@ -10,6 +10,7 @@ mod images;
 mod mini;
 mod models;
 mod perf;
+mod playcache;
 mod player;
 mod theme;
 mod ui;
@@ -40,6 +41,16 @@ fn main() -> eframe::Result {
         };
         let secs = args.get(pos + 3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
         std::process::exit(closetest(live_id, source, secs));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--cachetest") {
+        let (Some(m3u8), secs) = (
+            args.get(pos + 1),
+            args.get(pos + 2).and_then(|s| s.parse::<u64>().ok()),
+        ) else {
+            eprintln!("用法: live48-egui --cachetest <m3u8> [秒]");
+            std::process::exit(2);
+        };
+        std::process::exit(cachetest(m3u8, secs.unwrap_or(8)));
     }
     if let Some(pos) = args.iter().position(|a| a == "--selftest") {
         let Some(target) = args.get(pos + 1) else {
@@ -146,6 +157,86 @@ fn selftest(target: &str) -> i32 {
     } else {
         println!("SELFTEST FAIL");
         5
+    }
+}
+
+/// Opens a record through the read-ahead cache, so the proxy playlist, the segment
+/// serving and the buffered end can be checked without the UI.
+fn cachetest(m3u8: &str, secs: u64) -> i32 {
+    let t_cache = Instant::now();
+    let cache = match playcache::PlayCache::start(m3u8, "cachetest") {
+        Ok(cache) => cache,
+        Err(e) => {
+            eprintln!("FAIL cache: {e}");
+            return 11;
+        }
+    };
+    println!(
+        "cache = {} total = {}ms buffered = {}ms start = {:.0}ms",
+        cache.url(),
+        cache.total_ms(),
+        cache.buffered_ms(),
+        t_cache.elapsed().as_secs_f64() * 1000.0
+    );
+    let engine = match vlc::Engine::load() {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("FAIL engine: {e}");
+            return 3;
+        }
+    };
+    let session = match engine.open(&cache.url(), player::MAX_W, player::MAX_H) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("FAIL open: {e}");
+            return 4;
+        }
+    };
+    let mut buf = Vec::new();
+    let mut frames = 0usize;
+    let mut last_report = Instant::now();
+    let start = Instant::now();
+    let mut seeked = false;
+    while start.elapsed() < Duration::from_secs(secs) {
+        if session.frames().take_rgba(&mut buf) {
+            frames += 1;
+        }
+        cache.note_position(session.time_ms());
+        if secs >= 10 && !seeked && start.elapsed() >= Duration::from_secs(secs / 2) {
+            seeked = true;
+            let t = Instant::now();
+            session.set_time_ms(300_000);
+            println!("  seek to 300s took {:.0}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            println!(
+                "  t = {}ms buffered = {}ms frames = {}",
+                session.time_ms(),
+                cache.buffered_ms(),
+                frames
+            );
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let final_time = session.time_ms();
+    let final_buffered = cache.buffered_ms();
+    println!(
+        "played {} frames in {}s, {:.1} fps, time = {}ms, buffered = {}ms",
+        frames,
+        secs,
+        frames as f32 / secs as f32,
+        final_time,
+        final_buffered
+    );
+    drop(session);
+    drop(cache);
+    if frames > 0 && final_buffered > final_time {
+        println!("CACHETEST PASS");
+        0
+    } else {
+        println!("CACHETEST FAIL");
+        12
     }
 }
 

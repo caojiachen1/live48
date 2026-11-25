@@ -22,6 +22,7 @@ Settings, downloads and the cached engine live in `%APPDATA%/live48-egui/`.
 live48-egui --selftest <file:///path/to/video.ts>   # libVLC frame path
 live48-egui --apitest                              # API + decode + reattach + seek
 live48-egui --closetest <liveId> [open|member] [s] # open, decode, then time the teardown
+live48-egui --cachetest <m3u8> [s]                 # read-ahead cache + proxy + buffer end
 live48-egui --recordtest <mrl> <out.ts>            # libVLC stream-out capture
 live48-egui --dltest <liveId> <out.ts> [seconds]   # segment download + resume
 L48_PERF=1 live48-egui                             # per-frame cost on stderr
@@ -42,6 +43,12 @@ L48_PERF=1 live48-egui                             # per-frame cost on stderr
   drawer fed by `getOpenLiveMemberRank`
 * Portrait rooms (`pictureOrientation != 1`) get a tall placeholder before the first
   frame instead of a wide one
+* Records play through a local read-ahead cache: the playlist is fetched once, segments
+  are downloaded into `%APPDATA%/live48-egui/playcache/` about two minutes past the
+  playhead, and a loopback HTTP server feeds libVLC from disk. The seek bar therefore
+  has a second, lighter rail for what is already buffered (the way video sites show it);
+  reopening a record starts with the segments that were kept. Live streams still go
+  straight to the CDN
 * One HTTP client backs every API call and one `getLiveOne` feeds both the address and
   the chrome, so opening a record no longer pays two handshakes and two identical
   requests; closing hands the libVLC session to a background reaper thread instead of

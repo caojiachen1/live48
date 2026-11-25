@@ -30,6 +30,11 @@ pub enum Event {
         record: bool,
         append: bool,
     },
+    /// A record's read-ahead cache is serving; the player takes it when it opens.
+    CacheReady {
+        live_id: String,
+        cache: Arc<crate::playcache::PlayCache>,
+    },
     StreamUrl {
         result: Result<String, String>,
         action: Box<Action>,
