@@ -630,6 +630,9 @@ impl Engine {
         if url.starts_with("http") {
             self.add_option(media, ":http-user-agent=SNH48 ENGINE")?;
         }
+        if url.contains(".m3u8") {
+            self.add_option(media, ":demux=avformat")?;
+        }
         let mp = unsafe { (self.ffi.player_new)(self.instance) };
         if mp.is_null() {
             unsafe { (self.ffi.media_release)(media) };

@@ -126,6 +126,10 @@ pub struct Player {
     pub playlist_rect: Rect,
     pub cmd: Cmd,
     seek_preview: Option<f32>,
+    /// A requested seek still waiting for libVLC to reach the target. Holds the
+    /// cache read-ahead window on the destination instead of letting the old
+    /// playhead pull it back while the new segment is fetched.
+    seek_target: Option<(i64, i64)>,
 
     /// Clearness menu for this item; empty until the room info comes back.
     pub streams: Vec<Stream>,
@@ -233,6 +237,7 @@ impl Player {
             playlist_rect: Rect::NOTHING,
             cmd: Cmd::None,
             seek_preview: None,
+            seek_target: None,
             streams: Vec::new(),
             quality: 0,
             danmu_url: None,
@@ -292,6 +297,7 @@ impl Player {
         self.error = None;
         self.last_seq = 0;
         self.paused = false;
+        self.seek_target = None;
         Ok(old)
     }
 
@@ -300,6 +306,7 @@ impl Player {
         if let Some(old) = self.cache.take() {
             old.close();
         }
+        self.seek_target = None;
         self.buffered_ms = cache.as_ref().map(|c| c.buffered_ms()).unwrap_or(0);
         self.cache = cache;
     }
@@ -309,6 +316,7 @@ impl Player {
         if let Some(cache) = self.cache.take() {
             cache.close();
         }
+        self.seek_target = None;
         self.buffered_ms = 0;
     }
 
@@ -408,8 +416,26 @@ impl Player {
             self.push_audio();
         }
 
-        self.time_ms = self.session.time_ms().max(0);
+        let actual = self.session.time_ms().max(0);
         self.len_ms = self.session.length_ms().max(0);
+        if let Some((target, from)) = self.seek_target {
+            let reached = if target >= from {
+                actual >= target - 2_000
+            } else {
+                actual <= target + 2_000
+            };
+            if reached {
+                self.seek_target = None;
+                self.time_ms = actual;
+            } else {
+                // libVLC may keep reporting the old clock while its HLS demuxer
+                // opens the new segment. Keep the cache window on the target so
+                // the worker starts fetching that segment immediately.
+                self.time_ms = target;
+            }
+        } else {
+            self.time_ms = actual;
+        }
         if let Some(cache) = &self.cache {
             cache.note_position(self.time_ms);
             self.buffered_ms = cache.buffered_ms();
@@ -463,6 +489,23 @@ impl Player {
         } else {
             self.set_volume(self.last_volume.max(0.01));
         }
+    }
+
+    /// Seeks and moves the cache window first. On a long jump libVLC otherwise
+    /// asks for an unbuffered segment while the workers are still filling the old
+    /// window; by the time the request times out it reports the stream as ended.
+    fn seek_to(&mut self, ms: i64) {
+        let target = ms.max(0);
+        // Use libVLC's clock, not the optimistic UI time, so a second click
+        // before the first seek lands still knows the real direction.
+        let from = self.session.time_ms().max(0);
+        self.seek_target = Some((target, from));
+        self.time_ms = target;
+        if let Some(cache) = &self.cache {
+            cache.note_position(target);
+            self.buffered_ms = cache.buffered_ms();
+        }
+        self.session.set_time_ms(target);
     }
 
     /// Pushes the desired level to libVLC. It is deliberately unconditional:
@@ -725,9 +768,9 @@ impl Player {
             None
         };
         if let Some(f) = jump {
+            let target = (f as f64 * self.len_ms as f64) as i64;
             let t0 = Instant::now();
-            self.session
-                .set_time_ms((f as f64 * self.len_ms as f64) as i64);
+            self.seek_to(target);
             if crate::perf::on() {
                 eprintln!("PROBE seek {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -1133,7 +1176,7 @@ impl Player {
                 }
             });
         if let Some(secs) = seek {
-            self.session.set_time_ms((secs * 1000.0) as i64);
+            self.seek_to((secs * 1000.0) as i64);
         }
     }
 

@@ -430,7 +430,11 @@ fn playlist_text(cache: &PlayCache) -> String {
     let mut pending = false;
     let mut i = 0usize;
     for line in cache.text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if line.starts_with("#EXTINF") {
+        if line.starts_with("#EXT-X-DISCONTINUITY") {
+            // Timestamps are retimed when segments are served; leaving the tag
+            // would make VLC reset its clock at the splice and stall a far seek.
+            continue;
+        } else if line.starts_with("#EXTINF") {
             pending = true;
             out.push_str(line);
         } else if line.starts_with('#') {
@@ -535,16 +539,197 @@ fn seg_state(cache: &Arc<PlayCache>, idx: usize) -> Option<(bool, bool, bool, Pa
     ))
 }
 
+fn seg_expected_ms(cache: &Arc<PlayCache>, idx: usize) -> Option<i64> {
+    let st = cache.state.lock().ok()?;
+    let seg = st.segs.get(idx)?;
+    Some(seg.end_ms - seg.dur_ms)
+}
+
+/// Reads the first PES timestamp in a TS file. A record can restart its PTS at an
+/// `EXT-X-DISCONTINUITY`; VLC then loses its play clock after a time seek even
+/// though the bytes are available.
+fn first_pts_in(data: &[u8]) -> Option<i64> {
+    let mut off = 0usize;
+    while off + 188 <= data.len() {
+        if data[off] != 0x47 {
+            off += 1;
+            continue;
+        }
+        let b1 = data[off + 1];
+        let b3 = data[off + 3];
+        let pusi = (b1 & 0x40) != 0;
+        let afc = (b3 >> 4) & 3;
+        if pusi && (afc & 1) != 0 {
+            let mut p = off + 4;
+            if (afc & 2) != 0 {
+                let afl = data[p] as usize;
+                p += 1 + afl;
+            }
+            if p + 9 <= off + 188 && data[p..p + 3] == [0, 0, 1] {
+                let flags = data[p + 7];
+                if (flags & 0x80) != 0 {
+                    let q = p + 9;
+                    if q + 5 <= off + 188 {
+                        return Some(read_pts(&data[q..q + 5]));
+                    }
+                }
+            }
+        }
+        off += 188;
+    }
+    None
+}
+
+fn read_pts(buf: &[u8]) -> i64 {
+    (((buf[0] as i64 & 0x0e) << 29)
+        | ((buf[1] as i64) << 22)
+        | ((buf[2] as i64 & 0xfe) << 14)
+        | ((buf[3] as i64) << 7)
+        | ((buf[4] as i64) >> 1)) as i64
+}
+
+fn write_pts(buf: &mut [u8], value: i64) {
+    let v = value as u64 & 0x1_ffff_ffff;
+    buf[0] = (buf[0] & 0xf0) | ((((v >> 30) as u8) & 7) << 1) | 1;
+    buf[1] = ((v >> 22) & 0xff) as u8;
+    buf[2] = ((((v >> 15) as u8) & 0x7f) << 1) | 1;
+    buf[3] = ((v >> 7) & 0xff) as u8;
+    buf[4] = (((v as u8) & 0x7f) << 1) | 1;
+}
+
+fn shift_pcr(buf: &mut [u8], shift: i64) {
+    let base = ((buf[0] as i64) << 25)
+        | ((buf[1] as i64) << 17)
+        | ((buf[2] as i64) << 9)
+        | ((buf[3] as i64) << 1)
+        | ((buf[4] as i64) >> 7);
+    let reserved = (buf[4] >> 1) & 0x3f;
+    let ext = (((buf[4] & 1) as u16) << 8) | buf[5] as u16;
+    let next = (base + shift).rem_euclid(1 << 33) as u64;
+    buf[0] = ((next >> 25) & 0xff) as u8;
+    buf[1] = ((next >> 17) & 0xff) as u8;
+    buf[2] = ((next >> 9) & 0xff) as u8;
+    buf[3] = ((next >> 1) & 0xff) as u8;
+    buf[4] = (((next & 1) as u8) << 7) | (reserved << 1) | ((ext >> 8) as u8 & 1);
+    buf[5] = (ext & 0xff) as u8;
+}
+
+/// Rewrites PTS/DTS and PCR by the same offset so a spliced record looks like one
+/// continuous HLS timeline to libVLC. Only the timestamp fields are touched.
+fn normalize_ts(data: &mut [u8], shift: i64) {
+    if shift == 0 {
+        return;
+    }
+    let mut off = 0usize;
+    while off + 188 <= data.len() {
+        if data[off] != 0x47 {
+            off += 1;
+            continue;
+        }
+        let b1 = data[off + 1];
+        let b3 = data[off + 3];
+        let pusi = (b1 & 0x40) != 0;
+        let afc = (b3 >> 4) & 3;
+        let mut payload = off + 4;
+        if (afc & 2) != 0 {
+            let afl = data[off + 4] as usize;
+            let af = off + 5;
+            if afl > 0 && af < off + 188 {
+                let flags = data[af];
+                if (flags & 0x10) != 0 && af + 7 <= off + 188 {
+                    shift_pcr(&mut data[af + 1..af + 7], shift);
+                }
+            }
+            payload = off + 5 + afl;
+        }
+        if pusi && (afc & 1) != 0 && payload + 9 <= off + 188
+            && data[payload..payload + 3] == [0, 0, 1]
+        {
+            let flags = data[payload + 7];
+            let pts_at = payload + 9;
+            if (flags & 0x80) != 0 && pts_at + 5 <= off + 188 {
+                let value = read_pts(&data[pts_at..pts_at + 5]) + shift;
+                write_pts(&mut data[pts_at..pts_at + 5], value);
+            }
+            let dts_at = payload + 14;
+            if (flags & 0x40) != 0 && dts_at + 5 <= off + 188 {
+                let value = read_pts(&data[dts_at..dts_at + 5]) + shift;
+                write_pts(&mut data[dts_at..dts_at + 5], value);
+            }
+        }
+        off += 188;
+    }
+}
+
+/// Offset for the segment's raw timestamps, or None until the first PES arrives.
+fn shift_for(data: &[u8], expected_ms: i64) -> Option<i64> {
+    let first = first_pts_in(data)?;
+    let diff = expected_ms.max(0) * 90 - first;
+    // Segment cuts already start within a keyframe of their EXTINF boundary; only
+    // the huge backwards jump of a real discontinuity needs retiming.
+    Some(if diff.abs() > 5 * 90_000 { diff } else { 0 })
+}
+
+fn first_pts_file(path: &Path) -> Option<i64> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut data = Vec::new();
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(pts) = first_pts_in(&data) {
+            return Some(pts);
+        }
+        if data.len() >= 512 * 1024 {
+            return None;
+        }
+    }
+}
+
 fn ready_segment(cache: &Arc<PlayCache>, idx: usize) -> Option<Vec<u8>> {
     let (ready, _, _, path) = seg_state(cache, idx)?;
     if !ready {
         return None;
     }
-    std::fs::read(path).ok()
+    let mut bytes = std::fs::read(path).ok()?;
+    let expected = seg_expected_ms(cache, idx).unwrap_or(0);
+    let shift = shift_for(&bytes, expected).unwrap_or(0);
+    normalize_ts(&mut bytes, shift);
+    Some(bytes)
 }
 
 fn segment_exists(cache: &Arc<PlayCache>, idx: usize) -> bool {
     seg_state(cache, idx).is_some()
+}
+
+fn shift_for_file(path: &Path, expected_ms: i64) -> Option<i64> {
+    let first = first_pts_file(path)?;
+    let diff = expected_ms.max(0) * 90 - first;
+    Some(if diff.abs() > 5 * 90_000 { diff } else { 0 })
+}
+
+fn write_ts_packets(
+    stream: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    shift: i64,
+    sent: &mut u64,
+) -> std::io::Result<()> {
+    let take = pending.len() / 188 * 188;
+    if take == 0 {
+        return Ok(());
+    }
+    let mut block = Vec::with_capacity(take);
+    block.extend_from_slice(&pending[..take]);
+    pending.drain(..take);
+    normalize_ts(&mut block, shift);
+    write!(stream, "{take:x}\r\n")?;
+    stream.write_all(&block)?;
+    stream.write_all(b"\r\n")?;
+    *sent += take as u64;
+    Ok(())
 }
 
 /// Serves a segment while the worker is still writing it. libVLC starts decoding as
@@ -560,8 +745,10 @@ fn stream_segment(stream: &mut TcpStream, cache: &Arc<PlayCache>, idx: usize) ->
             return respond(stream, "text/plain", b"segment unavailable", 404);
         };
         if ready {
-            let bytes = std::fs::read(&path)?;
-            return respond_segment(stream, &bytes, None);
+            return match ready_segment(cache, idx) {
+                Some(bytes) => respond_segment(stream, &bytes, None),
+                None => respond(stream, "text/plain", b"segment unavailable", 404),
+            };
         }
         let part = part_of(&path);
         if std::fs::metadata(&part).map(|m| m.len() > 0).unwrap_or(false) {
@@ -573,12 +760,38 @@ fn stream_segment(stream: &mut TcpStream, cache: &Arc<PlayCache>, idx: usize) ->
         std::thread::sleep(Duration::from_millis(20));
     };
 
+    // A segment after EXT-X-DISCONTINUITY restarts its PTS. Wait for its first PES
+    // so the response can be retimed instead of handing VLC a clock that jumps
+    // back to zero.
+    let expected = seg_expected_ms(cache, idx).unwrap_or(0);
+    let shift_deadline = Instant::now() + Duration::from_millis(2_000);
+    let mut shift = 0i64;
+    loop {
+        if let Some(value) = shift_for_file(&path, expected) {
+            shift = value;
+            break;
+        }
+        let (ready, failed, downloading, _current) = match seg_state(cache, idx) {
+            Some(v) => v,
+            None => break,
+        };
+        if failed || (!downloading && !ready) || cache.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if Instant::now() > shift_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     let mut file = std::fs::File::open(&path)?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(
         b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
     )?;
     let mut buf = [0u8; 64 * 1024];
+    let mut pending = Vec::new();
+    let mut read_bytes = 0u64;
     let mut sent = 0u64;
     loop {
         match file.read(&mut buf) {
@@ -589,9 +802,8 @@ fn stream_segment(stream: &mut TcpStream, cache: &Arc<PlayCache>, idx: usize) ->
                         None => break,
                     };
                 if ready {
-                    // The worker may have renamed the file while we held the handle.
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    if sent >= size {
+                    if read_bytes >= size {
                         break;
                     }
                 }
@@ -605,21 +817,24 @@ fn stream_segment(stream: &mut TcpStream, cache: &Arc<PlayCache>, idx: usize) ->
                 let current = if path.exists() { path } else { part_of(&path) };
                 match std::fs::File::open(&current) {
                     Ok(mut next) => {
-                        let _ = next.seek(SeekFrom::Start(sent));
+                        let _ = next.seek(SeekFrom::Start(read_bytes));
                         file = next;
                     }
                     Err(_) => break,
                 }
             }
             Ok(n) => {
-                let data = &buf[..n];
-                write!(stream, "{:x}\r\n", data.len())?;
-                stream.write_all(data)?;
-                stream.write_all(b"\r\n")?;
-                sent += n as u64;
+                read_bytes += n as u64;
+                pending.extend_from_slice(&buf[..n]);
+                write_ts_packets(stream, &mut pending, shift, &mut sent)?;
             }
             Err(_) => break,
         }
+    }
+    if !pending.is_empty() {
+        write!(stream, "{:x}\r\n", pending.len())?;
+        stream.write_all(&pending)?;
+        stream.write_all(b"\r\n")?;
     }
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
