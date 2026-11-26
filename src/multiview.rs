@@ -26,6 +26,70 @@ const MIN_SHARE: f32 = 0.08;
 const RETRY_DELAY: Duration = Duration::from_secs(6);
 const MAX_AUTO_RETRIES: u8 = 3;
 
+/// Main groups shown in the picker. Keep the labels short enough for the narrow
+/// flyout; the id is what the API actually carries on each member row.
+const PICKER_GROUPS: [(i64, &str); 5] = [
+    (10, "SNH48"),
+    (12, "GNZ48"),
+    (11, "BEJ48"),
+    (14, "CKG48"),
+    (21, "CGT48"),
+];
+const PICKER_TYPES: [(i64, &str); 5] = [
+    (1, "视频"),
+    (2, "电台"),
+    (3, "连麦"),
+    (5, "游戏"),
+    (6, "AI"),
+];
+
+fn picker_group_id(item: &LiveItem) -> i64 {
+    if item.group_id != 0 {
+        return item.group_id;
+    }
+    let nick = item.nickname.to_uppercase();
+    crate::api::GROUP_IDS
+        .iter()
+        .find(|(name, _)| {
+            nick.starts_with(&name.to_uppercase())
+                || item.team_name.to_uppercase().starts_with(&name.to_uppercase())
+        })
+        .map(|(_, id)| *id)
+        .unwrap_or(0)
+}
+
+fn picker_group_name(id: i64) -> &'static str {
+    PICKER_GROUPS
+        .iter()
+        .find(|(group, _)| *group == id)
+        .map(|(_, name)| *name)
+        .unwrap_or("其他团体")
+}
+
+fn picker_type_id(item: &LiveItem) -> i64 {
+    if item.in_microphone_connection {
+        3
+    } else {
+        item.live_type
+    }
+}
+
+fn picker_type_name(id: i64) -> &'static str {
+    PICKER_TYPES
+        .iter()
+        .find(|(kind, _)| *kind == id)
+        .map(|(_, name)| *name)
+        .unwrap_or("其他类型")
+}
+
+fn matches_picker_group(item: &LiveItem, group: Option<i64>) -> bool {
+    group.map_or(true, |id| picker_group_id(item) == id)
+}
+
+fn matches_picker_type(item: &LiveItem, kind: Option<i64>) -> bool {
+    kind.map_or(true, |id| picker_type_id(item) == id)
+}
+
 /// What the view asks the app to do outside its own state: network work is the
 /// app's job because it owns the worker pool and the VLC engine.
 pub enum MultiAction {
@@ -205,6 +269,9 @@ pub struct MultiView {
     pub layout: Layout,
     pub picker_open: bool,
     pub picker_query: String,
+    /// Picker-only filters; they do not change the main list's persisted filters.
+    pub picker_group: Option<i64>,
+    pub picker_type: Option<i64>,
     pub dirty: bool,
 
     drag_from: Option<usize>,
@@ -235,6 +302,8 @@ impl MultiView {
             layout,
             picker_open,
             picker_query: String::new(),
+            picker_group: None,
+            picker_type: None,
             dirty: false,
             drag_from: None,
             drop_target: None,
@@ -578,7 +647,44 @@ impl MultiView {
                 .desired_width(f32::INFINITY)
                 .frame(frame),
         );
-        ui.add_space(6.0);
+        ui.add_space(5.0);
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("团体").size(11.5).color(t::TEXT_3));
+            let group_text = self
+                .picker_group
+                .map(picker_group_name)
+                .unwrap_or("全部团体");
+            egui::ComboBox::from_id_salt("multi_group_combo")
+                .width(92.0)
+                .selected_text(RichText::new(group_text).size(12.0).color(t::TEXT_2))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.picker_group, None, "全部团体");
+                    for (id, name) in PICKER_GROUPS {
+                        ui.selectable_value(&mut self.picker_group, Some(id), name);
+                    }
+                });
+            ui.add_space(6.0);
+            ui.label(RichText::new("类型").size(11.5).color(t::TEXT_3));
+            let type_text = self
+                .picker_type
+                .map(picker_type_name)
+                .unwrap_or("全部类型");
+            egui::ComboBox::from_id_salt("multi_type_combo")
+                .width(78.0)
+                .selected_text(RichText::new(type_text).size(12.0).color(t::TEXT_2))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.picker_type, None, "全部类型");
+                    for (id, name) in PICKER_TYPES {
+                        ui.selectable_value(&mut self.picker_type, Some(id), name);
+                    }
+                });
+        });
+        ui.add_space(4.0);
+
+        let group = self.picker_group;
+        let kind = self.picker_type;
+        let filtering = group.is_some() || kind.is_some();
 
         ui.horizontal(|ui| {
             if loading {
@@ -587,12 +693,21 @@ impl MultiView {
             } else {
                 let available = candidates
                     .iter()
-                    .filter(|i| i.source == Source::Member && i.live_mode == 0)
+                    .filter(|i| {
+                        i.source == Source::Member
+                            && i.live_mode == 0
+                            && matches_picker_group(i, group)
+                            && matches_picker_type(i, kind)
+                    })
                     .count();
                 ui.label(
-                    RichText::new(format!("{available} 个在播"))
-                        .size(11.5)
-                        .color(t::TEXT_3),
+                    RichText::new(if filtering {
+                        format!("筛出 {available} 个")
+                    } else {
+                        format!("{available} 个在播")
+                    })
+                    .size(11.5)
+                    .color(t::TEXT_3),
                 );
             }
             ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
@@ -612,7 +727,11 @@ impl MultiView {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for item in candidates {
-                    if item.source != Source::Member || item.live_mode != 0 {
+                    if item.source != Source::Member
+                        || item.live_mode != 0
+                        || !matches_picker_group(item, group)
+                        || !matches_picker_type(item, kind)
+                    {
                         continue;
                     }
                     let name = if item.nickname.is_empty() {
@@ -711,8 +830,9 @@ impl MultiView {
                 if shown == 0 {
                     ui.add_space(20.0);
                     ui.vertical_centered(|ui| {
+                        let plain_empty = query.is_empty() && !filtering;
                         ui.label(
-                            RichText::new(if query.is_empty() {
+                            RichText::new(if plain_empty {
                                 "还没有正在直播的成员"
                             } else {
                                 "没有匹配的成员"
@@ -720,14 +840,16 @@ impl MultiView {
                             .size(12.0)
                             .color(t::TEXT_3),
                         );
-                        if query.is_empty() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("点右上角刷新再试")
-                                    .size(11.0)
-                                    .color(t::TEXT_3),
-                            );
-                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(if plain_empty {
+                                "点右上角刷新再试"
+                            } else {
+                                "换个团体、类型或搜索词"
+                            })
+                            .size(11.0)
+                            .color(t::TEXT_3),
+                        );
                     });
                 }
             });
