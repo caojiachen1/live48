@@ -179,6 +179,9 @@ pub struct App {
     pub fly_prev: f64,
     /// Measured grid row height, tagged with the column width it was measured at.
     pub row_height: Option<(f32, f32)>,
+    /// True when the record grid was already pinned to the bottom last frame. A
+    /// further wheel event then means the user kept pulling, not just arrived.
+    pub list_at_bottom: bool,
     /// Decoded covers waiting to become textures; uploading them all in one pass is
     /// what made scrolling stutter while a page of thumbnails arrived.
     pub img_pending: Vec<(String, Option<(usize, usize, Vec<u8>)>)>,
@@ -251,6 +254,7 @@ impl App {
             fly_t: 0.0,
             fly_prev: 0.0,
             row_height: None,
+            list_at_bottom: false,
             img_pending: Vec::new(),
             lives: Vec::new(),
             records: Vec::new(),

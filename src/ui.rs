@@ -676,8 +676,14 @@ impl App {
         let loading = self.loading_records || self.loading_live || self.loading_open;
         let is_record = tab.is_record();
         let more_open = tab == Tab::OpenRecord;
+        let more_loading = if more_open {
+            self.loading_open
+        } else {
+            self.loading_records
+        };
 
         if items.is_empty() {
+            self.list_at_bottom = false;
             egui::ScrollArea::vertical()
                 .id_salt("list")
                 .auto_shrink([false, false])
@@ -710,15 +716,13 @@ impl App {
             _ => w + 86.0,
         };
         let measured = Cell::new(0.0f32);
-        let last = rows;
 
         ui.spacing_mut().item_spacing.y = gap;
-        egui::ScrollArea::vertical()
+        let scroll = egui::ScrollArea::vertical()
             .id_salt("list")
             .auto_shrink([false, false])
             .show_rows(ui, est, rows, |ui, range| {
                 let first = range.start;
-                let end = range.end;
                 for row in range {
                     let lo = row * cols;
                     let hi = (lo + cols).min(items.len());
@@ -732,23 +736,42 @@ impl App {
                         measured.set(resp.response.rect.height());
                     }
                 }
-                if is_record && next != "0" && end >= last {
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        let label = if more_open { "加载更多公演录播" } else { "加载更多录播" };
-                        if ui
-                            .add_sized(Vec2::new(180.0, 32.0), t::ghost_button(label))
-                            .clicked()
-                        {
-                            if more_open {
-                                self.refresh_open(true);
-                            } else {
-                                self.load_more();
-                            }
-                        }
-                    });
-                }
             });
+
+        // A wheel event that reaches the bottom is consumed by the scroll area. On
+        // the next event the grid is already pinned, so use the raw wheel direction
+        // and last frame's bottom state: arriving there is not enough, continuing
+        // down is. This also survives the scroll area swallowing a sub-pixel move.
+        let wheel_down = ui.ctx().input(|i| {
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::MouseWheel { delta, .. } if delta.y < 0.0
+                )
+            })
+        });
+        let max_offset = (scroll.content_size.y - scroll.inner_rect.height()).max(0.0);
+        let at_bottom = scroll.state.offset.y >= max_offset - 8.0;
+        let over_list = ui.ctx().input(|i| {
+            i.pointer
+                .hover_pos()
+                .is_some_and(|p| scroll.inner_rect.expand(12.0).contains(p))
+        });
+        let continued = is_record
+            && next != "0"
+            && !more_loading
+            && at_bottom
+            && self.list_at_bottom
+            && over_list
+            && wheel_down;
+        self.list_at_bottom = is_record && at_bottom;
+        if continued {
+            if more_open {
+                self.refresh_open(true);
+            } else {
+                self.load_more();
+            }
+        }
 
         let h = measured.get();
         if h > 0.0 && (h - est).abs() > 1.0 {
