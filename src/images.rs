@@ -11,8 +11,8 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 // Cards render ~340 logical points wide; on a 150% display that is ~510 physical
 // pixels, so anything below ~760 looked soft.
-/// Covers are drawn ~490 physical pixels wide on this display and are cropped from the
-/// centre, so they need the headroom.
+/// Covers render in a square card and are letterboxed to their own aspect ratio,
+/// so they need the same pixel budget.
 const MAX_EDGE: u32 = 760;
 /// Avatars are 34pt circles, so they never needed the cover resolution.
 const AVATAR_EDGE: u32 = 160;
@@ -108,6 +108,52 @@ impl ImageCache {
         tx: &Sender<Event>,
     ) {
         self.draw_cover(ui, url, rect, radius, tx, MAX_EDGE);
+    }
+
+    /// Draws the whole image inside `rect`, preserving its aspect ratio and filling
+    /// the leftover space with black. Used for live and record covers, where a
+    /// centre crop hides too much of a portrait or wide poster.
+    pub fn contain(
+        &mut self,
+        ui: &mut Ui,
+        url: &str,
+        rect: Rect,
+        radius: u8,
+        tx: &Sender<Event>,
+    ) {
+        ui.painter().rect_filled(rect, radius, PLACEHOLDER);
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let Some(tex) = self.known(url, ui.ctx(), tx, MAX_EDGE) else {
+            return;
+        };
+        ui.painter().rect_filled(rect, radius, Color32::BLACK);
+        let [tw, th] = tex.size();
+        if tw == 0 || th == 0 {
+            return;
+        }
+        let scale = (rect.width() / tw as f32).min(rect.height() / th as f32);
+        let dest = Rect::from_center_size(
+            rect.center(),
+            Vec2::new(tw as f32 * scale, th as f32 * scale),
+        );
+        // Only round the image itself when it fills the card; inside a letterbox
+        // the straight edge reads cleaner against the black bars.
+        let image_radius = if dest.width() >= rect.width() - 1.0
+            && dest.height() >= rect.height() - 1.0
+        {
+            radius
+        } else {
+            0
+        };
+        paint(
+            ui,
+            &tex,
+            dest,
+            image_radius,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        );
     }
 
     /// Draws a cover into a rect the caller already owns. Returns whether a

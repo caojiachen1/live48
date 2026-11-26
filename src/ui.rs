@@ -757,9 +757,9 @@ impl App {
         }
     }
 
-    /// Every card is exactly the same size: a square cover (centre-cropped), one
-    /// meta row and one action row. Download state is folded into those two rows so
-    /// a card never grows taller than its neighbours.
+    /// Every card is exactly the same size: a square cover (letterboxed, never
+    /// cropped or stretched), one meta row and one action row. Download state is
+    /// folded into those two rows so a card never grows taller than its neighbours.
     fn card(&mut self, ui: &mut Ui, item: &LiveItem, w: f32, is_record: bool) {
         let tx = self.req.tx();
         let badge = badge_text(item);
@@ -800,7 +800,7 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 0.0;
 
                     let (crect, _) = ui.allocate_exact_size(Vec2::splat(inner), Sense::hover());
-                    self.images.cover(ui, &cover_url, crect, 6, &tx);
+                    self.images.contain(ui, &cover_url, crect, 6, &tx);
 
                     // A stepped gradient reads far softer than the hard black band.
                     let grad = 48.0f32;
